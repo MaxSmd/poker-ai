@@ -1,10 +1,22 @@
 //! Undo stack for zero-allocation tree traversal.
 //!
-//! Records a complete snapshot of all mutable fields before each `apply_action`
-//! call so that `undo_action` can restore the state exactly.  Each record is a
-//! full copy (not a delta), which keeps the implementation simple and correct
-//! at the cost of ~88 bytes per entry.  With a 256-deep pre-allocated stack
-//! this amounts to ~22 KB per `GameState` — acceptable for CFR traversal.
+//! Records a *delta* of the mutable fields that changed during each
+//! `apply_action` call so that `undo_action` can restore the state exactly.
+//!
+//! ## Delta layout (compared to the old full-snapshot approach)
+//!
+//! The old full-snapshot stored **three** `[u32; MAX_PLAYERS]` arrays (stacks,
+//! street_bets, total_committed) regardless of the action.  Only one player's
+//! values ever change per action, so we now store:
+//!   - The acting player's index (1 byte)
+//!   - That player's old stack / street_bet / total_committed (3 × 4 bytes)
+//!   - All scalar fields that may change (≈14 bytes)
+//!   - An `old_street_bets` array used **only** when the betting round closes
+//!     and `advance_street` resets every player's street bet to zero.
+//!
+//! Typical record size: ~60 bytes vs ~88 bytes for the old snapshot.
+//! With a 256-deep pre-allocated stack this is ~15 KB vs ~22 KB per
+//! `GameState`.
 //!
 //! The stack is pre-allocated; `push` and `pop` do not allocate.
 
@@ -13,23 +25,44 @@ use crate::state::MAX_PLAYERS;
 
 pub const MAX_UNDO_DEPTH: usize = 256;
 
-/// A complete snapshot of all mutable `GameState` fields before a single
-/// `apply_action` call.  Restoring the state is done by overwriting all
-/// mutable fields with these values.
+/// A delta-based undo record for a single `apply_action` call.
+///
+/// Only the fields that may have changed are stored:
+/// - The acting player's per-player values (stack, street_bet, total_committed).
+/// - All mutable scalar fields (street, to_act, current_bet, …).
+/// - When the betting round closes and a street advances, `street_changed` is
+///   set and `old_street_bets` holds the full pre-reset array so that all
+///   players' street bets can be restored.
 #[derive(Clone, Copy, Debug)]
 pub struct UndoRecord {
     pub action: Action,
-    pub stacks: [u32; MAX_PLAYERS],
-    pub street_bets: [u32; MAX_PLAYERS],
-    pub total_committed: [u32; MAX_PLAYERS],
-    pub street: u8,
-    pub to_act: u8,
-    pub current_bet: u32,
-    pub min_raise: u32,
-    pub folded: u8,
-    pub allin: u8,
-    pub last_aggressor: u8,
-    pub players_to_act: u8,
+
+    /// Index of the player who acted.
+    pub player: u8,
+
+    // ── Per-player deltas (acting player only) ──────────────────────────────
+    pub old_stack: u32,
+    pub old_street_bet: u32,
+    pub old_total_committed: u32,
+
+    // ── Scalar fields (may all change via advance_or_next) ──────────────────
+    pub old_street: u8,
+    pub old_to_act: u8,
+    pub old_current_bet: u32,
+    pub old_min_raise: u32,
+    pub old_folded: u8,
+    pub old_allin: u8,
+    pub old_last_aggressor: u8,
+    pub old_players_to_act: u8,
+
+    // ── Street-transition data ───────────────────────────────────────────────
+    /// `true` when `advance_street` fired during this action, resetting all
+    /// players' street bets.  When restoring, use `old_street_bets` for the
+    /// full array instead of just patching the acting player's slot.
+    pub street_changed: bool,
+    /// Pre-action values of all players' street bets.  Only meaningful (and
+    /// used during undo) when `street_changed` is `true`.
+    pub old_street_bets: [u32; MAX_PLAYERS],
 }
 
 /// Fixed-capacity undo stack.  All operations are O(1) and allocation-free
@@ -65,6 +98,15 @@ impl UndoStack {
     /// Pop the most recent record, or `None` if the stack is empty.
     pub fn pop(&mut self) -> Option<UndoRecord> {
         self.records.pop()
+    }
+
+    /// Mark the most-recently-pushed record as having triggered a street
+    /// transition.  Called by `apply_action` after `advance_or_next` when
+    /// `self.street` changed.
+    pub fn mark_street_changed(&mut self) {
+        if let Some(rec) = self.records.last_mut() {
+            rec.street_changed = true;
+        }
     }
 
     /// Current depth of the stack.

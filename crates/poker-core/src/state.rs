@@ -166,24 +166,30 @@ impl GameState {
     /// Pushes an undo record so that `undo_action` can reverse the change.
     /// No heap allocation occurs in the hot path.
     pub fn apply_action(&mut self, action: Action) {
-        // Save snapshot for undo.
+        // Capture the acting player's index and per-player values before the
+        // action mutates them, plus all scalar fields that may change.
+        let p = self.to_act as usize;
+        let old_street = self.street;
         let record = UndoRecord {
             action,
-            stacks: self.stacks,
-            street_bets: self.street_bets,
-            total_committed: self.total_committed,
-            street: self.street,
-            to_act: self.to_act,
-            current_bet: self.current_bet,
-            min_raise: self.min_raise,
-            folded: self.folded,
-            allin: self.allin,
-            last_aggressor: self.last_aggressor,
-            players_to_act: self.players_to_act,
+            player: p as u8,
+            old_stack: self.stacks[p],
+            old_street_bet: self.street_bets[p],
+            old_total_committed: self.total_committed[p],
+            old_street,
+            old_to_act: self.to_act,
+            old_current_bet: self.current_bet,
+            old_min_raise: self.min_raise,
+            old_folded: self.folded,
+            old_allin: self.allin,
+            old_last_aggressor: self.last_aggressor,
+            old_players_to_act: self.players_to_act,
+            // old_street_bets is always captured; street_changed will be set
+            // below if advance_street fires and resets the array.
+            street_changed: false,
+            old_street_bets: self.street_bets,
         };
         self.undo.push(record);
-
-        let p = self.to_act as usize;
 
         match action {
             Action::Fold => {
@@ -259,22 +265,41 @@ impl GameState {
 
         // Advance: either move to the next player or close the street.
         self.advance_or_next();
+
+        // If the street advanced, mark the just-pushed record so that undo
+        // knows to restore all players' street bets from old_street_bets.
+        if self.street != old_street {
+            self.undo.mark_street_changed();
+        }
     }
 
     /// Undo the last applied action, restoring state exactly.
     pub fn undo_action(&mut self) {
         if let Some(rec) = self.undo.pop() {
-            self.stacks = rec.stacks;
-            self.street_bets = rec.street_bets;
-            self.total_committed = rec.total_committed;
-            self.street = rec.street;
-            self.to_act = rec.to_act;
-            self.current_bet = rec.current_bet;
-            self.min_raise = rec.min_raise;
-            self.folded = rec.folded;
-            self.allin = rec.allin;
-            self.last_aggressor = rec.last_aggressor;
-            self.players_to_act = rec.players_to_act;
+            let p = rec.player as usize;
+
+            // Restore the acting player's per-player fields.
+            self.stacks[p] = rec.old_stack;
+            self.total_committed[p] = rec.old_total_committed;
+
+            // Restore street bets: if the street advanced, all players' bets
+            // were reset by advance_street — restore the whole array.  Otherwise
+            // only the acting player's slot changed.
+            if rec.street_changed {
+                self.street_bets = rec.old_street_bets;
+            } else {
+                self.street_bets[p] = rec.old_street_bet;
+            }
+
+            // Restore scalar fields.
+            self.street = rec.old_street;
+            self.to_act = rec.old_to_act;
+            self.current_bet = rec.old_current_bet;
+            self.min_raise = rec.old_min_raise;
+            self.folded = rec.old_folded;
+            self.allin = rec.old_allin;
+            self.last_aggressor = rec.old_last_aggressor;
+            self.players_to_act = rec.old_players_to_act;
         }
     }
 

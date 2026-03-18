@@ -288,7 +288,18 @@ fn full_traversal_explicit_stack() -> u64 {
 // main
 // ─────────────────────────────────────────────────────────────────────────────
 
+use poker_core::evaluator::make_card as mc;
+use poker_core::UndoRecord;
+
 fn main() {
+    // ── UndoRecord memory footprint ───────────────────────────────────────────
+    println!(
+        "UndoRecord size (delta):  {} bytes  (old snapshot: ~88 bytes, stack depth 256 → ~{} KB)",
+        std::mem::size_of::<UndoRecord>(),
+        std::mem::size_of::<UndoRecord>() * 256 / 1024,
+    );
+    println!();
+
     // ── Sanity check: both methods must agree on terminal-node count ──────────
     let terminals_rec = full_traversal_recursive();
     let terminals_stk = full_traversal_explicit_stack();
@@ -346,4 +357,54 @@ fn main() {
             stk_tps / rec_tps
         );
     }
+
+    // ── Evaluator benchmark ───────────────────────────────────────────────────
+    println!();
+    println!("── Evaluator benchmark ──────────────────────────────────────────");
+
+    // A typical 7-card river hand: two hole cards + five board cards.
+    let hand7: [u8; 7] = [
+        mc(12, 0), mc(11, 1), // Ah Kd (hole)
+        mc(10, 2), mc(9, 3), mc(8, 0), mc(7, 1), mc(6, 2), // Qh Js Tc 9d 8h (board)
+    ];
+    let hand5: [u8; 5] = [mc(12, 0), mc(11, 1), mc(10, 2), mc(9, 3), mc(8, 0)];
+    let hand6: [u8; 6] = [mc(12, 0), mc(11, 1), mc(10, 2), mc(9, 3), mc(8, 0), mc(7, 1)];
+
+    const EVAL_ITERS: u64 = 5_000_000;
+
+    let t0 = Instant::now();
+    for _ in 0..EVAL_ITERS {
+        let _ = std::hint::black_box(poker_core::evaluate_5(&hand5));
+    }
+    let e5_elapsed = t0.elapsed();
+    let e5_eps = EVAL_ITERS as f64 / e5_elapsed.as_secs_f64();
+    println!(
+        "evaluate_5:  {:>12.0} evals/sec  ({:.3}s for {EVAL_ITERS} iters)",
+        e5_eps,
+        e5_elapsed.as_secs_f64(),
+    );
+
+    let t0 = Instant::now();
+    for _ in 0..EVAL_ITERS {
+        let _ = std::hint::black_box(poker_core::evaluate_6(&hand6));
+    }
+    let e6_elapsed = t0.elapsed();
+    let e6_eps = EVAL_ITERS as f64 / e6_elapsed.as_secs_f64();
+    println!(
+        "evaluate_6:  {:>12.0} evals/sec  ({:.3}s for {EVAL_ITERS} iters)",
+        e6_eps,
+        e6_elapsed.as_secs_f64(),
+    );
+
+    let t0 = Instant::now();
+    for _ in 0..EVAL_ITERS {
+        let _ = std::hint::black_box(poker_core::evaluate_7(&hand7));
+    }
+    let e7_elapsed = t0.elapsed();
+    let e7_eps = EVAL_ITERS as f64 / e7_elapsed.as_secs_f64();
+    println!(
+        "evaluate_7:  {:>12.0} evals/sec  ({:.3}s for {EVAL_ITERS} iters)",
+        e7_eps,
+        e7_elapsed.as_secs_f64(),
+    );
 }
