@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "crates/poker-core",
+    "crates/poker-ai",
+]
+resolver = "2"
