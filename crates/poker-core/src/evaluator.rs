@@ -10,6 +10,14 @@
 //!   8 = Straight Flush, 7 = Four of a Kind, 6 = Full House, 5 = Flush,
 //!   4 = Straight,       3 = Three of a Kind, 2 = Two Pair, 1 = One Pair,
 //!   0 = High Card.
+//!
+//! ## Performance note
+//! `evaluate_7` enumerates all 21 five-card subsets and calls `evaluate_5` for
+//! each.  `evaluate_5` sorts a five-element array on every call.  This is
+//! correct and readable but not optimised for throughput.  For production CFR
+//! (millions of evaluations per second), replace with a lookup-table evaluator
+//! such as the two-plus-two table or a Cactus Kev–style hash, which would be
+//! orders of magnitude faster.
 
 /// Extract the rank from a card byte (0 = 2, …, 12 = Ace).
 #[inline]

@@ -10,9 +10,15 @@
 //!
 //! ## Position layout
 //! Given `button` position `b` and `num_players` `n`:
+//!
+//! **Multi-way (n ≥ 3):**
 //! - Small blind : `(b + 1) % n`
 //! - Big blind   : `(b + 2) % n`
 //! - UTG (first to act preflop) : `(b + 3) % n`
+//!
+//! **Heads-up (n = 2):**
+//! - Small blind / button : `b`  (button is the SB and acts first preflop)
+//! - Big blind            : `(b + 1) % 2`
 
 use crate::action::Action;
 use crate::evaluator::{evaluate_5, evaluate_6, evaluate_7};
@@ -28,6 +34,7 @@ pub const MAX_PLAYERS: usize = 6;
 /// All board cards for the entire hand are pre-loaded at construction time
 /// (appropriate for CFR tree traversal with public chance sampling).  The
 /// board cards are "revealed" automatically when streets advance.
+#[derive(Clone, Debug)]
 pub struct GameState {
     /// Remaining chip stack for each player.
     pub stacks: [u32; MAX_PLAYERS],
@@ -102,8 +109,13 @@ impl GameState {
         };
 
         // Post blinds.
-        let sb = (button as usize + 1) % n;
-        let bb = (button as usize + 2) % n;
+        // In heads-up (n == 2) the button IS the SB (standard HU convention).
+        // In multi-way (n >= 3) the button is behind the blinds.
+        let (sb, bb) = if n == 2 {
+            (button as usize, (button as usize + 1) % n)
+        } else {
+            ((button as usize + 1) % n, (button as usize + 2) % n)
+        };
 
         let sb_amount = (big_blind / 2).min(gs.stacks[sb]);
         gs.stacks[sb] -= sb_amount;
@@ -125,8 +137,8 @@ impl GameState {
         // First to act preflop: UTG (player after BB), or in heads-up: the button (SB).
         // All players (including BB) need a voluntary action, so players_to_act = n.
         let first_to_act = if n == 2 {
-            // Heads-up: button (who is also SB) acts first preflop.
-            (button as usize + 1) % n
+            // Heads-up: button is the SB and acts first preflop.
+            button as usize
         } else {
             (button as usize + 3) % n
         };
@@ -279,6 +291,10 @@ impl GameState {
     /// True if the current node is a chance node (street transition pending).
     /// In this engine street transitions happen automatically inside `apply_action`,
     /// so callers only see player-decision nodes and terminal nodes.
+    ///
+    /// This always returns `false` and exists as a placeholder for AI crates that
+    /// expect a uniform `is_chance_node` interface (e.g., when switching to an
+    /// external-sampling CFR implementation that handles chance nodes explicitly).
     pub fn is_chance_node(&self) -> bool {
         false
     }
@@ -353,8 +369,12 @@ impl GameState {
             if level <= prev_level {
                 continue;
             }
-            // This side pot: each eligible player contributed (level - prev_level) chips.
-            // Eligible: not folded AND total_committed >= level.
+            // This side pot: each player who committed >= level contributes
+            // (level - prev_level) chips to this tier, including folded players
+            // (their chips don't disappear — they're just ineligible to win).
+            // Eligible winners: not folded AND total_committed >= level.
+            let contributor_count =
+                (0..n).filter(|&i| self.total_committed[i] >= level).count() as u32;
             let eligible_mask: u8 = (0..n as u8)
                 .filter(|&i| {
                     (self.folded >> i) & 1 == 0
@@ -368,7 +388,7 @@ impl GameState {
                 prev_level = level;
                 continue;
             }
-            let side_pot = eligible_count * (level - prev_level);
+            let side_pot = contributor_count * (level - prev_level);
 
             // Find winner(s) of this side pot (highest hand rank among eligible).
             let best_rank = (0..n)
@@ -648,10 +668,10 @@ mod tests {
     fn street_advances_after_round() {
         let mut gs = make_game(2);
         assert_eq!(gs.street, 0);
-        // Heads-up preflop: player 1 (SB/button) acts first.
+        // Heads-up preflop: button (player 0, SB) acts first.
         // Both call/check to close the street.
-        gs.apply_action(Action::Call);  // SB calls
-        gs.apply_action(Action::Check); // BB checks
+        gs.apply_action(Action::Call);  // SB (button, player 0) calls
+        gs.apply_action(Action::Check); // BB (player 1) checks
         // Street should now be flop (1).
         assert_eq!(gs.street, 1);
     }
