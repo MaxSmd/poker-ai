@@ -1,27 +1,71 @@
 //! Undo stack for zero-allocation tree traversal.
 //!
 //! Records the minimal delta needed to reverse each `apply_action` call.
+//! The stack is pre-allocated; `push` and `pop` do not allocate.
 
-/// A record of what changed when an action was applied.
+use crate::action::Action;
+
+pub const MAX_UNDO_DEPTH: usize = 256;
+
+/// A record of the complete mutable state before a single `apply_action` call.
+/// Restoring the state is done by overwriting all mutable fields with these values.
+#[derive(Clone, Copy)]
 pub struct UndoRecord {
-    // TODO: fields to reverse a single apply_action
+    pub action: Action,
+    pub stacks: [u32; 6],
+    pub street_bets: [u32; 6],
+    pub total_committed: [u32; 6],
+    pub street: u8,
+    pub to_act: u8,
+    pub current_bet: u32,
+    pub min_raise: u32,
+    pub folded: u8,
+    pub allin: u8,
+    pub last_aggressor: u8,
+    pub players_to_act: u8,
 }
 
-/// Fixed-capacity undo stack.
+/// Fixed-capacity undo stack.  All operations are O(1) and allocation-free
+/// after the initial `new()` call (which pre-allocates `MAX_UNDO_DEPTH` slots).
 pub struct UndoStack {
     records: Vec<UndoRecord>,
 }
 
+impl Default for UndoStack {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UndoStack {
+    /// Create a new stack pre-allocated for `MAX_UNDO_DEPTH` entries.
     pub fn new() -> Self {
-        Self { records: Vec::new() }
+        Self {
+            records: Vec::with_capacity(MAX_UNDO_DEPTH),
+        }
     }
 
+    /// Push a record.  Panics if the stack would exceed `MAX_UNDO_DEPTH`.
     pub fn push(&mut self, record: UndoRecord) {
+        debug_assert!(
+            self.records.len() < MAX_UNDO_DEPTH,
+            "undo stack overflow — game tree too deep"
+        );
         self.records.push(record);
     }
 
+    /// Pop the most recent record, or `None` if the stack is empty.
     pub fn pop(&mut self) -> Option<UndoRecord> {
         self.records.pop()
+    }
+
+    /// Current depth of the stack.
+    pub fn depth(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Remove all records (does not release memory).
+    pub fn clear(&mut self) {
+        self.records.clear();
     }
 }
