@@ -17,13 +17,6 @@ pub const RIVER_BET_FRACS: &[f64] = &[0.50, 0.75, 1.0, 1.50];
 /// roughly 2.5 BB, 3.5 BB, and 6 BB opens from a standard blind structure.
 pub const PREFLOP_BET_FRACS: &[f64] = &[0.50, 1.0, 2.0];
 
-/// Total chip amounts committed to the pot so far (across both players / all players).
-/// `total_committed` is the sum of all chips put in the pot by all players.
-#[inline]
-pub fn pot_total(total_committed: &[u32]) -> u32 {
-    total_committed.iter().sum()
-}
-
 /// Compute abstract raise amounts (as total bet levels, not increments) for
 /// the current state.
 ///
