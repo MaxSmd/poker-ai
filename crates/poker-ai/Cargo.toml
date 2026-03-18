@@ -1,0 +1,27 @@
+[package]
+name = "poker-ai"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "train"
+path = "src/bin/train.rs"
+
+[[bin]]
+name = "benchmark"
+path = "src/bin/benchmark.rs"
+
+[[bin]]
+name = "cluster"
+path = "src/bin/cluster.rs"
+
+[[bin]]
+name = "memory_estimate"
+path = "src/bin/memory_estimate.rs"
+
+[[bin]]
+name = "play"
+path = "src/bin/play.rs"
+
+[dependencies]
+poker-core = { path = "../poker-core" }
