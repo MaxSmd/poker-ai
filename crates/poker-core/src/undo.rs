@@ -1,20 +1,27 @@
 //! Undo stack for zero-allocation tree traversal.
 //!
-//! Records the minimal delta needed to reverse each `apply_action` call.
+//! Records a complete snapshot of all mutable fields before each `apply_action`
+//! call so that `undo_action` can restore the state exactly.  Each record is a
+//! full copy (not a delta), which keeps the implementation simple and correct
+//! at the cost of ~88 bytes per entry.  With a 256-deep pre-allocated stack
+//! this amounts to ~22 KB per `GameState` — acceptable for CFR traversal.
+//!
 //! The stack is pre-allocated; `push` and `pop` do not allocate.
 
 use crate::action::Action;
+use crate::state::MAX_PLAYERS;
 
 pub const MAX_UNDO_DEPTH: usize = 256;
 
-/// A record of the complete mutable state before a single `apply_action` call.
-/// Restoring the state is done by overwriting all mutable fields with these values.
-#[derive(Clone, Copy)]
+/// A complete snapshot of all mutable `GameState` fields before a single
+/// `apply_action` call.  Restoring the state is done by overwriting all
+/// mutable fields with these values.
+#[derive(Clone, Copy, Debug)]
 pub struct UndoRecord {
     pub action: Action,
-    pub stacks: [u32; 6],
-    pub street_bets: [u32; 6],
-    pub total_committed: [u32; 6],
+    pub stacks: [u32; MAX_PLAYERS],
+    pub street_bets: [u32; MAX_PLAYERS],
+    pub total_committed: [u32; MAX_PLAYERS],
     pub street: u8,
     pub to_act: u8,
     pub current_bet: u32,
@@ -27,6 +34,7 @@ pub struct UndoRecord {
 
 /// Fixed-capacity undo stack.  All operations are O(1) and allocation-free
 /// after the initial `new()` call (which pre-allocates `MAX_UNDO_DEPTH` slots).
+#[derive(Clone, Debug)]
 pub struct UndoStack {
     records: Vec<UndoRecord>,
 }
@@ -47,7 +55,7 @@ impl UndoStack {
 
     /// Push a record.  Panics if the stack would exceed `MAX_UNDO_DEPTH`.
     pub fn push(&mut self, record: UndoRecord) {
-        debug_assert!(
+        assert!(
             self.records.len() < MAX_UNDO_DEPTH,
             "undo stack overflow — game tree too deep"
         );
