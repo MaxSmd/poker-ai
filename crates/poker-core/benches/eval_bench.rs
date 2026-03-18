@@ -8,8 +8,8 @@
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use poker_core::{
-    evaluate_5, evaluate_6, evaluate_7, make_card,
-    Action, GameState, MAX_PLAYERS, NO_CARD,
+    evaluate_5, evaluate_5_lut, evaluate_6, evaluate_6_lut, evaluate_7, evaluate_7_lut,
+    make_card, Action, GameState, MAX_PLAYERS, NO_CARD,
 };
 
 // ── Sample hands ─────────────────────────────────────────────────────────────
@@ -56,6 +56,13 @@ fn bench_evaluate_5(c: &mut Criterion) {
     });
 }
 
+fn bench_evaluate_5_lut(c: &mut Criterion) {
+    let h = hand5();
+    c.bench_function("evaluate_5_lut", |b| {
+        b.iter(|| evaluate_5_lut(black_box(&h)))
+    });
+}
+
 fn bench_evaluate_6(c: &mut Criterion) {
     let h = hand6();
     c.bench_function("evaluate_6", |b| {
@@ -63,10 +70,24 @@ fn bench_evaluate_6(c: &mut Criterion) {
     });
 }
 
+fn bench_evaluate_6_lut(c: &mut Criterion) {
+    let h = hand6();
+    c.bench_function("evaluate_6_lut", |b| {
+        b.iter(|| evaluate_6_lut(black_box(&h)))
+    });
+}
+
 fn bench_evaluate_7(c: &mut Criterion) {
     let h = hand7();
     c.bench_function("evaluate_7", |b| {
         b.iter(|| evaluate_7(black_box(&h)))
+    });
+}
+
+fn bench_evaluate_7_lut(c: &mut Criterion) {
+    let h = hand7();
+    c.bench_function("evaluate_7_lut", |b| {
+        b.iter(|| evaluate_7_lut(black_box(&h)))
     });
 }
 
@@ -112,8 +133,11 @@ fn bench_legal_actions(c: &mut Criterion) {
 criterion_group!(
     eval_benches,
     bench_evaluate_5,
+    bench_evaluate_5_lut,
     bench_evaluate_6,
-    bench_evaluate_7
+    bench_evaluate_6_lut,
+    bench_evaluate_7,
+    bench_evaluate_7_lut,
 );
 criterion_group!(state_benches, bench_apply_undo, bench_legal_actions);
 criterion_main!(eval_benches, state_benches);
