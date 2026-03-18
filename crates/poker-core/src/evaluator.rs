@@ -45,7 +45,7 @@ const STRAIGHT_TABLE: [(u16, u8); 10] = [
 /// may have more bits set — the first (highest) matching pattern wins.
 /// Returns `(true, top_rank)` or `(false, 0)`.
 #[inline]
-fn find_best_straight(rank_bits: u16) -> (bool, u8) {
+pub(crate) fn find_best_straight(rank_bits: u16) -> (bool, u8) {
     for (mask, top) in STRAIGHT_TABLE {
         if rank_bits & mask == mask {
             return (true, top);
