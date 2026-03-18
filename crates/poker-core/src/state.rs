@@ -238,7 +238,9 @@ impl GameState {
 
                 if self.stacks[p] == 0 {
                     self.allin |= 1 << p;
-                    // All-in raise: all currently active players need to respond.
+                    // All-in raise: player p is now marked allin (above), so
+                    // count_active() excludes them.  Every *other* active player
+                    // still needs to respond to the raise.
                     self.players_to_act = self.count_active();
                 } else {
                     // Normal raise: every active player *except* the raiser needs to respond.
@@ -609,16 +611,6 @@ impl GameState {
         self.hole_cards[player][0] != NO_CARD && self.hole_cards[player][1] != NO_CARD
     }
 }
-
-// ------------------------------------------------------------------
-// Suit / rank convenience re-exports so callers don't need to import
-// the evaluator module directly.
-// ------------------------------------------------------------------
-
-/// Decoded suit of a card byte.
-pub use crate::evaluator::suit_of as card_suit;
-/// Decoded rank of a card byte.
-pub use crate::evaluator::rank_of as card_rank;
 
 #[cfg(test)]
 mod tests {

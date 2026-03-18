@@ -16,8 +16,8 @@
 //! flush classification becomes a single array lookup; non-flush
 //! classification requires only a prime-product multiply and 1–2 probes.
 //!
-//! `evaluate_7_lut` enumerates all C(7,5) = 21 five-card subsets, evaluates
-//! each with `evaluate_5_lut`, and returns the maximum (best) rank.
+//! `evaluate_7_lut` (like `evaluate_6_lut`) uses a single-pass frequency and
+//! per-suit bitmask approach — no C(7,5) = 21 subset enumeration needed.
 
 use crate::evaluator::{rank_of, suit_of};
 
@@ -48,6 +48,25 @@ fn flush_rank(rank_bits: u16) -> u32 {
     FLUSH_LUT[rank_bits as usize]
 }
 
+/// Return a new bitmask containing only the top 5 set bits of `bits`.
+/// Used to reduce a 6- or 7-card suited hand to exactly 5 ranks before
+/// indexing `FLUSH_LUT`, which only has valid entries for 5-bit masks.
+#[inline(always)]
+fn top5_bits(bits: u16) -> u16 {
+    let mut result = 0u16;
+    let mut count = 0u8;
+    for bit in (0..13).rev() {
+        if (bits >> bit) & 1 == 1 {
+            result |= 1u16 << bit;
+            count += 1;
+            if count == 5 {
+                break;
+            }
+        }
+    }
+    result
+}
+
 /// Look up the hand rank for a non-flush hand described by the product of its
 /// five rank primes.  Uses linear probing; expected probe count < 2.
 #[inline(always)]
@@ -70,6 +89,13 @@ fn noflush_rank(product: u32) -> u32 {
 ///
 /// Returns the same `u32` rank encoding as [`crate::evaluate_5`] —
 /// higher is better, category in bits 23-20, tiebreaker nibbles below.
+///
+/// **Note on invalid inputs:** this function assumes a valid 5-card hand from
+/// a standard deck (all cards distinct).  If the 5 cards share a suit but have
+/// duplicate ranks (impossible in a real deck), `rank_bits` will have fewer
+/// than 5 bits set, `FLUSH_LUT` will return 0, and the non-flush path is
+/// taken — the result is then undefined.  Real-deck hands are always handled
+/// correctly.
 #[inline]
 pub fn evaluate_5_lut(cards: &[u8; 5]) -> u32 {
     let mut rank_bits = 0u16;
@@ -189,13 +215,19 @@ fn evaluate_from_tables_lut(
     let mut best_flush_or_sf = 0u32;
     for s in 0..4 {
         if suit_count[s] >= 5 {
-            // A single table lookup covers both straight-flush and regular
-            // flush, replacing find_best_straight + top_n_ranks + make_hand.
-            let fv = flush_rank(suit_rank_bits[s]);
-            if fv >> 20 == 8 {
+            // When 6 or 7 cards share a suit, suit_rank_bits[s] has 6/7 bits
+            // set, but FLUSH_LUT is only defined for exactly-5-bit masks.
+            // Check for straight-flush first using the full bitmask (so that
+            // wheel SFs like A-2-3-4-5 are detected even when A is not among
+            // the top 5 ranks), then reduce to the top 5 for a plain flush.
+            let bits = suit_rank_bits[s];
+            let (is_sf, sf_top) = find_best_straight(bits);
+            if is_sf {
                 // Straight flush — nothing can beat it.
-                return fv;
+                return make_hand_lut(8, sf_top, 0, 0, 0, 0);
             }
+            // Regular flush: look up best 5 suited ranks.
+            let fv = flush_rank(top5_bits(bits));
             if fv > best_flush_or_sf {
                 best_flush_or_sf = fv;
             }
@@ -440,5 +472,79 @@ mod tests {
             c(0, 0), c(1, 1), c(3, 2), c(5, 3), c(7, 0), c(12, 1),
         ];
         assert_eq!(evaluate_6_lut(&cards), evaluate_6(&cards));
+    }
+
+    // ── 6+ suited cards: flush-detection regression tests ─────────────────────
+
+    #[test]
+    fn evaluate_6_lut_six_suited_flush() {
+        // 6 hearts — best 5 = A K Q J 10 flush (not straight flush: 10 absent)
+        let cards: [u8; 6] = [
+            c(12, 2), c(11, 2), c(10, 2), c(9, 2), c(7, 2), c(6, 2),
+        ];
+        assert_eq!(evaluate_6_lut(&cards), evaluate_6(&cards));
+        assert_eq!(evaluate_6_lut(&cards) >> 20, 5, "expected flush");
+    }
+
+    #[test]
+    fn evaluate_6_lut_six_suited_straight_flush() {
+        // 6 spades: A K Q J 10 9 — best 5 = A K Q J 10 straight flush
+        let cards: [u8; 6] = [
+            c(12, 3), c(11, 3), c(10, 3), c(9, 3), c(8, 3), c(7, 3),
+        ];
+        assert_eq!(evaluate_6_lut(&cards), evaluate_6(&cards));
+        assert_eq!(evaluate_6_lut(&cards) >> 20, 8, "expected straight flush");
+    }
+
+    #[test]
+    fn evaluate_7_lut_seven_suited_flush() {
+        // 7 clubs (ranks 0-6, i.e. 2-3-4-5-6-7-8): best 5 = 4-5-6-7-8 straight flush
+        let cards: [u8; 7] = [
+            c(0, 0), c(1, 0), c(2, 0), c(3, 0), c(4, 0), c(5, 0), c(6, 0),
+        ];
+        assert_eq!(evaluate_7_lut(&cards), evaluate_7(&cards));
+        assert_eq!(evaluate_7_lut(&cards) >> 20, 8, "expected straight flush");
+    }
+
+    #[test]
+    fn evaluate_7_lut_six_suited_wheel_straight_flush() {
+        // 6 diamonds: A 5 4 3 2 K — wheel straight flush (A-2-3-4-5) should win
+        let cards: [u8; 6] = [
+            c(12, 1), c(3, 1), c(2, 1), c(1, 1), c(0, 1), c(11, 1),
+        ];
+        assert_eq!(evaluate_6_lut(&cards), evaluate_6(&cards));
+        assert_eq!(evaluate_6_lut(&cards) >> 20, 8, "expected straight flush (wheel)");
+    }
+
+    // ── Exhaustive validation (skipped by default; run with --ignored) ─────────
+
+    /// Verify that `evaluate_5_lut` agrees with `evaluate_5` on all
+    /// C(52,5) = 2 598 960 possible 5-card hands drawn from a standard deck.
+    ///
+    /// Run with:
+    ///   cargo test -p poker-core -- --ignored exhaustive_evaluate_5_lut
+    #[test]
+    #[ignore]
+    fn exhaustive_evaluate_5_lut_matches_reference() {
+        use crate::evaluator::make_card;
+        let deck: Vec<u8> = (0u8..52).map(|i| make_card(i / 4, i % 4)).collect();
+        let mut mismatches = 0u64;
+        for a in 0..52usize {
+            for b in (a + 1)..52 {
+                for c in (b + 1)..52 {
+                    for d in (c + 1)..52 {
+                        for e in (d + 1)..52 {
+                            let hand = [deck[a], deck[b], deck[c], deck[d], deck[e]];
+                            let lut = evaluate_5_lut(&hand);
+                            let ref_ = crate::evaluator::evaluate_5(&hand);
+                            if lut != ref_ {
+                                mismatches += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(mismatches, 0, "{mismatches} mismatches between evaluate_5_lut and evaluate_5");
     }
 }
