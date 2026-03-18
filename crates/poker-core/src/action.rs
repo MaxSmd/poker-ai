@@ -40,6 +40,7 @@ pub enum Action {
 ///
 /// The returned `Vec` is pre-allocated with capacity 8 to avoid reallocations
 /// in typical cases.
+#[inline]
 pub fn legal_actions(state: &GameState) -> Vec<Action> {
     let mut actions: Vec<Action> = Vec::with_capacity(8);
 

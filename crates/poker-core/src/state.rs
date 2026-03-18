@@ -148,11 +148,11 @@ impl GameState {
         // even if no one else has raised.  Count how many active players need to act:
         // if BB is already all-in (e.g., short stack), they don't need an action.
         let active = gs.count_active();
-        // Number of players who still need to voluntarily act = all active players,
-        // but BB counts even though they posted (they get the "option").
-        // We represent this by setting players_to_act = active (which includes BB when
-        // not all-in).  The extra "+1 for BB option" is already embedded because BB is
-        // counted in count_active() as long as they have chips remaining.
+        // `players_to_act` is set to the number of active (non-folded, non-all-in)
+        // players.  The BB's "option" — the right to raise even after everyone limps —
+        // is naturally included here: the BB appears in count_active() as long as
+        // they have chips remaining, so they will always get a turn to act
+        // (their preflop posting does NOT consume their action slot).
         gs.players_to_act = active;
 
         gs
@@ -165,7 +165,14 @@ impl GameState {
     /// Apply `action` for the current player, updating state in-place.
     /// Pushes an undo record so that `undo_action` can reverse the change.
     /// No heap allocation occurs in the hot path.
+    #[inline]
     pub fn apply_action(&mut self, action: Action) {
+        // Debug-only chip conservation check: sum(stacks) + sum(total_committed)
+        // must be invariant across every action.
+        #[cfg(debug_assertions)]
+        let chips_before: u32 = self.stacks.iter().sum::<u32>()
+            + self.total_committed.iter().sum::<u32>();
+
         // Capture the acting player's index and per-player values before the
         // action mutates them, plus all scalar fields that may change.
         let p = self.to_act as usize;
@@ -271,9 +278,24 @@ impl GameState {
         if self.street != old_street {
             self.undo.mark_street_changed();
         }
+
+        #[cfg(debug_assertions)]
+        {
+            let chips_after: u32 = self.stacks.iter().sum::<u32>()
+                + self.total_committed.iter().sum::<u32>();
+            debug_assert_eq!(
+                chips_before,
+                chips_after,
+                "chip conservation violated after {:?}: before={} after={}",
+                action,
+                chips_before,
+                chips_after
+            );
+        }
     }
 
     /// Undo the last applied action, restoring state exactly.
+    #[inline]
     pub fn undo_action(&mut self) {
         if let Some(rec) = self.undo.pop() {
             let p = rec.player as usize;
@@ -438,14 +460,25 @@ impl GameState {
                 .filter(|&&w| w != usize::MAX)
                 .count() as u32;
 
-            // Distribute side pot evenly (integer division; remainder goes to first winner).
+            // Distribute side pot evenly (integer division; remainder goes to
+            // the winner seated closest to the button's left, matching standard
+            // casino rules for odd-chip allocation).
             let share = side_pot / num_winners;
             let remainder = side_pot % num_winners;
-            let mut first = true;
-            for &w in winners.iter().filter(|&&w| w != usize::MAX) {
-                let extra = if first { remainder } else { 0 };
+            // Sort winners by seat distance from the button (button+1 first).
+            let mut sorted_winners: [usize; MAX_PLAYERS] = [usize::MAX; MAX_PLAYERS];
+            let mut sw_count = 0usize;
+            // Iterate starting from button+1, wrapping around.
+            for offset in 1..=n {
+                let seat = (self.button as usize + offset) % n;
+                if winners.contains(&seat) {
+                    sorted_winners[sw_count] = seat;
+                    sw_count += 1;
+                }
+            }
+            for (idx, &w) in sorted_winners[..sw_count].iter().enumerate() {
+                let extra = if idx == 0 { remainder } else { 0 };
                 payoffs[w] += (share + extra) as i32;
-                first = false;
             }
 
             prev_level = level;
@@ -510,8 +543,7 @@ impl GameState {
             }
             next = (next + 1) % n;
         }
-        debug_assert!(false, "next_active_player: no active player found — invalid game state");
-        from // fallback: return same player to avoid out-of-bounds
+        panic!("next_active_player: no active player found — corrupt game state (folded={:#010b} allin={:#010b})", self.folded, self.allin);
     }
 
     /// First active player seated to the left of the button (used for
@@ -525,8 +557,7 @@ impl GameState {
                 return i as u8;
             }
         }
-        debug_assert!(false, "first_active_after_button: no active player found — invalid game state");
-        self.button // fallback
+        panic!("first_active_after_button: no active player found — corrupt game state (folded={:#010b} allin={:#010b})", self.folded, self.allin);
     }
 
     /// After an action, either move to the next player or close the street.
@@ -709,5 +740,144 @@ mod tests {
         // All active players except the raiser now need to act.
         // players_to_act >= 1 (there are opponents).
         assert!(gs.players_to_act >= 1);
+    }
+
+    // ── Chip conservation helper ─────────────────────────────────────────────
+
+    fn chip_total(gs: &GameState) -> u32 {
+        gs.stacks.iter().sum::<u32>() + gs.total_committed.iter().sum::<u32>()
+    }
+
+    // ── Full-hand integration test ───────────────────────────────────────────
+
+    /// Play a complete hand (preflop → flop → turn → river → showdown) and
+    /// assert that chips are conserved at every step and payoffs sum to zero.
+    #[test]
+    fn full_hand_chip_conservation() {
+        let mut gs = make_game(2);
+        let initial_chips = chip_total(&gs);
+
+        // Preflop: SB (button=0) calls, BB checks.
+        gs.apply_action(Action::Call);
+        assert_eq!(chip_total(&gs), initial_chips, "conservation after preflop call");
+        gs.apply_action(Action::Check);
+        assert_eq!(chip_total(&gs), initial_chips, "conservation after preflop check");
+        assert_eq!(gs.street, 1, "should be on flop");
+
+        // Flop: check, check.
+        gs.apply_action(Action::Check);
+        assert_eq!(chip_total(&gs), initial_chips, "conservation after flop check 1");
+        gs.apply_action(Action::Check);
+        assert_eq!(chip_total(&gs), initial_chips, "conservation after flop check 2");
+        assert_eq!(gs.street, 2, "should be on turn");
+
+        // Turn: check, check.
+        gs.apply_action(Action::Check);
+        assert_eq!(chip_total(&gs), initial_chips, "conservation after turn check 1");
+        gs.apply_action(Action::Check);
+        assert_eq!(chip_total(&gs), initial_chips, "conservation after turn check 2");
+        assert_eq!(gs.street, 3, "should be on river");
+
+        // River: check, check → showdown.
+        gs.apply_action(Action::Check);
+        assert_eq!(chip_total(&gs), initial_chips, "conservation after river check 1");
+        gs.apply_action(Action::Check);
+        assert_eq!(chip_total(&gs), initial_chips, "conservation after river check 2");
+        assert!(gs.is_terminal(), "should be terminal after river");
+
+        let payoffs = gs.terminal_payoffs();
+        assert_eq!(payoffs.iter().sum::<i32>(), 0, "payoffs must sum to zero");
+    }
+
+    // ── Adversarial edge cases ────────────────────────────────────────────────
+
+    /// Everyone goes all-in preflop — hand must terminate correctly with chips conserved.
+    #[test]
+    fn all_in_preflop_two_players() {
+        let mut gs = make_game(2);
+        let initial_chips = chip_total(&gs);
+
+        gs.apply_action(Action::AllIn);
+        assert_eq!(chip_total(&gs), initial_chips, "conservation after p0 all-in");
+        gs.apply_action(Action::AllIn);
+        assert_eq!(chip_total(&gs), initial_chips, "conservation after p1 all-in");
+        assert!(gs.is_terminal(), "hand should be terminal when both all-in");
+
+        let payoffs = gs.terminal_payoffs();
+        assert_eq!(payoffs.iter().sum::<i32>(), 0, "payoffs must sum to zero");
+    }
+
+    /// 3-way all-in with different stack sizes — verify side pots and chip conservation.
+    #[test]
+    fn three_way_allin_different_stacks() {
+        // Player 0: button (stack 100), Player 1: SB (stack 200), Player 2: BB (stack 300).
+        let mut stacks = [0u32; MAX_PLAYERS];
+        stacks[0] = 100;
+        stacks[1] = 200;
+        stacks[2] = 300;
+        let holes = default_holes();
+        let board = default_board();
+        let big_blind = 10u32;
+        let mut gs = GameState::new(3, big_blind, stacks, holes, board, 0);
+        let initial_chips = chip_total(&gs);
+
+        // Drive everyone all-in: UTG (player 3%3=0 is button, so UTG is player (0+3)%3=0)
+        // Actually button=0, SB=(0+1)%3=1, BB=(0+2)%3=2, UTG=(0+3)%3=0=button. Wait, that
+        // wraps to 0. Let me think again. n=3, button=0, SB=1, BB=2, UTG=(0+3)%3=0.
+        // So UTG is the button position (0). First to act preflop is UTG=player 0.
+        gs.apply_action(Action::AllIn); // player 0 all-in (100 chips)
+        assert_eq!(chip_total(&gs), initial_chips);
+        gs.apply_action(Action::AllIn); // player 1 all-in (200 chips)
+        assert_eq!(chip_total(&gs), initial_chips);
+        gs.apply_action(Action::AllIn); // player 2 all-in (300 chips)
+        assert_eq!(chip_total(&gs), initial_chips);
+        assert!(gs.is_terminal(), "should be terminal when all players all-in");
+
+        let payoffs = gs.terminal_payoffs();
+        assert_eq!(payoffs.iter().sum::<i32>(), 0, "payoffs must sum to zero");
+        // Total chips redistributed must equal total initial chips.
+        let total_returned: i32 = payoffs
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| {
+                let committed = gs.total_committed[i] as i32;
+                committed + p
+            })
+            .sum();
+        assert_eq!(total_returned as u32, initial_chips, "all chips must be returned");
+    }
+
+    /// Min-raise then re-raise — min_raise must track the largest raise increment.
+    #[test]
+    fn min_raise_then_reraise() {
+        let mut gs = make_game(2);
+        // Preflop HU: button (p0, SB) is first to act.
+        // Raise to 30 (min raise = 20 above the BB=10).
+        gs.apply_action(Action::Raise(30));
+        assert_eq!(gs.current_bet, 30);
+        let mr_after_first = gs.min_raise;
+        assert!(mr_after_first >= 10, "min_raise should be >= BB after first raise");
+
+        // BB re-raises to 60 (raise increment = 30, >= min_raise).
+        gs.apply_action(Action::Raise(60));
+        assert_eq!(gs.current_bet, 60);
+        assert!(gs.min_raise >= mr_after_first, "min_raise should not decrease on re-raise");
+    }
+
+    /// BB special case: everyone limps preflop, BB gets the option to raise.
+    #[test]
+    fn bb_gets_option_when_everyone_limps() {
+        let mut gs = make_game(3);
+        // button=0, SB=1, BB=2, UTG=0
+        // UTG (player 0) calls (limps).
+        gs.apply_action(Action::Call);
+        // SB (player 1) calls (limps, tops up to BB).
+        gs.apply_action(Action::Call);
+        // Now BB (player 2) should still have the option — game is NOT terminal and
+        // it is BB's turn.  BB checks.
+        assert!(!gs.is_terminal(), "game should not be terminal before BB acts");
+        assert_eq!(gs.to_act, 2, "BB (player 2) should be next to act");
+        gs.apply_action(Action::Check); // BB exercises option by checking.
+        assert_eq!(gs.street, 1, "street should advance to flop after BB checks");
     }
 }

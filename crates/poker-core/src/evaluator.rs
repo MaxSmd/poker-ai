@@ -104,6 +104,7 @@ fn make_hand(cat: u8, r1: u8, r2: u8, r3: u8, r4: u8, r5: u8) -> u32 {
 ///
 /// Uses a single-pass rank-frequency table and bitmask straight detection to
 /// avoid the sort required by the previous implementation.
+#[inline]
 pub fn evaluate_5(cards: &[u8; 5]) -> u32 {
     let mut freq = [0u8; 13];
     let mut rank_bits = 0u16;
@@ -258,12 +259,11 @@ fn evaluate_from_tables(
     }
 
     // Overall rank bitmask (union of all suits).
-    let mut rank_bits = 0u16;
-    for r in 0..13 {
-        if freq[r] > 0 {
-            rank_bits |= 1u16 << r;
-        }
-    }
+    let rank_bits: u16 = freq
+        .iter()
+        .enumerate()
+        .filter(|(_, &f)| f > 0)
+        .fold(0u16, |bits, (r, _)| bits | (1u16 << r));
 
     // ── flush / straight-flush ───────────────────────────────────────────────
     let mut best_flush_or_sf = 0u32;
@@ -348,6 +348,7 @@ fn evaluate_from_tables(
 
 /// Evaluate the best 5-card hand from 6 cards (e.g., turn + hole cards).
 /// Direct single-pass evaluation — no heap allocation.
+#[inline]
 pub fn evaluate_6(cards: &[u8; 6]) -> u32 {
     let mut freq = [0u8; 13];
     let mut suit_rank_bits = [0u16; 4];
@@ -367,6 +368,7 @@ pub fn evaluate_6(cards: &[u8; 6]) -> u32 {
 /// Evaluate the strength of a 7-card hand. Returns a rank where higher is better.
 /// Direct single-pass evaluation — no heap allocation and no repeated subset
 /// enumeration.
+#[inline]
 pub fn evaluate_7(cards: &[u8; 7]) -> u32 {
     let mut freq = [0u8; 13];
     let mut suit_rank_bits = [0u16; 4];

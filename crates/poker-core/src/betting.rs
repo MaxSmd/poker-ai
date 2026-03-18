@@ -59,6 +59,9 @@ pub fn abstract_raise_amounts(
         // equal to the current pot + the call amount.
         let raise_size = ((pot as f64 + current_bet as f64) * frac).round() as u32;
         let new_bet = current_bet + raise_size.max(big_blind);
+        // Deduplicate: if this bet level rounds to the same value as the previous
+        // one (e.g., two fractions both round to the same chip amount), skip it
+        // so callers receive distinct choices only.
         if count == 0 || amounts[count - 1] != new_bet {
             amounts[count] = new_bet;
             count += 1;

@@ -131,8 +131,7 @@ fn fill_legal_actions(state: &GameState, out: &mut [Action; MAX_ACTIONS]) -> usi
         abstract_raise_amounts(pot, state.current_bet, state.street, state.big_blind);
 
     let mut allin_added = false;
-    for i in 0..nb {
-        let bet_level = abstract_bets[i];
+    for &bet_level in abstract_bets[..nb].iter() {
         if bet_level < min_raise_total {
             continue;
         }
@@ -175,8 +174,8 @@ fn traverse_recursive(state: &mut GameState) -> u64 {
     let n = fill_legal_actions(state, &mut actions);
     let mut count = 0u64;
 
-    for i in 0..n {
-        state.apply_action(actions[i]);
+    for &action in actions[..n].iter() {
+        state.apply_action(action);
         count += traverse_recursive(state);
         state.undo_action();
     }
