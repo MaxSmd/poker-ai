@@ -76,7 +76,7 @@ fn make_kuhn_state(p0_rank: u8, p1_rank: u8) -> GameState {
     // No board cards – showdown hand evaluation is not invoked during traversal.
     let board = [NO_CARD; 5];
 
-    GameState::new(2, 2, stacks, holes, board, 0)
+    GameState::new(2, 2, 1, stacks, holes, board, 0)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -128,7 +128,7 @@ fn fill_legal_actions(state: &GameState, out: &mut [Action; MAX_ACTIONS]) -> usi
 
     let pot = state.pot();
     let (abstract_bets, nb) =
-        abstract_raise_amounts(pot, state.current_bet, state.street, state.big_blind);
+        abstract_raise_amounts(pot, state.current_bet, state.min_raise, state.street);
 
     let mut allin_added = false;
     for &bet_level in abstract_bets[..nb].iter() {

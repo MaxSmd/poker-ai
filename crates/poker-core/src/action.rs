@@ -77,7 +77,7 @@ pub fn legal_actions(state: &GameState) -> Vec<Action> {
     }
 
     let pot = state.pot();
-    let (abstract_bets, n) = abstract_raise_amounts(pot, state.current_bet, state.street, state.big_blind);
+    let (abstract_bets, n) = abstract_raise_amounts(pot, state.current_bet, state.min_raise, state.street);
 
     let mut allin_added = false;
 
@@ -114,17 +114,20 @@ mod tests {
     fn make_game(num_players: u8) -> GameState {
         let stacks = [1000u32; MAX_PLAYERS];
         let mut holes = [[NO_CARD; 2]; MAX_PLAYERS];
+        // Use non-overlapping cards: player i gets ranks (i*2) and (i*2+1) in suit 0 and 1.
+        // This guarantees all hole cards are unique and don't overlap with the board.
         for i in 0..num_players as usize {
-            holes[i] = [make_card(i as u8, 0), make_card(i as u8 + 1, 1)];
+            holes[i] = [make_card(i as u8, 0), make_card(i as u8, 1)];
         }
+        // Board uses high ranks (8-12) in suit 2 to avoid any overlap with hole cards.
         let board = [
-            make_card(2, 0),
-            make_card(3, 1),
-            make_card(4, 2),
-            make_card(5, 3),
-            make_card(6, 0),
+            make_card(8, 2),
+            make_card(9, 2),
+            make_card(10, 2),
+            make_card(11, 2),
+            make_card(12, 2),
         ];
-        GameState::new(num_players, 10, stacks, holes, board, 0)
+        GameState::new(num_players, 10, 5, stacks, holes, board, 0)
     }
 
     #[test]

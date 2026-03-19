@@ -38,6 +38,11 @@ const RANK_PRIMES: [u32; 13] = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41];
 /// 4-bit category field in bits 23-20.
 const TIEBREAKER_MASK: u32 = 0x000F_FFFF;
 
+// Compile-time assertions: verify that the generated tables match the
+// constants declared here.  A mismatch would cause silent wrong evaluations.
+const _: () = assert!(FLUSH_LUT.len() == 8192, "FLUSH_LUT size mismatch with build.rs");
+const _: () = assert!(NOFLUSH_LUT.len() == NOFLUSH_SIZE, "NOFLUSH_LUT size mismatch with build.rs");
+
 // ── Core lookup helpers ───────────────────────────────────────────────────────
 
 /// Look up the hand rank for a flush (or straight-flush) hand described by a
@@ -514,6 +519,25 @@ mod tests {
         ];
         assert_eq!(evaluate_6_lut(&cards), evaluate_6(&cards));
         assert_eq!(evaluate_6_lut(&cards) >> 20, 8, "expected straight flush (wheel)");
+    }
+
+    /// Verify that RANK_PRIMES in lut_eval.rs match the build script by
+    /// spot-checking known prime products against the NOFLUSH_LUT.
+    #[test]
+    fn lut_constants_consistent_with_build() {
+        // A-K-Q-J-T (ranks 12,11,10,9,8) should have a valid non-flush entry.
+        let product: u32 = [12, 11, 10, 9, 8]
+            .iter()
+            .map(|&r| RANK_PRIMES[r as usize])
+            .product();
+        let rank = noflush_rank(product);
+        // This should be a straight (category 4).
+        assert_eq!(rank >> 20, 4, "A-K-Q-J-T should be a straight in NOFLUSH_LUT");
+
+        // 2-2-2-2-3 (four deuces + three) — product = 2^4 * 3 = 48
+        let product_quads: u32 = RANK_PRIMES[0].pow(4) * RANK_PRIMES[1];
+        let rank_quads = noflush_rank(product_quads);
+        assert_eq!(rank_quads >> 20, 7, "four deuces should be quads in NOFLUSH_LUT");
     }
 
     // ── Exhaustive validation (skipped by default; run with --ignored) ─────────
