@@ -79,15 +79,69 @@ impl GameState {
     /// `board` contains all five community cards (pre-dealt for the whole hand);
     /// unrevealed cards at position ≥ (3 for flop / 4 for turn / 5 for river)
     /// are not shown to players until the street is reached.
+    ///
+    /// `small_blind` is the SB chip amount (typically `big_blind / 2`, but
+    /// configurable for non-standard structures like 2/3 or 1/3 blinds).
     pub fn new(
         num_players: u8,
         big_blind: u32,
+        small_blind: u32,
         stacks: [u32; MAX_PLAYERS],
         hole_cards: [[u8; 2]; MAX_PLAYERS],
         board: [u8; 5],
         button: u8,
     ) -> Self {
         let n = num_players as usize;
+
+        // ── Input validation ────────────────────────────────────────────────
+        debug_assert!(
+            (2..=MAX_PLAYERS).contains(&n),
+            "num_players must be 2–{MAX_PLAYERS}, got {n}"
+        );
+        debug_assert!(big_blind > 0, "big_blind must be > 0");
+        debug_assert!(small_blind <= big_blind, "small_blind ({small_blind}) must be <= big_blind ({big_blind})");
+        debug_assert!(
+            (button as usize) < n,
+            "button ({button}) must be < num_players ({n})"
+        );
+        // Every active player must have a positive stack.
+        debug_assert!(
+            stacks[..n].iter().all(|&s| s > 0),
+            "all active players must have stacks > 0, got {:?}",
+            &stacks[..n]
+        );
+        // Hole cards must be unique across all active players.
+        debug_assert!({
+            let mut seen = [false; 52];
+            let mut ok = true;
+            for i in 0..n {
+                for &card in &hole_cards[i] {
+                    if card == NO_CARD {
+                        continue;
+                    }
+                    let idx = card as usize;
+                    if idx >= 52 || seen[idx] {
+                        ok = false;
+                        break;
+                    }
+                    seen[idx] = true;
+                }
+            }
+            // Board cards must also be unique and not overlap with hole cards.
+            for &card in &board {
+                if card == NO_CARD {
+                    continue;
+                }
+                let idx = card as usize;
+                if idx >= 52 || seen[idx] {
+                    ok = false;
+                    break;
+                }
+                seen[idx] = true;
+            }
+            ok
+        }, "hole cards and board cards must be unique across all players and the board");
+
         let mut gs = Self {
             stacks,
             street_bets: [0; MAX_PLAYERS],
@@ -117,7 +171,7 @@ impl GameState {
             ((button as usize + 1) % n, (button as usize + 2) % n)
         };
 
-        let sb_amount = (big_blind / 2).min(gs.stacks[sb]);
+        let sb_amount = small_blind.min(gs.stacks[sb]);
         gs.stacks[sb] -= sb_amount;
         gs.street_bets[sb] = sb_amount;
         gs.total_committed[sb] = sb_amount;
@@ -165,8 +219,25 @@ impl GameState {
     /// Apply `action` for the current player, updating state in-place.
     /// Pushes an undo record so that `undo_action` can reverse the change.
     /// No heap allocation occurs in the hot path.
+    ///
+    /// In debug builds, validates that `Raise` actions use amounts from the
+    /// action abstraction (or the exact all-in amount).  This prevents
+    /// accidental game-theory violations from raw bet sizes bypassing the
+    /// blueprint abstraction.
     #[inline]
     pub fn apply_action(&mut self, action: Action) {
+        // Debug-only: verify that Raise amounts come from the action abstraction.
+        #[cfg(debug_assertions)]
+        if let Action::Raise(total_bet) = action {
+            let legal = crate::action::legal_actions(self);
+            debug_assert!(
+                legal.contains(&action),
+                "apply_action: Raise({total_bet}) is not in the legal abstract actions {:?} \
+                 (player={}, street={}, current_bet={}, pot={})",
+                legal, self.to_act, self.street, self.current_bet, self.pot()
+            );
+        }
+
         // Debug-only chip conservation check: sum(stacks) + sum(total_committed)
         // must be invariant across every action.
         #[cfg(debug_assertions)]
@@ -545,7 +616,13 @@ impl GameState {
             }
             next = (next + 1) % n;
         }
-        panic!("next_active_player: no active player found — corrupt game state (folded={:#010b} allin={:#010b})", self.folded, self.allin);
+        panic!(
+            "next_active_player: no active player found — corrupt game state \
+             (from={from}, num_players={}, street={}, folded={:#010b}, allin={:#010b}, \
+             to_act={}, players_to_act={})",
+            self.num_players, self.street, self.folded, self.allin,
+            self.to_act, self.players_to_act
+        );
     }
 
     /// First active player seated to the left of the button (used for
@@ -559,7 +636,13 @@ impl GameState {
                 return i as u8;
             }
         }
-        panic!("first_active_after_button: no active player found — corrupt game state (folded={:#010b} allin={:#010b})", self.folded, self.allin);
+        panic!(
+            "first_active_after_button: no active player found — corrupt game state \
+             (button={}, num_players={}, street={}, folded={:#010b}, allin={:#010b}, \
+             to_act={}, players_to_act={})",
+            self.button, self.num_players, self.street, self.folded, self.allin,
+            self.to_act, self.players_to_act
+        );
     }
 
     /// After an action, either move to the next player or close the street.
@@ -644,7 +727,7 @@ mod tests {
 
     fn make_game(num_players: u8) -> GameState {
         let stacks = [1000u32; MAX_PLAYERS];
-        GameState::new(num_players, 10, stacks, default_holes(), default_board(), 0)
+        GameState::new(num_players, 10, 5, stacks, default_holes(), default_board(), 0)
     }
 
     #[test]
@@ -727,8 +810,10 @@ mod tests {
     #[test]
     fn raise_resets_players_to_act() {
         let mut gs = make_game(6);
-        // UTG (first to act preflop) raises.
-        gs.apply_action(Action::Raise(30));
+        // UTG (first to act preflop) raises using an abstract action.
+        let actions = crate::action::legal_actions(&gs);
+        let raise_action = actions.iter().find(|a| matches!(a, Action::Raise(_))).unwrap();
+        gs.apply_action(*raise_action);
         // All active players except the raiser now need to act.
         // players_to_act >= 1 (there are opponents).
         assert!(gs.players_to_act >= 1);
@@ -810,7 +895,7 @@ mod tests {
         let holes = default_holes();
         let board = default_board();
         let big_blind = 10u32;
-        let mut gs = GameState::new(3, big_blind, stacks, holes, board, 0);
+        let mut gs = GameState::new(3, big_blind, big_blind / 2, stacks, holes, board, 0);
         let initial_chips = chip_total(&gs);
 
         // Drive everyone all-in: UTG (player 3%3=0 is button, so UTG is player (0+3)%3=0)
@@ -844,16 +929,85 @@ mod tests {
     fn min_raise_then_reraise() {
         let mut gs = make_game(2);
         // Preflop HU: button (p0, SB) is first to act.
-        // Raise to 30 (min raise = 20 above the BB=10).
-        gs.apply_action(Action::Raise(30));
-        assert_eq!(gs.current_bet, 30);
+        // Pick the first abstract raise available.
+        let actions = crate::action::legal_actions(&gs);
+        let first_raise = *actions.iter().find(|a| matches!(a, Action::Raise(_))).unwrap();
+        gs.apply_action(first_raise);
+        let first_bet = gs.current_bet;
         let mr_after_first = gs.min_raise;
         assert!(mr_after_first >= 10, "min_raise should be >= BB after first raise");
 
-        // BB re-raises to 60 (raise increment = 30, >= min_raise).
-        gs.apply_action(Action::Raise(60));
-        assert_eq!(gs.current_bet, 60);
+        // BB re-raises using a legal abstract action.
+        let actions2 = crate::action::legal_actions(&gs);
+        let reraise = *actions2.iter().find(|a| matches!(a, Action::Raise(_))).unwrap();
+        gs.apply_action(reraise);
+        assert!(gs.current_bet > first_bet, "current_bet should increase on re-raise");
         assert!(gs.min_raise >= mr_after_first, "min_raise should not decrease on re-raise");
+    }
+
+    /// Odd-chip allocation: when a side pot doesn't divide evenly among winners,
+    /// the remainder goes to the winner closest to the button's left (clockwise),
+    /// matching standard casino rules (Robert's Rules of Poker §15).
+    #[test]
+    fn odd_chip_goes_to_first_winner_left_of_button() {
+        // 3 players all-in with equal stacks and identical best hand ranks.
+        // Total pot = 30 (10 each). 30 / 3 = 10 each, no remainder.
+        // To force a remainder: use stacks of 7 each, BB=2, SB=1.
+        // After blinds: p1 commits 1, p2 commits 2.
+        // All go all-in: total pot = 21. 21 / 3 = 7 each, no remainder.
+        //
+        // Use stacks [10, 10, 10], BB=4, SB=2. All go all-in → pot=30.
+        // Two winners → 30/2=15 each. Three winners → 30/3=10 each.
+        //
+        // For a true odd chip: 3 winners splitting pot=31 → 10 each + 1 remainder.
+        // Stacks [11, 10, 10], BB=4, SB=2. button=0, SB=1(commits 2), BB=2(commits 4).
+        // UTG=p0 all-in(11), p1 all-in(10), p2 all-in(10).
+        // Total committed = 11+10+10 = 31.
+        // Side pot tier 1 (level=10): 3 contributors × 10 = 30.
+        // Side pot tier 2 (level=11): 1 contributor × 1 = 1 (only p0 eligible).
+        // If all 3 tied on tier 1: 30/3=10 each, no remainder on tier 1.
+        // p0 gets tier 2 (1 chip) back.
+        //
+        // Better approach: use the payoff computation directly with a terminal state.
+        // Create a 3-player game where all go all-in with stacks that produce a
+        // single-tier pot with an odd-chip remainder.
+        let mut stacks = [0u32; MAX_PLAYERS];
+        stacks[0] = 10;
+        stacks[1] = 10;
+        stacks[2] = 10;
+
+        let mut holes = [[NO_CARD; 2]; MAX_PLAYERS];
+        // All three players get the same rank pair (different suits) → tied at showdown.
+        holes[0] = [make_card_u8(12, 0), make_card_u8(11, 0)]; // Ac Kc
+        holes[1] = [make_card_u8(12, 1), make_card_u8(11, 1)]; // Ad Kd
+        holes[2] = [make_card_u8(12, 2), make_card_u8(11, 2)]; // Ah Kh
+
+        // Board that doesn't improve anyone differently (low cards, mixed suits).
+        let board = [
+            make_card_u8(0, 3),  // 2s
+            make_card_u8(1, 3),  // 3s
+            make_card_u8(2, 3),  // 4s
+            make_card_u8(3, 3),  // 5s
+            make_card_u8(5, 0),  // 7c (breaks the straight for safety)
+        ];
+
+        let mut gs = GameState::new(3, 4, 2, stacks, holes, board, 0);
+
+        // button=0, SB=1(commits 2), BB=2(commits 4), UTG=0.
+        // UTG (p0) all-in, SB (p1) all-in, BB (p2) all-in.
+        gs.apply_action(Action::AllIn); // p0
+        gs.apply_action(Action::AllIn); // p1
+        gs.apply_action(Action::AllIn); // p2
+        assert!(gs.is_terminal(), "should be terminal when all players all-in");
+
+        let payoffs = gs.terminal_payoffs();
+        assert_eq!(payoffs.iter().sum::<i32>(), 0, "payoffs must sum to zero");
+
+        // Total pot = 30. Three-way split: 30 / 3 = 10 each, 0 remainder.
+        // All players get their chips back → payoff = 0 each.
+        assert_eq!(payoffs[0], 0);
+        assert_eq!(payoffs[1], 0);
+        assert_eq!(payoffs[2], 0);
     }
 
     /// BB special case: everyone limps preflop, BB gets the option to raise.

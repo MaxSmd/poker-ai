@@ -105,7 +105,7 @@ fn make_bench_state() -> GameState {
         make_card(5, 3),
         make_card(6, 0),
     ];
-    GameState::new(6, 10, [1000u32; MAX_PLAYERS], holes, board, 0)
+    GameState::new(6, 10, 5, [1000u32; MAX_PLAYERS], holes, board, 0)
 }
 
 /// Benchmark a single apply_action + undo_action cycle.
