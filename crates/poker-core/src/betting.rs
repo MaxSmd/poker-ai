@@ -7,7 +7,7 @@
 //! | Preflop | fixed open/3-bet/4-bet multiples   |
 //! | Flop    | 0.33, 0.67, 1.0                    |
 //! | Turn    | 0.50, 0.75, 1.0                    |
-//! | River   | 0.50, 0.75, 1.0, 1.5 (overbet)    |
+//! | River   | 0.50, 0.75, 1.0, 1.5 (overbet)     |
 //! | Any     | all-in always available (caller)   |
 //!
 //! All sizing arithmetic uses integer-only math (numerator/denominator pairs)

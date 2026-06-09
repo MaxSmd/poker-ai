@@ -19,7 +19,7 @@
 //! `evaluate_7_lut` (like `evaluate_6_lut`) uses a single-pass frequency and
 //! per-suit bitmask approach — no C(7,5) = 21 subset enumeration needed.
 
-use crate::evaluator::{rank_of, suit_of};
+use crate::evaluator::{best_non_flush_rank, find_best_straight, make_hand, rank_of, suit_of};
 
 // ── Generated tables (written to $OUT_DIR/lut_tables.rs by build.rs) ─────────
 
@@ -33,10 +33,6 @@ const HASH_MUL: u32 = 2_654_435_761;
 
 /// Primes for ranks 0..=12 (two through ace).
 const RANK_PRIMES: [u32; 13] = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41];
-
-/// Mask that keeps only the tiebreaker nibbles (bits 19-0), stripping the
-/// 4-bit category field in bits 23-20.
-const TIEBREAKER_MASK: u32 = 0x000F_FFFF;
 
 // Compile-time assertions: verify that the generated tables match the
 // constants declared here.  A mismatch would cause silent wrong evaluations.
@@ -56,36 +52,33 @@ fn flush_rank(rank_bits: u16) -> u32 {
 /// Return a new bitmask containing only the top 5 set bits of `bits`.
 /// Used to reduce a 6- or 7-card suited hand to exactly 5 ranks before
 /// indexing `FLUSH_LUT`, which only has valid entries for 5-bit masks.
+///
+/// Clears the lowest set bit repeatedly until exactly 5 remain, keeping
+/// the highest 5 ranks.  Runs at most 2 iterations for 6- or 7-card hands.
 #[inline(always)]
-fn top5_bits(bits: u16) -> u16 {
-    let mut result = 0u16;
-    let mut count = 0u8;
-    for bit in (0..13).rev() {
-        if (bits >> bit) & 1 == 1 {
-            result |= 1u16 << bit;
-            count += 1;
-            if count == 5 {
-                break;
-            }
-        }
+fn top5_bits(mut bits: u16) -> u16 {
+    while bits.count_ones() > 5 {
+        bits &= bits - 1; // clear lowest set bit
     }
-    result
+    bits
 }
 
 /// Look up the hand rank for a non-flush hand described by the product of its
 /// five rank primes.  Uses linear probing; expected probe count < 2.
+///
+/// Panics if the product is not found after a full table scan, which indicates
+/// either a corrupt LUT (build script bug) or an invalid input product.
 #[inline(always)]
 fn noflush_rank(product: u32) -> u32 {
     let mut idx = (product.wrapping_mul(HASH_MUL) as usize) & NOFLUSH_MASK;
-    loop {
+    for _ in 0..NOFLUSH_SIZE {
         let (key, val) = NOFLUSH_LUT[idx];
         if key == product {
             return val;
         }
-        // key == 0 would indicate a missing entry, which should never happen
-        // for a valid 5-card non-flush hand.
         idx = (idx + 1) & NOFLUSH_MASK;
     }
+    panic!("noflush_rank: product {product} not found — corrupt LUT or invalid non-flush hand");
 }
 
 // ── Public evaluators ─────────────────────────────────────────────────────────
@@ -170,154 +163,37 @@ pub fn evaluate_7_lut(cards: &[u8; 7]) -> u32 {
 
 /// Shared core for [`evaluate_6_lut`] and [`evaluate_7_lut`]: derives the best
 /// hand from pre-built frequency and per-suit rank-bitmask tables, using
-/// [`FLUSH_LUT`] for flush and straight-flush classification (a single array
-/// lookup replaces the straight-scan + rank-extraction done by the bitmask
-/// evaluator).
+/// [`FLUSH_LUT`] for flush and straight-flush classification.  Non-flush
+/// classification is delegated to [`best_non_flush_rank`] from `evaluator.rs`
+/// so the logic lives in exactly one place.
 fn evaluate_from_tables_lut(
     freq: &[u8; 13],
     suit_rank_bits: &[u16; 4],
     suit_count: &[u8; 4],
 ) -> u32 {
-    use crate::evaluator::find_best_straight;
-
-    // ── frequency-based components ───────────────────────────────────────────
-    let mut quad_rank = 0u8;
-    let mut trips = [0u8; 2];
-    let mut pairs = [0u8; 3];
-    let mut num_trips = 0usize;
-    let mut num_pairs = 0usize;
-    let mut has_quads = false;
-
-    for r in (0..13u8).rev() {
-        match freq[r as usize] {
-            4 => {
-                quad_rank = r;
-                has_quads = true;
-            }
-            3 => {
-                if num_trips < 2 {
-                    trips[num_trips] = r;
-                    num_trips += 1;
-                }
-            }
-            2 => {
-                if num_pairs < 3 {
-                    pairs[num_pairs] = r;
-                    num_pairs += 1;
-                }
-            }
-            _ => {}
-        }
+    // Overall rank bitmask — needed by best_non_flush_rank for straight check.
+    let mut rank_bits = 0u16;
+    for (r, &f) in freq.iter().enumerate() {
+        if f > 0 { rank_bits |= 1u16 << r; }
     }
 
-    let rank_bits: u16 = freq
-        .iter()
-        .enumerate()
-        .filter(|(_, &f)| f > 0)
-        .fold(0u16, |bits, (r, _)| bits | (1u16 << r));
-
     // ── flush / straight-flush via FLUSH_LUT ─────────────────────────────────
-    let mut best_flush_or_sf = 0u32;
+    // Check SF on the full suited bitmask (catches wheel SFs where A isn't
+    // among the top 5 ranks), then reduce to the top 5 for a plain flush.
+    let mut best_flush = 0u32;
     for s in 0..4 {
         if suit_count[s] >= 5 {
-            // When 6 or 7 cards share a suit, suit_rank_bits[s] has 6/7 bits
-            // set, but FLUSH_LUT is only defined for exactly-5-bit masks.
-            // Check for straight-flush first using the full bitmask (so that
-            // wheel SFs like A-2-3-4-5 are detected even when A is not among
-            // the top 5 ranks), then reduce to the top 5 for a plain flush.
             let bits = suit_rank_bits[s];
             let (is_sf, sf_top) = find_best_straight(bits);
             if is_sf {
-                // Straight flush — nothing can beat it.
-                return make_hand_lut(8, sf_top, 0, 0, 0, 0);
+                return make_hand(8, sf_top, 0, 0, 0, 0);
             }
-            // Regular flush: look up best 5 suited ranks.
             let fv = flush_rank(top5_bits(bits));
-            if fv > best_flush_or_sf {
-                best_flush_or_sf = fv;
-            }
+            if fv > best_flush { best_flush = fv; }
         }
     }
 
-    // ── non-flush hand ───────────────────────────────────────────────────────
-    let best_non_flush = if has_quads {
-        let kicker = (0..13u8)
-            .rev()
-            .find(|&r| r != quad_rank && freq[r as usize] > 0)
-            .unwrap_or(0);
-        make_hand_lut(7, quad_rank, kicker, 0, 0, 0)
-    } else if num_trips >= 1 && (num_pairs >= 1 || num_trips >= 2) {
-        let pair_part = if num_trips >= 2 { trips[1] } else { pairs[0] };
-        make_hand_lut(6, trips[0], pair_part, 0, 0, 0)
-    } else {
-        let (is_straight, straight_top) = find_best_straight(rank_bits);
-        if is_straight {
-            make_hand_lut(4, straight_top, 0, 0, 0, 0)
-        } else if num_trips == 1 {
-            let mut k = [0u8; 2];
-            let mut ki = 0;
-            for r in (0..13u8).rev() {
-                if freq[r as usize] > 0 && r != trips[0] {
-                    k[ki] = r;
-                    ki += 1;
-                    if ki == 2 {
-                        break;
-                    }
-                }
-            }
-            make_hand_lut(3, trips[0], k[0], k[1], 0, 0)
-        } else if num_pairs >= 2 {
-            let kicker = (0..13u8)
-                .rev()
-                .find(|&r| r != pairs[0] && r != pairs[1] && freq[r as usize] > 0)
-                .unwrap_or(0);
-            make_hand_lut(2, pairs[0], pairs[1], kicker, 0, 0)
-        } else if num_pairs == 1 {
-            let mut k = [0u8; 3];
-            let mut ki = 0;
-            for r in (0..13u8).rev() {
-                if freq[r as usize] > 0 && r != pairs[0] {
-                    k[ki] = r;
-                    ki += 1;
-                    if ki == 3 {
-                        break;
-                    }
-                }
-            }
-            make_hand_lut(1, pairs[0], k[0], k[1], k[2], 0)
-        } else {
-            // High card: find the top 5 ranks from rank_bits (which may have
-            // more than 5 bits set for 6- or 7-card hands).
-            // Build a 5-bit bitmask of the top 5 set bits, look up in
-            // FLUSH_LUT (category 5 = flush), then strip the category to 0.
-            let mut top5 = 0u16;
-            let mut count = 0u8;
-            for bit in (0..13i32).rev() {
-                if (rank_bits >> bit) & 1 == 1 {
-                    top5 |= 1u16 << bit;
-                    count += 1;
-                    if count == 5 {
-                        break;
-                    }
-                }
-            }
-            flush_rank(top5) & TIEBREAKER_MASK
-        }
-    };
-
-    best_non_flush.max(best_flush_or_sf)
-}
-
-/// Pack category and tiebreaker ranks into a hand value (mirrors `make_hand`
-/// in `evaluator.rs`; kept private to this module).
-#[inline(always)]
-fn make_hand_lut(cat: u8, r1: u8, r2: u8, r3: u8, r4: u8, r5: u8) -> u32 {
-    ((cat as u32) << 20)
-        | ((r1 as u32) << 16)
-        | ((r2 as u32) << 12)
-        | ((r3 as u32) << 8)
-        | ((r4 as u32) << 4)
-        | (r5 as u32)
+    best_non_flush_rank(freq, rank_bits).max(best_flush)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

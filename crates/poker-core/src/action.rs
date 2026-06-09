@@ -30,6 +30,38 @@ pub enum Action {
     AllIn,
 }
 
+/// Stack-allocated list of legal actions — avoids heap allocation in the CFR
+/// hot path.  Supports up to 8 actions (fold/check/call + up to 4 abstract
+/// raises + all-in), which is sufficient for any configured bet abstraction.
+///
+/// Derefs to `&[Action]`, so all slice methods (`contains`, `iter`, `len`,
+/// `is_empty`, …) work without additional code.
+#[derive(Clone, Copy, Debug)]
+pub struct ActionList {
+    buf: [Action; 8],
+    len: usize,
+}
+
+impl ActionList {
+    fn new() -> Self {
+        Self { buf: [Action::Fold; 8], len: 0 }
+    }
+
+    fn push(&mut self, a: Action) {
+        debug_assert!(self.len < 8, "ActionList capacity exceeded");
+        self.buf[self.len] = a;
+        self.len += 1;
+    }
+}
+
+impl std::ops::Deref for ActionList {
+    type Target = [Action];
+    #[inline]
+    fn deref(&self) -> &[Action] {
+        &self.buf[..self.len]
+    }
+}
+
 /// Returns the legal abstract actions available for the current player in `state`.
 ///
 /// Uses the blueprint action abstraction from [`betting`]:
@@ -38,11 +70,10 @@ pub enum Action {
 /// - AllIn is always appended when it represents a bet or raise above the
 ///   current bet and the player has chips remaining.
 ///
-/// The returned `Vec` is pre-allocated with capacity 8 to avoid reallocations
-/// in typical cases.
+/// Returns a stack-allocated [`ActionList`] — no heap allocation occurs.
 #[inline]
-pub fn legal_actions(state: &GameState) -> Vec<Action> {
-    let mut actions: Vec<Action> = Vec::with_capacity(8);
+pub fn legal_actions(state: &GameState) -> ActionList {
+    let mut actions = ActionList::new();
 
     if state.is_terminal() {
         return actions;
@@ -50,7 +81,7 @@ pub fn legal_actions(state: &GameState) -> Vec<Action> {
 
     let p = state.to_act as usize;
     let to_call = state.current_bet.saturating_sub(state.street_bets[p]);
-    // Maximum total street-bet this player can make (all chips in).
+    // Maximum total street-bet this player can reach (all chips in).
     let max_bet = state.stacks[p] + state.street_bets[p];
 
     // --- passive options ---
@@ -68,26 +99,22 @@ pub fn legal_actions(state: &GameState) -> Vec<Action> {
     }
 
     // --- aggressive options ---
-    // Minimum legal raise total: current_bet + min_raise.
+    // At this point max_bet > current_bet is guaranteed: if to_call == 0
+    // the player has chips (active players always do); if to_call > 0 we
+    // already returned when stacks[p] <= to_call, so stacks[p] > to_call
+    // implies max_bet = stacks[p] + street_bets[p] > current_bet.
     let min_raise_total = state.current_bet + state.min_raise;
-
-    if max_bet <= state.current_bet {
-        // Player can't raise (no chips above the call amount).
-        return actions;
-    }
-
-    let pot = state.pot();
-    let (abstract_bets, n) = abstract_raise_amounts(pot, state.current_bet, state.min_raise, state.street);
+    let pot = state.pot;
+    let (abstract_bets, n) =
+        abstract_raise_amounts(pot, state.current_bet, state.min_raise, state.street);
 
     let mut allin_added = false;
 
     for &bet_level in &abstract_bets[..n] {
         if bet_level < min_raise_total {
-            // Below minimum raise — skip.
             continue;
         }
         if bet_level >= max_bet {
-            // Would require going all-in or beyond.
             if !allin_added {
                 actions.push(Action::AllIn);
                 allin_added = true;
@@ -97,7 +124,6 @@ pub fn legal_actions(state: &GameState) -> Vec<Action> {
         actions.push(Action::Raise(bet_level));
     }
 
-    // All-in is always a valid aggressive action if it's at least a call/min-raise.
     if !allin_added && max_bet >= min_raise_total {
         actions.push(Action::AllIn);
     }
@@ -114,12 +140,9 @@ mod tests {
     fn make_game(num_players: u8) -> GameState {
         let stacks = [1000u32; MAX_PLAYERS];
         let mut holes = [[NO_CARD; 2]; MAX_PLAYERS];
-        // Use non-overlapping cards: player i gets ranks (i*2) and (i*2+1) in suit 0 and 1.
-        // This guarantees all hole cards are unique and don't overlap with the board.
         for i in 0..num_players as usize {
             holes[i] = [make_card(i as u8, 0), make_card(i as u8, 1)];
         }
-        // Board uses high ranks (8-12) in suit 2 to avoid any overlap with hole cards.
         let board = [
             make_card(8, 2),
             make_card(9, 2),
@@ -142,7 +165,6 @@ mod tests {
     #[test]
     fn check_available_when_no_bet() {
         let mut gs = make_game(2);
-        // HU: SB calls, then BB has no bet to face.
         gs.apply_action(Action::Call);
         let actions = legal_actions(&gs);
         assert!(actions.contains(&Action::Check));

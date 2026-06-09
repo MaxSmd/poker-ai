@@ -91,13 +91,86 @@ pub fn make_card(rank: u8, suit: u8) -> u8 {
 /// Pack category and up-to-5 tiebreaker ranks into a comparable `u32`.
 /// `cat` is 0–8; each `rN` is a rank 0–12 stored in a 4-bit nibble.
 #[inline]
-fn make_hand(cat: u8, r1: u8, r2: u8, r3: u8, r4: u8, r5: u8) -> u32 {
+pub(crate) fn make_hand(cat: u8, r1: u8, r2: u8, r3: u8, r4: u8, r5: u8) -> u32 {
     ((cat as u32) << 20)
         | ((r1 as u32) << 16)
         | ((r2 as u32) << 12)
         | ((r3 as u32) << 8)
         | ((r4 as u32) << 4)
         | (r5 as u32)
+}
+
+/// Classify the best non-flush hand from a rank-frequency table.
+///
+/// Shared by both the reference evaluator and the LUT evaluator so the
+/// non-flush classification logic lives in exactly one place.  Handles all
+/// categories from quads down through high card.
+///
+/// `freq`      – 13-element rank frequency histogram.
+/// `rank_bits` – 13-bit mask of ranks present (bit `r` set iff `freq[r] > 0`).
+///               Callers computing both fields in the same loop should pass it
+///               in; callers that only have `freq` can build it with the
+///               one-liner `freq.iter().enumerate().filter(|(_,&f)| f>0).fold(0u16, |b,(r,_)| b | 1<<r)`.
+#[inline]
+pub(crate) fn best_non_flush_rank(freq: &[u8; 13], rank_bits: u16) -> u32 {
+    let mut quad_rank = 0u8;
+    let mut trips = [0u8; 2];
+    let mut pairs = [0u8; 3];
+    let mut num_trips = 0usize;
+    let mut num_pairs = 0usize;
+    let mut has_quads = false;
+
+    for r in (0..13u8).rev() {
+        match freq[r as usize] {
+            4 => { quad_rank = r; has_quads = true; }
+            3 => { if num_trips < 2 { trips[num_trips] = r; num_trips += 1; } }
+            2 => { if num_pairs < 3 { pairs[num_pairs] = r; num_pairs += 1; } }
+            _ => {}
+        }
+    }
+
+    if has_quads {
+        let kicker = (0..13u8).rev()
+            .find(|&r| r != quad_rank && freq[r as usize] > 0)
+            .unwrap_or(0);
+        make_hand(7, quad_rank, kicker, 0, 0, 0)
+    } else if num_trips >= 1 && (num_pairs >= 1 || num_trips >= 2) {
+        let pair_part = if num_trips >= 2 { trips[1] } else { pairs[0] };
+        make_hand(6, trips[0], pair_part, 0, 0, 0)
+    } else {
+        let (is_straight, straight_top) = find_best_straight(rank_bits);
+        if is_straight {
+            make_hand(4, straight_top, 0, 0, 0, 0)
+        } else if num_trips == 1 {
+            let mut k = [0u8; 2];
+            let mut ki = 0;
+            for r in (0..13u8).rev() {
+                if freq[r as usize] > 0 && r != trips[0] {
+                    k[ki] = r; ki += 1;
+                    if ki == 2 { break; }
+                }
+            }
+            make_hand(3, trips[0], k[0], k[1], 0, 0)
+        } else if num_pairs >= 2 {
+            let kicker = (0..13u8).rev()
+                .find(|&r| r != pairs[0] && r != pairs[1] && freq[r as usize] > 0)
+                .unwrap_or(0);
+            make_hand(2, pairs[0], pairs[1], kicker, 0, 0)
+        } else if num_pairs == 1 {
+            let mut k = [0u8; 3];
+            let mut ki = 0;
+            for r in (0..13u8).rev() {
+                if freq[r as usize] > 0 && r != pairs[0] {
+                    k[ki] = r; ki += 1;
+                    if ki == 3 { break; }
+                }
+            }
+            make_hand(1, pairs[0], k[0], k[1], k[2], 0)
+        } else {
+            let r = top_n_ranks::<5>(rank_bits);
+            make_hand(0, r[0], r[1], r[2], r[3], r[4])
+        }
+    }
 }
 
 /// Evaluate a 5-card hand.  Returns a rank where higher is better.
@@ -228,122 +301,30 @@ fn evaluate_from_tables(
     suit_rank_bits: &[u16; 4],
     suit_count: &[u8; 4],
 ) -> u32 {
-    // ── frequency-based components ───────────────────────────────────────────
-    let mut quad_rank = 0u8;
-    let mut trips = [0u8; 2]; // up to 2 trip ranks in 7 cards
-    let mut pairs = [0u8; 3]; // up to 3 pair ranks in 7 cards
-    let mut num_trips = 0usize;
-    let mut num_pairs = 0usize;
-    let mut has_quads = false;
-
-    for r in (0..13u8).rev() {
-        match freq[r as usize] {
-            4 => {
-                quad_rank = r;
-                has_quads = true;
-            }
-            3 => {
-                if num_trips < 2 {
-                    trips[num_trips] = r;
-                    num_trips += 1;
-                }
-            }
-            2 => {
-                if num_pairs < 3 {
-                    pairs[num_pairs] = r;
-                    num_pairs += 1;
-                }
-            }
-            _ => {}
-        }
+    // Overall rank bitmask (union of all suits).
+    let mut rank_bits = 0u16;
+    for (r, &f) in freq.iter().enumerate() {
+        if f > 0 { rank_bits |= 1u16 << r; }
     }
 
-    // Overall rank bitmask (union of all suits).
-    let rank_bits: u16 = freq
-        .iter()
-        .enumerate()
-        .filter(|(_, &f)| f > 0)
-        .fold(0u16, |bits, (r, _)| bits | (1u16 << r));
-
     // ── flush / straight-flush ───────────────────────────────────────────────
-    let mut best_flush_or_sf = 0u32;
+    let mut best_flush = 0u32;
     for s in 0..4 {
         if suit_count[s] >= 5 {
             let fb = suit_rank_bits[s];
             let (is_sf, sf_top) = find_best_straight(fb);
             if is_sf {
-                // Straight flush beats everything else; return immediately.
                 return make_hand(8, sf_top, 0, 0, 0, 0);
             }
-            // Regular flush: best 5 cards from this suit.
             let r = top_n_ranks::<5>(fb);
             let fv = make_hand(5, r[0], r[1], r[2], r[3], r[4]);
-            if fv > best_flush_or_sf {
-                best_flush_or_sf = fv;
-            }
+            if fv > best_flush { best_flush = fv; }
         }
     }
 
-    // ── non-flush hand ───────────────────────────────────────────────────────
-    let best_non_flush = if has_quads {
-        let kicker = (0..13u8)
-            .rev()
-            .find(|&r| r != quad_rank && freq[r as usize] > 0)
-            .unwrap_or(0);
-        make_hand(7, quad_rank, kicker, 0, 0, 0)
-    } else if num_trips >= 1 && (num_pairs >= 1 || num_trips >= 2) {
-        // Full house: best trips + best "pair" (second trips or highest pair).
-        let pair_part = if num_trips >= 2 { trips[1] } else { pairs[0] };
-        make_hand(6, trips[0], pair_part, 0, 0, 0)
-    } else {
-        // Straight check.
-        let (is_straight, straight_top) = find_best_straight(rank_bits);
-
-        if is_straight {
-            // Might still lose to a flush (already computed above).
-            make_hand(4, straight_top, 0, 0, 0, 0)
-        } else if num_trips == 1 {
-            let mut k = [0u8; 2];
-            let mut ki = 0;
-            for r in (0..13u8).rev() {
-                if freq[r as usize] > 0 && r != trips[0] {
-                    k[ki] = r;
-                    ki += 1;
-                    if ki == 2 {
-                        break;
-                    }
-                }
-            }
-            make_hand(3, trips[0], k[0], k[1], 0, 0)
-        } else if num_pairs >= 2 {
-            let kicker = (0..13u8)
-                .rev()
-                .find(|&r| r != pairs[0] && r != pairs[1] && freq[r as usize] > 0)
-                .unwrap_or(0);
-            make_hand(2, pairs[0], pairs[1], kicker, 0, 0)
-        } else if num_pairs == 1 {
-            let mut k = [0u8; 3];
-            let mut ki = 0;
-            for r in (0..13u8).rev() {
-                if freq[r as usize] > 0 && r != pairs[0] {
-                    k[ki] = r;
-                    ki += 1;
-                    if ki == 3 {
-                        break;
-                    }
-                }
-            }
-            make_hand(1, pairs[0], k[0], k[1], k[2], 0)
-        } else {
-            let r = top_n_ranks::<5>(rank_bits);
-            make_hand(0, r[0], r[1], r[2], r[3], r[4])
-        }
-    };
-
-    // A flush (cat 5) beats trips, two-pair, pair, high-card but loses to
-    // quads (cat 7) and full house (cat 6).  The `max` correctly selects
-    // the winner because the category is encoded in the high bits.
-    best_non_flush.max(best_flush_or_sf)
+    // The category field in the high bits ensures flush (cat 5) beats
+    // straight/trips/pair/high-card but loses to quads/full-house via `max`.
+    best_non_flush_rank(freq, rank_bits).max(best_flush)
 }
 
 /// Evaluate the best 5-card hand from 6 cards (e.g., turn + hole cards).

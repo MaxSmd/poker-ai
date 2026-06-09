@@ -1,20 +1,50 @@
-//! Discounted Counterfactual Regret Minimization (DCFR).
+//! Discounted Counterfactual Regret Minimization (DCFR) discount schedule.
 //!
-//! Brown & Sandholm, AAAI 2019.
-//! Discount: d(t) = t^alpha / (t^alpha + 1), alpha ≈ 1.5.
+//! Brown & Sandholm, AAAI 2019.  The plan mandates the full three-parameter
+//! form `(α, β, γ) = (1.5, 0, 2)`, not the α-only discount from v2:
+//!
+//! * `α = 1.5` — discounts accumulated **positive** regret, suppressing the
+//!   noise of early iterations.
+//! * `β = 0`   — applies a constant 0.5 weight to accumulated **negative**
+//!   regret, letting actions that early noise made look bad recover quickly.
+//! * `γ = 2`   — weights the **strategy-sum** accumulation toward later
+//!   iterations.  This is the parameter that most directly improves the
+//!   deployed blueprint, because the blueprint is the time-averaged strategy,
+//!   not the last iterate.
+//!
+//! Each iteration `t` (1-indexed), before adding the new instantaneous regret,
+//! the running positive/negative regret is multiplied by `t^x / (t^x + 1)`.
+//! The strategy-sum contribution on iteration `t` carries weight `∝ t^γ`, which
+//! is equivalent to DCFR's `(t/(t+1))^γ` running discount up to normalization.
 
-pub const ALPHA: f64 = 1.5;
-
-/// Compute the DCFR discount factor for iteration `t`.
-pub fn discount(t: u64) -> f64 {
-    let t = t as f64;
-    t.powf(ALPHA) / (t.powf(ALPHA) + 1.0)
+/// DCFR discount parameters.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Discount {
+    pub alpha: f64,
+    pub beta: f64,
+    pub gamma: f64,
 }
 
-/// Apply the DCFR update to a regret slice for one info set.
-pub fn update_regrets(regrets: &mut [f32], new_regrets: &[f32], t: u64) {
-    let d = discount(t) as f32;
-    for (r, &nr) in regrets.iter_mut().zip(new_regrets.iter()) {
-        *r = *r * d + nr;
+impl Discount {
+    /// The plan's recommended `(α, β, γ) = (1.5, 0, 2)`.
+    pub const RECOMMENDED: Discount = Discount { alpha: 1.5, beta: 0.0, gamma: 2.0 };
+
+    /// Multiplicative factor applied to accumulated **positive** regret at the
+    /// start of iteration `t`.
+    pub fn positive_factor(&self, t: u64) -> f64 {
+        let x = (t as f64).powf(self.alpha);
+        x / (x + 1.0)
+    }
+
+    /// Multiplicative factor applied to accumulated **negative** regret at the
+    /// start of iteration `t`.  With `β = 0` this is the constant `0.5`.
+    pub fn negative_factor(&self, t: u64) -> f64 {
+        let x = (t as f64).powf(self.beta);
+        x / (x + 1.0)
+    }
+
+    /// Weight applied to this iteration's contribution to the strategy sum.
+    pub fn strategy_weight(&self, t: u64) -> f64 {
+        (t as f64).powf(self.gamma)
     }
 }

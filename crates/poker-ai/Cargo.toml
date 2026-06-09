@@ -25,3 +25,6 @@ path = "src/bin/play.rs"
 
 [dependencies]
 poker-core = { path = "../poker-core" }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+rayon = "1"

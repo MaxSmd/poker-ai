@@ -54,6 +54,7 @@ pub struct UndoRecord {
     pub old_allin: u8,
     pub old_last_aggressor: u8,
     pub old_players_to_act: u8,
+    pub old_pot: u32,
 
     // ── Street-transition data ───────────────────────────────────────────────
     /// `true` when `advance_street` fired during this action, resetting all

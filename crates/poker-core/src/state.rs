@@ -21,7 +21,7 @@
 //! - Big blind            : `(b + 1) % 2`
 
 use crate::action::Action;
-use crate::evaluator::{evaluate_5, evaluate_6, evaluate_7};
+use crate::lut_eval::{evaluate_5_lut, evaluate_6_lut, evaluate_7_lut};
 use crate::undo::{UndoRecord, UndoStack};
 
 /// Sentinel value indicating "no card dealt here yet".
@@ -56,6 +56,9 @@ pub struct GameState {
     pub button: u8,
     /// Big blind chip amount.
     pub big_blind: u32,
+    /// Cached total chips in the pot (== `total_committed.iter().sum()`).
+    /// Maintained incrementally to avoid an O(n) sum on every action.
+    pub pot: u32,
     /// The highest `street_bet` placed so far this street (the amount to call).
     pub current_bet: u32,
     /// Minimum raise increment (at least the size of the last raise, or 1 BB).
@@ -110,8 +113,9 @@ impl GameState {
             "all active players must have stacks > 0, got {:?}",
             &stacks[..n]
         );
-        // Hole cards must be unique across all active players.
-        debug_assert!({
+        // Hole cards must be unique across all active players (enforced in
+        // release builds to prevent silent wrong evaluations from duplicates).
+        assert!({
             let mut seen = [false; 52];
             let mut ok = true;
             for i in 0..n {
@@ -153,6 +157,7 @@ impl GameState {
             num_players,
             button,
             big_blind,
+            pot: 0,
             current_bet: big_blind,
             min_raise: big_blind,
             folded: 0,
@@ -187,6 +192,8 @@ impl GameState {
         if gs.stacks[bb] == 0 {
             gs.allin |= 1 << bb;
         }
+
+        gs.pot = sb_amount + bb_amount;
 
         // First to act preflop: UTG (player after BB), or in heads-up: the button (SB).
         // All players (including BB) need a voluntary action, so players_to_act = n.
@@ -234,7 +241,7 @@ impl GameState {
                 legal.contains(&action),
                 "apply_action: Raise({total_bet}) is not in the legal abstract actions {:?} \
                  (player={}, street={}, current_bet={}, pot={})",
-                legal, self.to_act, self.street, self.current_bet, self.pot()
+                legal, self.to_act, self.street, self.current_bet, self.pot
             );
         }
 
@@ -262,6 +269,7 @@ impl GameState {
             old_allin: self.allin,
             old_last_aggressor: self.last_aggressor,
             old_players_to_act: self.players_to_act,
+            old_pot: self.pot,
             // old_street_bets is always captured; street_changed will be set
             // below if advance_street fires and resets the array.
             street_changed: false,
@@ -286,6 +294,7 @@ impl GameState {
                 self.stacks[p] -= actual;
                 self.street_bets[p] += actual;
                 self.total_committed[p] += actual;
+                self.pot += actual;
                 if self.stacks[p] == 0 {
                     self.allin |= 1 << p;
                 }
@@ -299,6 +308,7 @@ impl GameState {
                 self.stacks[p] -= actual;
                 self.street_bets[p] += actual;
                 self.total_committed[p] += actual;
+                self.pot += actual;
 
                 let raise_size = self.street_bets[p].saturating_sub(self.current_bet);
                 if raise_size > 0 {
@@ -324,6 +334,7 @@ impl GameState {
                 self.stacks[p] = 0;
                 self.street_bets[p] += amount;
                 self.total_committed[p] += amount;
+                self.pot += amount;
                 self.allin |= 1 << p;
 
                 if self.street_bets[p] > self.current_bet {
@@ -395,6 +406,7 @@ impl GameState {
             self.allin = rec.old_allin;
             self.last_aggressor = rec.old_last_aggressor;
             self.players_to_act = rec.old_players_to_act;
+            self.pot = rec.old_pot;
         }
     }
 
@@ -424,9 +436,9 @@ impl GameState {
         self.to_act as usize
     }
 
-    /// Total chips currently in the pot.
+    /// Total chips currently in the pot (O(1) — backed by a cached field).
     pub fn pot(&self) -> u32 {
-        self.total_committed.iter().sum()
+        self.pot
     }
 
     /// Number of board cards currently visible (0, 3, 4, or 5).
@@ -575,35 +587,37 @@ impl GameState {
                     self.board[0], self.board[1], self.board[2],
                     self.board[3], self.board[4],
                 ];
-                evaluate_7(&cards)
+                evaluate_7_lut(&cards)
             }
             4 => {
                 let cards: [u8; 6] = [
                     h[0], h[1],
                     self.board[0], self.board[1], self.board[2], self.board[3],
                 ];
-                evaluate_6(&cards)
+                evaluate_6_lut(&cards)
             }
             3 => {
                 let cards: [u8; 5] = [h[0], h[1], self.board[0], self.board[1], self.board[2]];
-                evaluate_5(&cards)
+                evaluate_5_lut(&cards)
             }
             _ => 0,
         }
     }
 
     /// Number of active (non-folded, non-all-in) players.
+    #[inline]
     pub fn count_active(&self) -> u8 {
-        let n = self.num_players as usize;
-        (0..n)
-            .filter(|&i| (self.folded >> i) & 1 == 0 && (self.allin >> i) & 1 == 0)
-            .count() as u8
+        // Build a mask of the num_players low bits, then count those that are
+        // neither folded nor all-in.  Uses a single hardware popcount instruction.
+        let player_mask = (1u8 << self.num_players) - 1;
+        (player_mask & !(self.folded | self.allin)).count_ones() as u8
     }
 
     /// Number of players who have not folded (active + all-in).
+    #[inline]
     pub fn count_non_folded(&self) -> u8 {
-        let n = self.num_players as usize;
-        (0..n).filter(|&i| (self.folded >> i) & 1 == 0).count() as u8
+        let player_mask = (1u8 << self.num_players) - 1;
+        (player_mask & !self.folded).count_ones() as u8
     }
 
     /// Next player to act after `from`, wrapping around, skipping folded/all-in.
@@ -946,68 +960,66 @@ mod tests {
     }
 
     /// Odd-chip allocation: when a side pot doesn't divide evenly among winners,
-    /// the remainder goes to the winner closest to the button's left (clockwise),
+    /// the remainder goes to the winner seated closest to the button's left,
     /// matching standard casino rules (Robert's Rules of Poker §15).
+    ///
+    /// Setup: 3 players, button=0.  SB=p1 posts 5, BB=p2 posts 10.  p0 (UTG)
+    /// goes all-in for 30.  p1 folds (5 committed).  p2 goes all-in for 20 more.
+    ///
+    /// Committed: p0=30, p1=5 (folded), p2=30.  Total = 65.
+    ///
+    /// Both p0 and p2 hold an identical board hand (royal flush on board) → tied.
+    ///
+    /// Side pot tiers:
+    ///   Tier 1 (level 5):  3 contributors × 5 = 15.  Eligible: p0, p2.
+    ///                       15 / 2 = 7 remainder 1.  ← odd-chip path exercised
+    ///                       First winner left of button (button=0): p2 (offset 2).
+    ///                       p2 gets 8, p0 gets 7.
+    ///   Tier 2 (level 30): 2 contributors × 25 = 50.  50 / 2 = 25 each.
+    ///
+    /// Expected payoffs: p0=2, p1=−5, p2=3.
     #[test]
     fn odd_chip_goes_to_first_winner_left_of_button() {
-        // 3 players all-in with equal stacks and identical best hand ranks.
-        // Total pot = 30 (10 each). 30 / 3 = 10 each, no remainder.
-        // To force a remainder: use stacks of 7 each, BB=2, SB=1.
-        // After blinds: p1 commits 1, p2 commits 2.
-        // All go all-in: total pot = 21. 21 / 3 = 7 each, no remainder.
-        //
-        // Use stacks [10, 10, 10], BB=4, SB=2. All go all-in → pot=30.
-        // Two winners → 30/2=15 each. Three winners → 30/3=10 each.
-        //
-        // For a true odd chip: 3 winners splitting pot=31 → 10 each + 1 remainder.
-        // Stacks [11, 10, 10], BB=4, SB=2. button=0, SB=1(commits 2), BB=2(commits 4).
-        // UTG=p0 all-in(11), p1 all-in(10), p2 all-in(10).
-        // Total committed = 11+10+10 = 31.
-        // Side pot tier 1 (level=10): 3 contributors × 10 = 30.
-        // Side pot tier 2 (level=11): 1 contributor × 1 = 1 (only p0 eligible).
-        // If all 3 tied on tier 1: 30/3=10 each, no remainder on tier 1.
-        // p0 gets tier 2 (1 chip) back.
-        //
-        // Better approach: use the payoff computation directly with a terminal state.
-        // Create a 3-player game where all go all-in with stacks that produce a
-        // single-tier pot with an odd-chip remainder.
         let mut stacks = [0u32; MAX_PLAYERS];
-        stacks[0] = 10;
-        stacks[1] = 10;
-        stacks[2] = 10;
+        stacks[0] = 30; // UTG / button
+        stacks[1] = 6;  // SB — posts 5, keeps 1
+        stacks[2] = 30; // BB
 
         let mut holes = [[NO_CARD; 2]; MAX_PLAYERS];
-        // All three players get the same rank pair (different suits) → tied at showdown.
-        holes[0] = [make_card_u8(12, 0), make_card_u8(11, 0)]; // Ac Kc
-        holes[1] = [make_card_u8(12, 1), make_card_u8(11, 1)]; // Ad Kd
-        holes[2] = [make_card_u8(12, 2), make_card_u8(11, 2)]; // Ah Kh
+        // Hole cards are low clubs; royal-flush board gives everyone the same hand.
+        holes[0] = [make_card_u8(0, 0), make_card_u8(1, 0)]; // 2c 3c
+        holes[1] = [make_card_u8(2, 0), make_card_u8(3, 0)]; // 4c 5c
+        holes[2] = [make_card_u8(4, 0), make_card_u8(5, 0)]; // 6c 7c
 
-        // Board that doesn't improve anyone differently (low cards, mixed suits).
         let board = [
-            make_card_u8(0, 3),  // 2s
-            make_card_u8(1, 3),  // 3s
-            make_card_u8(2, 3),  // 4s
-            make_card_u8(3, 3),  // 5s
-            make_card_u8(5, 0),  // 7c (breaks the straight for safety)
+            make_card_u8(12, 3), // As
+            make_card_u8(11, 3), // Ks
+            make_card_u8(10, 3), // Qs
+            make_card_u8(9, 3),  // Js
+            make_card_u8(8, 3),  // Ts  → royal flush on board; everyone ties
         ];
 
-        let mut gs = GameState::new(3, 4, 2, stacks, holes, board, 0);
+        // button=0, SB=p1, BB=p2, UTG=p0 (acts first preflop).
+        let mut gs = GameState::new(3, 10, 5, stacks, holes, board, 0);
 
-        // button=0, SB=1(commits 2), BB=2(commits 4), UTG=0.
-        // UTG (p0) all-in, SB (p1) all-in, BB (p2) all-in.
-        gs.apply_action(Action::AllIn); // p0
-        gs.apply_action(Action::AllIn); // p1
-        gs.apply_action(Action::AllIn); // p2
-        assert!(gs.is_terminal(), "should be terminal when all players all-in");
+        gs.apply_action(Action::AllIn); // p0: commits 30, current_bet=30
+        // p1: to_call=25, stacks=1 < 25 → only Fold or AllIn available.
+        gs.apply_action(Action::Fold);  // p1 folds; 5 committed stays in pot
+        // p2: to_call=20, stacks=20, stacks NOT > to_call → AllIn only.
+        gs.apply_action(Action::AllIn); // p2: commits 20 more, total=30
+
+        assert!(gs.is_terminal(), "should be terminal (remaining players all-in)");
+        assert_eq!(gs.total_committed[0], 30);
+        assert_eq!(gs.total_committed[1],  5);
+        assert_eq!(gs.total_committed[2], 30);
 
         let payoffs = gs.terminal_payoffs();
         assert_eq!(payoffs.iter().sum::<i32>(), 0, "payoffs must sum to zero");
 
-        // Total pot = 30. Three-way split: 30 / 3 = 10 each, 0 remainder.
-        // All players get their chips back → payoff = 0 each.
-        assert_eq!(payoffs[0], 0);
-        assert_eq!(payoffs[1], 0);
-        assert_eq!(payoffs[2], 0);
+        // p2 is first winner left of button=0 (offset 2 before p0 at offset 3).
+        assert_eq!(payoffs[0],  2, "p0: 7+25−30");
+        assert_eq!(payoffs[1], -5, "p1 folded, loses blind");
+        assert_eq!(payoffs[2],  3, "p2 gets odd chip: 8+25−30");
     }
 
     /// BB special case: everyone limps preflop, BB gets the option to raise.
