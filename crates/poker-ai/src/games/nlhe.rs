@@ -26,6 +26,7 @@ use poker_core::state::{GameState, MAX_PLAYERS, NO_CARD};
 use poker_core::{legal_actions, make_card};
 
 use super::Game;
+use crate::util::hash::fnv1a;
 
 /// One concrete heads-up deal: both players' hole cards and the full board.
 #[derive(Clone, Debug)]
@@ -92,18 +93,6 @@ impl HeadsUpHoldem {
         holes[1] = deal.holes[1];
         GameState::new(2, self.big_blind, self.small_blind, self.stacks, holes, deal.board, self.button)
     }
-}
-
-/// FNV-1a hash — folds a variable-length information-set descriptor into the
-/// `u64` key the trait requires.  64-bit collision risk is negligible for the
-/// thousands of info sets in these games.
-pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
 }
 
 impl Game for HeadsUpHoldem {

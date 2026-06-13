@@ -17,9 +17,8 @@
 
 use std::time::Instant;
 
-use poker_core::betting::abstract_raise_amounts;
 use poker_core::evaluator::make_card;
-use poker_core::{Action, GameState, MAX_PLAYERS, NO_CARD};
+use poker_core::{legal_actions, Action, GameState, MAX_PLAYERS, NO_CARD};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -83,77 +82,16 @@ fn make_kuhn_state(p0_rank: u8, p1_rank: u8) -> GameState {
 // Allocation-free legal action enumeration
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Fill `out` with the legal actions for the current player in `state`.
+/// Fill `out` with the legal actions for the current player in `state`,
+/// returning the count written into `out[..n]`.
 ///
-/// Replicates the logic of [`poker_core::legal_actions`] but writes into a
-/// caller-supplied fixed-size array so that **no heap allocation is needed**.
-///
-/// Returns the number of valid entries written into `out[..n]`.
+/// Delegates to [`poker_core::legal_actions`] — the single source of truth —
+/// which returns a stack-allocated `ActionList`, so this stays heap-free.
 #[inline]
 fn fill_legal_actions(state: &GameState, out: &mut [Action; MAX_ACTIONS]) -> usize {
-    let mut n = 0usize;
-
-    if state.is_terminal() {
-        return 0;
-    }
-
-    let p = state.to_act as usize;
-    let to_call = state.current_bet.saturating_sub(state.street_bets[p]);
-    let max_bet = state.stacks[p] + state.street_bets[p];
-
-    // ── passive options ───────────────────────────────────────────────────────
-    if to_call == 0 {
-        out[n] = Action::Check;
-        n += 1;
-    } else {
-        out[n] = Action::Fold;
-        n += 1;
-        if state.stacks[p] > to_call {
-            out[n] = Action::Call;
-            n += 1;
-        } else {
-            // Calling would commit all remaining chips – offer AllIn, not Call.
-            out[n] = Action::AllIn;
-            n += 1;
-            return n; // No further raise options when forced all-in to call.
-        }
-    }
-
-    // ── aggressive options ────────────────────────────────────────────────────
-    let min_raise_total = state.current_bet + state.min_raise;
-    if max_bet <= state.current_bet {
-        // Player cannot raise (no chips above the call amount).
-        return n;
-    }
-
-    let pot = state.pot();
-    let (abstract_bets, nb) =
-        abstract_raise_amounts(pot, state.current_bet, state.min_raise, state.street);
-
-    let mut allin_added = false;
-    for &bet_level in abstract_bets[..nb].iter() {
-        if bet_level < min_raise_total {
-            continue;
-        }
-        if bet_level >= max_bet {
-            if !allin_added && n < MAX_ACTIONS {
-                out[n] = Action::AllIn;
-                n += 1;
-                allin_added = true;
-            }
-            break;
-        }
-        if n < MAX_ACTIONS {
-            out[n] = Action::Raise(bet_level);
-            n += 1;
-        }
-    }
-
-    if !allin_added && max_bet >= min_raise_total && n < MAX_ACTIONS {
-        out[n] = Action::AllIn;
-        n += 1;
-    }
-
+    let list = legal_actions(state);
+    let n = list.len();
+    out[..n].copy_from_slice(&list);
     n
 }
 

@@ -1,133 +1,131 @@
 //! Offline information-abstraction builder (Phase 2).
 //!
-//! For each post-flop street it samples boards, computes each canonical
-//! situation's equity-distribution histogram **once** (deduped by suit
-//! isomorphism), clusters them into buckets, and writes the [`EquityCache`] and
-//! [`BucketMap`] to `data/`.  A training run loads the maps into
-//! [`BlueprintHoldem`](poker_ai::games::blueprint::BlueprintHoldem) rather than
-//! re-clustering.
+//! Built **per board** via the equity sweep ([`board_equities`] /
+//! [`board_histograms`]): one board scores all ~1081 holes at once in
+//! O(n log n), so the feature for every situation is **exact and ~1000× cheaper**
+//! than the old per-hand O(n²) enumeration / Monte-Carlo rollout (exact, low-noise
+//! histograms cluster better — the plan names sampling noise as the ceiling).
 //!
-//!  * **River** — exact equity (the board is complete; one showdown
-//!    enumeration per situation).
-//!  * **Flop / turn** — Monte-Carlo equity (`ehs_histogram_mc`): exact
-//!    enumeration is ~10⁶ showdowns per flop hand, so the runout is sampled
-//!    while each sampled showdown stays exact.
+//! Boards are enumerated by a suit-isomorphic board indexer and processed in
+//! parallel; each board emits `(joint slot, feature)` entries that are merged
+//! serially into the flat [`EquityCache`] keyed by finding #2's joint
+//! `(hole, board)` index.  Writes to a joint slot from different raw boards are
+//! idempotent (suit-iso ⇒ identical feature), and iterating canonical boards ×
+//! all holes covers every joint class.
 //!
-//! **Scale.** Full postflop *coverage* (~1.3M canonical flop, ~14M turn, ~123M
-//! river situations) is the project's compute-bound step and is the intended
-//! cloud burst — raise `--boards` and run it on a high-core server.  The modest
-//! defaults here build inspectable maps locally so bucket quality can be eyeballed
-//! (the Phase 2 "inspect bucket contents manually" deliverable).
+//!  * **River** — exact scalar equity (1 bin), clustered by the exact 1-D DP.
+//!  * **Flop / turn** — exact equity-distribution histograms, clustered by L2
+//!    K-Means++.
+//!
+//! **Scale.** Full coverage is the cloud burst (`cap = 0` on a big machine).
+//! Locally, `cap` limits the boards processed, and any street whose flat cache
+//! would exceed the memory budget is skipped (turn @ 50 bins = 2.8 GB).
 //!
 //! Usage:
-//!   cluster [boards] [seed]
-//!     boards  river boards to sample; flop/turn use boards/2  (default 40)
-//!     seed    RNG seed for sampling + clustering               (default 1)
+//!   cluster [cap] [seed]
+//!     cap   max canonical boards to process per street; 0 = full  (default 300)
+//!     seed  K-Means++ seed for flop/turn clustering                (default 1)
 
 use std::path::Path;
+use std::time::Instant;
 
 use rayon::prelude::*;
 
 use poker_ai::abstraction::bucket_map::BucketMap;
 use poker_ai::abstraction::equity_cache::EquityCache;
-use poker_ai::abstraction::features::{ehs_histogram_mc, river_equity};
+use poker_ai::abstraction::features::{board_equities, board_histograms, combo_index};
+use poker_ai::abstraction::hand_index::HandIndexer;
 
-/// Histogram resolution (plan: 50-bin equity histograms).
+/// Histogram resolution for flop/turn (plan: 50-bin equity histograms).
 const BINS: usize = 50;
-/// Monte-Carlo runout samples per flop/turn situation.
-const MC_SAMPLES: usize = 80;
+/// Skip a street whose flat cache would exceed this — the cloud burst's job.
+const MEM_BUDGET_BYTES: usize = 1_500_000_000;
+/// Boards per parallel batch (bounds the merge buffer).
+const BATCH_BOARDS: usize = 256;
 
-/// SplitMix64 — derives an independent, well-mixed RNG seed per board so each
-/// board's sampling is reproducible regardless of which thread runs it.
-fn mix_seed(seed: u64, board_idx: usize) -> u64 {
-    let mut z = seed ^ (board_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
+/// Per-board features: `(joint slot, feature vector)` for every hole on `board`.
+fn board_features(
+    board: &[u8],
+    river: bool,
+    bins: usize,
+    joint_ix: &HandIndexer,
+) -> Vec<(usize, Vec<f32>)> {
+    let mut used = 0u64;
+    for &c in board {
+        used |= 1 << c;
+    }
+    let live: Vec<u8> = (0u8..52).filter(|c| used & (1 << c) == 0).collect();
+    let mut out = Vec::with_capacity(live.len() * (live.len().saturating_sub(1)) / 2);
 
-/// xorshift64* — deterministic sampling without a `rand` dependency.
-struct Rng(u64);
-impl Rng {
-    fn unit(&mut self) -> f64 {
-        let mut x = self.0;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.0 = x;
-        (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
+    let mut cards = [0u8; 7];
+    cards[2..2 + board.len()].copy_from_slice(board);
+    let mut river_buf = [f32::NAN; 1326];
+    let hists = if river { Vec::new() } else { board_histograms(board, bins) };
+    if river {
+        board_equities(board.try_into().expect("river board is 5 cards"), &mut river_buf);
     }
 
-    /// Draw `n` distinct cards by partial Fisher–Yates over the deck.
-    fn cards(&mut self, n: usize) -> Vec<u8> {
-        let mut deck: [u8; 52] = std::array::from_fn(|i| i as u8);
-        let last = 51;
-        for i in 0..n {
-            let span = 52 - i;
-            let j = (i + (self.unit() * span as f64) as usize).min(last);
-            deck.swap(i, j);
+    for i in 0..live.len() {
+        let a = live[i];
+        for &b in &live[i + 1..] {
+            cards[0] = a;
+            cards[1] = b;
+            let slot = joint_ix.index(&cards[..2 + board.len()]) as usize;
+            let ci = combo_index(a, b);
+            let feat = if river {
+                vec![river_buf[ci]]
+            } else {
+                hists[ci * bins..][..bins].to_vec()
+            };
+            out.push((slot, feat));
         }
-        deck[..n].to_vec()
     }
+    out
 }
 
-/// Sample `boards` boards of `board_len` cards, compute every hole pair's
-/// feature once (canonical dedup), and cluster into `k` buckets.
-///
-/// Feature by street: the **flop/turn** use the multi-bin equity-distribution
-/// histogram (the runout makes the distribution genuinely spread, so L2 on the
-/// histogram captures draw shape).  The **river** is a *complete* board — the
-/// distribution is a point mass — so its histogram would be one-hot, and L2 on
-/// one-hot vectors is degenerate (every distinct equity is equidistant, erasing
-/// the ordinal structure).  The river therefore clusters on the scalar equity.
-fn build_street(name: &str, board_len: usize, boards: usize, k: usize, seed: u64) -> BucketMap {
-    let river = board_len == 5;
+/// Build (a prefix of) a street's flat cache by sweeping canonical boards, then
+/// cluster and persist.
+fn build_street(name: &str, board_round: u8, k: usize, seed: u64, cap: usize) {
+    let river = board_round == 5;
     let bins = if river { 1 } else { BINS };
-    let start = std::time::Instant::now();
+    let joint_ix = HandIndexer::new(&[2, board_round]);
+    let n_joint = joint_ix.size() as usize;
 
-    // Equity precompute is the compute-bound, embarrassingly-parallel step (the
-    // plan calls it out).  Each board is an independent task with its own seeded
-    // RNG (so the result is reproducible regardless of thread scheduling),
-    // building a board-local cache deduped by suit isomorphism.  The board-local
-    // caches are merged in fixed board order, keeping the merge deterministic.
-    let per_board: Vec<EquityCache> = (0..boards)
-        .into_par_iter()
-        .map(|b| {
-            let mut rng = Rng(mix_seed(seed, b) | 1);
-            let board = rng.cards(board_len);
-            let mut used = 0u64;
-            for &c in &board {
-                used |= 1 << c;
-            }
-            let live: Vec<u8> = (0u8..52).filter(|c| used & (1 << c) == 0).collect();
-            let mut local = EquityCache::new(bins);
-            for i in 0..live.len() {
-                for j in (i + 1)..live.len() {
-                    let hole = [live[i], live[j]];
-                    local.compute_if_absent_with(&hole, &board, || {
-                        if river {
-                            let full: [u8; 5] =
-                                board.as_slice().try_into().expect("river board is 5 cards");
-                            vec![river_equity(hole, full) as f32]
-                        } else {
-                            ehs_histogram_mc(&hole, &board, BINS, MC_SAMPLES, || rng.unit())
-                                .iter()
-                                .map(|&x| x as f32)
-                                .collect()
-                        }
-                    });
-                }
-            }
-            local
-        })
-        .collect();
-
-    let mut cache = EquityCache::new(bins);
-    for local in per_board {
-        cache.merge(local);
+    let need = bins.saturating_mul(n_joint).saturating_mul(4);
+    if need > MEM_BUDGET_BYTES {
+        println!(
+            "  [{name}] joint N={n_joint} → flat cache {:.1} GB exceeds budget; skipped (cloud burst)",
+            need as f64 / 1e9
+        );
+        return;
     }
+
+    let board_ix = HandIndexer::new(&[board_round]);
+    let n_boards = board_ix.size() as usize;
+    let fill = if cap == 0 { n_boards } else { cap.min(n_boards) };
+    let start = Instant::now();
+
+    let mut data = vec![f32::NAN; bins * n_joint];
+    let mut bi = 0;
+    while bi < fill {
+        let end = (bi + BATCH_BOARDS).min(fill);
+        // Parallel per board; serial idempotent merge (different boards may map a
+        // hole to the same joint slot, so a shared parallel write would race).
+        let batch: Vec<Vec<(usize, Vec<f32>)>> = (bi..end)
+            .into_par_iter()
+            .map(|b| board_features(&board_ix.unindex(b as u64), river, bins, &joint_ix))
+            .collect();
+        for board_out in batch {
+            for (slot, feat) in board_out {
+                data[slot * bins..][..bins].copy_from_slice(&feat);
+            }
+        }
+        bi = end;
+    }
+
+    let cache = EquityCache::from_parts(bins, &[2, board_round], data);
     println!(
-        "  [{name}] {boards} boards -> {} canonical situations ({:.1}s)",
+        "  [{name}] swept {fill}/{n_boards} canonical boards → {} joint situations ({:.1}s)",
         cache.len(),
         start.elapsed().as_secs_f64()
     );
@@ -144,19 +142,19 @@ fn build_street(name: &str, board_len: usize, boards: usize, k: usize, seed: u64
         map.len(),
         start.elapsed().as_secs_f64()
     );
-    map
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let boards: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(40);
+    let cap: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(300);
     let seed: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
 
-    println!("Building card abstraction (river {boards} boards, flop/turn {} each)", boards / 2);
+    let cap_str = if cap == 0 { "full".to_string() } else { cap.to_string() };
+    println!("Building card abstraction (exact sweep; cap {cap_str} boards/street, seed {seed})");
     // Plan bucket targets: flop/turn 500–800, river 800–1200.  Capped to the
-    // number of sampled situations at small scales.
-    build_street("flop", 3, boards / 2, 500, seed);
-    build_street("turn", 4, boards / 2, 500, seed);
-    build_street("river", 5, boards, 800, seed);
+    // number of filled situations at small scales.
+    build_street("flop", 3, 500, seed, cap);
+    build_street("turn", 4, 500, seed, cap);
+    build_street("river", 5, 800, seed, cap);
     println!("Done. Load the *_buckets.bin maps into BlueprintHoldem::with_street_bucket.");
 }

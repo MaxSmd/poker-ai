@@ -30,8 +30,8 @@ use std::time::Instant;
 use poker_core::legal_actions;
 use poker_core::state::{GameState, NO_CARD};
 
-use crate::games::nlhe::fnv1a;
 use crate::games::Game;
+use crate::util::hash::fnv1a;
 use crate::resolving::belief_state::BeliefState;
 use crate::resolving::leaf_eval::LeafEvaluator;
 use crate::solver::cfr::{Cfr, Variant};
@@ -84,14 +84,30 @@ fn deals_from_beliefs(template: &GameState, b0: &BeliefState, b1: &BeliefState) 
 pub struct SubgameNode {
     gs: Option<GameState>,
     history: Vec<u8>,
+    /// Multi-valued leaf state (finding #1).  At a depth-limit leaf with `K > 1`
+    /// continuations this is `None` first — a decision node where the opponent
+    /// picks a continuation — then `Some(i)` once chosen, a terminal scored by
+    /// continuation `i`.  Always `None` when `K = 1` (no continuation node).
+    continuation: Option<u8>,
 }
 
 /// A depth-limited heads-up subgame as a [`Game`].
 pub struct Subgame<'a> {
-    template: GameState,
     deals: Vec<Deal>,
+    /// Chance children precomputed once from `deals`: a deal-rooted state plus
+    /// its probability.  The root is visited every CFR⁺ iteration, so building
+    /// these here (rather than in `chance_outcomes`) keeps the per-deal
+    /// `template` clone + hole-card assignment out of the hot loop.
+    outcomes: Vec<(SubgameNode, f64)>,
     leaf_eval: &'a dyn LeafEvaluator,
     big_blind: f64,
+    /// Number of opponent continuations `K` offered at each depth-limit leaf
+    /// (finding #1).  `K = 1` ⇒ leaves are plain terminals (legacy behaviour).
+    k: usize,
+    /// The player who chooses the continuation at a leaf — the opponent of the
+    /// resolve-root actor, whose post-leaf adaptation the resolve must be robust
+    /// to.  Fixed for the whole subgame.
+    chooser: usize,
 }
 
 impl<'a> Subgame<'a> {
@@ -105,7 +121,19 @@ impl<'a> Subgame<'a> {
         assert_eq!(beliefs.len(), 2, "heads-up resolving needs two belief ranges");
         let deals = deals_from_beliefs(&template, &beliefs[0], &beliefs[1]);
         let big_blind = template.big_blind as f64;
-        Self { template, deals, leaf_eval, big_blind }
+        // The continuation chooser is the opponent of whoever acts at the root.
+        let chooser = 1 - template.current_player();
+        let k = leaf_eval.num_continuations().max(1);
+        let outcomes = deals
+            .iter()
+            .map(|d| {
+                let mut gs = template.clone();
+                gs.hole_cards[0] = d.h0;
+                gs.hole_cards[1] = d.h1;
+                (SubgameNode { gs: Some(gs), history: Vec::new(), continuation: None }, d.prob)
+            })
+            .collect();
+        Self { deals, outcomes, leaf_eval, big_blind, k, chooser }
     }
 
     /// Number of enumerated deals (the chance breadth).
@@ -121,6 +149,15 @@ impl<'a> Subgame<'a> {
     fn needs_leaf(&self, gs: &GameState) -> bool {
         gs.board[..gs.board_cards_count()].contains(&NO_CARD)
     }
+
+    /// A depth-limit leaf with `K > 1` continuations that the opponent has not
+    /// yet chosen between — a decision node for [`Self::chooser`], not a terminal
+    /// (finding #1).  False when `K = 1` (leaves are plain terminals).
+    fn pending_continuation(&self, state: &SubgameNode) -> bool {
+        self.k > 1
+            && state.continuation.is_none()
+            && state.gs.as_ref().is_some_and(|gs| self.needs_leaf(gs))
+    }
 }
 
 impl Game for Subgame<'_> {
@@ -131,11 +168,14 @@ impl Game for Subgame<'_> {
     }
 
     fn root(&self) -> SubgameNode {
-        SubgameNode { gs: None, history: Vec::new() }
+        SubgameNode { gs: None, history: Vec::new(), continuation: None }
     }
 
     fn is_terminal(&self, state: &SubgameNode) -> bool {
         match &state.gs {
+            // A multi-valued depth-limit leaf is a decision node until the
+            // opponent has chosen a continuation; then it is terminal.
+            Some(_) if self.pending_continuation(state) => false,
             Some(gs) => gs.is_terminal() || self.needs_leaf(gs),
             None => false,
         }
@@ -149,8 +189,11 @@ impl Game for Subgame<'_> {
         let gs = state.gs.as_ref().expect("utility at a play node");
         let chips = if self.needs_leaf(gs) {
             // Play advanced past the known board: estimate (the engine cannot
-            // score a showdown it has no cards for).
-            self.leaf_eval.evaluate(gs, &[])[player]
+            // score a showdown it has no cards for).  With K > 1 the opponent has
+            // chosen continuation `i`; with K = 1 it is the normal continuation.
+            let conts = self.leaf_eval.continuations(gs, &[]);
+            let i = state.continuation.unwrap_or(0) as usize;
+            conts[i.min(conts.len() - 1)][player]
         } else {
             // Complete board and a real terminal (fold or river showdown): exact.
             gs.terminal_payoffs()[player] as f64
@@ -159,39 +202,51 @@ impl Game for Subgame<'_> {
     }
 
     fn chance_outcomes(&self, _state: &SubgameNode) -> Vec<(SubgameNode, f64)> {
-        self.deals
-            .iter()
-            .map(|d| {
-                let mut gs = self.template.clone();
-                gs.hole_cards[0] = d.h0;
-                gs.hole_cards[1] = d.h1;
-                (SubgameNode { gs: Some(gs), history: Vec::new() }, d.prob)
-            })
-            .collect()
+        // Precomputed in `Subgame::new`; the root is visited every iteration.
+        self.outcomes.clone()
     }
 
     fn current_player(&self, state: &SubgameNode) -> usize {
+        if self.pending_continuation(state) {
+            // The opponent of the resolve-root actor chooses the continuation.
+            return self.chooser;
+        }
         state.gs.as_ref().expect("current_player at a play node").current_player()
     }
 
     fn num_actions(&self, state: &SubgameNode) -> usize {
         let gs = state.gs.as_ref().expect("num_actions at a play node");
+        if self.pending_continuation(state) {
+            // One action per continuation the opponent may pick at this leaf.
+            return self.leaf_eval.continuations(gs, &[]).len();
+        }
         legal_actions(gs).len()
     }
 
     fn apply(&self, state: &SubgameNode, action: usize) -> SubgameNode {
         let gs = state.gs.as_ref().expect("apply at a play node");
+        if self.pending_continuation(state) {
+            // Record the chosen continuation; the node is now terminal.
+            return SubgameNode {
+                gs: Some(gs.clone()),
+                history: state.history.clone(),
+                continuation: Some(action as u8),
+            };
+        }
         let act = legal_actions(gs)[action];
         let mut next = gs.clone();
         next.apply_action(act);
         let mut history = state.history.clone();
         history.push(action as u8);
-        SubgameNode { gs: Some(next), history }
+        SubgameNode { gs: Some(next), history, continuation: None }
     }
 
     fn info_key(&self, state: &SubgameNode) -> u64 {
         let gs = state.gs.as_ref().expect("info_key at a play node");
-        let player = gs.current_player();
+        // At a continuation-choice node the actor is the fixed chooser, who keys
+        // on its OWN hand (perfect recall: the continuation may depend on it).
+        let continuation = self.pending_continuation(state);
+        let player = if continuation { self.chooser } else { gs.current_player() };
         let mut hole = gs.hole_cards[player];
         hole.sort_unstable();
 
@@ -206,6 +261,11 @@ impl Game for Subgame<'_> {
         }
         bytes.push(0xFF); // separator so board / history can't blur together
         bytes.extend_from_slice(&state.history);
+        // Marker so a continuation-choice info set can never collide with a
+        // betting info set at the same (player, hand, board, history).
+        if continuation {
+            bytes.push(0xFE);
+        }
         fnv1a(&bytes)
     }
 }
@@ -649,6 +709,81 @@ mod tests {
             }
         }
         walk(&sg, &sg.root());
+    }
+
+    // ----- Finding #1: multi-valued leaf states -----
+
+    fn turn_board_with_hole_room() -> [u8; 5] {
+        // A♣ K♦ 9♥ 4♠ + (river unknown) — a depth-limit cut at the river.
+        [make_card(12, 0), make_card(11, 1), make_card(7, 2), make_card(2, 3), NO_CARD]
+    }
+
+    #[test]
+    fn multi_valued_leaf_inserts_a_chooser_node_and_stays_zero_sum() {
+        // With K > 1 the depth-limit leaf becomes the opponent's K-way choice
+        // node; the tree must still be well-formed and zero-sum everywhere, and
+        // a continuation node (K actions, owned by the chooser) must exist.
+        let root = public_root(turn_board_with_hole_room(), 20, 2);
+        let (b0, b1) = duel_ranges();
+        let leaf = crate::resolving::leaf_eval::MultiContinuationLeaf::new();
+        let sg = Subgame::new(root.clone(), &[b0, b1], &leaf);
+        let chooser = 1 - root.current_player();
+
+        fn walk(g: &Subgame, s: &SubgameNode, chooser: usize, saw_choice: &mut bool) {
+            if g.is_terminal(s) {
+                assert!((g.utility(s, 0) + g.utility(s, 1)).abs() < 1e-9, "zero-sum at leaf");
+                return;
+            }
+            if g.is_chance(s) {
+                for (c, _) in g.chance_outcomes(s) {
+                    walk(g, &c, chooser, saw_choice);
+                }
+                return;
+            }
+            if g.pending_continuation(s) {
+                *saw_choice = true;
+                assert_eq!(g.current_player(s), chooser, "the opponent chooses the continuation");
+                assert_eq!(g.num_actions(s), 4, "one action per continuation");
+            }
+            for a in 0..g.num_actions(s) {
+                walk(g, &g.apply(s, a), chooser, saw_choice);
+            }
+        }
+        let mut saw_choice = false;
+        walk(&sg, &sg.root(), chooser, &mut saw_choice);
+        assert!(saw_choice, "the subgame must contain at least one continuation-choice node");
+    }
+
+    #[test]
+    fn multi_continuation_resolve_is_more_robust_than_single() {
+        // The depth-limited-solving headline (Brown et al. 2018): a strategy
+        // resolved while the opponent may pick among K continuations is less
+        // exploitable — measured IN the K-continuation game by exact BR (which
+        // may choose continuations adversarially) — than one resolved assuming a
+        // single (check-down) continuation.
+        let (b0, b1) = duel_ranges();
+        let beliefs = [b0, b1];
+        let iters = 4_000;
+        let root = || public_root(turn_board_with_hole_room(), 20, 2);
+
+        let multi = crate::resolving::leaf_eval::MultiContinuationLeaf::new();
+        let single = CheckdownLeafEval::new(); // == multi's continuation 0
+
+        // A: resolved aware of the K = 4 choice.  B: resolved assuming one.
+        let a = SubgameSolver::new(1, 0).solve_for_iters(&root(), &beliefs, &multi, iters);
+        let b = SubgameSolver::new(1, 0).solve_for_iters(&root(), &beliefs, &single, iters);
+
+        // Both scored in the SAME multi-valued game (the real, robust opponent).
+        let game = Subgame::new(root(), &beliefs, &multi);
+        let expl_a = exploitability(&game, &a.strategy);
+        let expl_b = exploitability(&game, &b.strategy);
+        println!(
+            "multi-valued-leaf robustness — K=4-resolved: {expl_a:.5} bb, single-resolved: {expl_b:.5} bb"
+        );
+        assert!(
+            expl_a < expl_b,
+            "the continuation-aware resolve ({expl_a}) must be less exploitable than the naive one ({expl_b})"
+        );
     }
 
     #[test]

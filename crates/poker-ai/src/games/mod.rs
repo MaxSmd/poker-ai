@@ -110,3 +110,97 @@ pub trait Game {
         outcomes.last().expect("chance node must have at least one outcome").0.clone()
     }
 }
+
+/// A game traversed by a **mutable cursor** with `apply`/`undo`, for the sampled
+/// solver's hot path.
+///
+/// [`Game`] returns a freshly-cloned child on every `apply`, which is the right,
+/// clear design for the tiny validation games and exact best response.  But the
+/// real-mechanics blueprint games ([`blueprint::BlueprintHoldem`],
+/// [`push_fold::PushFoldHoldem`]) wrap a `poker_core::GameState`, whose clone
+/// drags along a pre-allocated `UndoStack` — so the clone-based path
+/// heap-allocates on *every tree node*, throwing away the zero-allocation
+/// `apply_action`/`undo_action` design `poker_core` was built around.
+///
+/// `CursorGame` exposes that mutate-and-undo design to MCCFR: one `GameState` is
+/// walked in place, children reached by `apply` and reversed by `undo`, with the
+/// legal-action list (a `Copy` value) computed once per node and held on the
+/// traverser's stack frame.  External-sampling MCCFR drives it through
+/// [`crate::solver::mccfr::Mccfr::train_fast`] and
+/// [`train_parallel_fast`](crate::solver::mccfr::Mccfr::train_parallel_fast),
+/// which are proven **bit-identical** to the clone-based path for a fixed seed.
+///
+/// The trait is scoped to the **non-enumerable** sampled games: chance is a full
+/// random deal reached only through [`sample_chance`](CursorGame::sample_chance),
+/// so there is no enumerable-chance API here.
+pub trait CursorGame {
+    /// A mutable traversal cursor wrapping one in-place game state.
+    type Cursor;
+
+    /// A single legal action (applied to the cursor without re-deriving the
+    /// legal set).
+    type Action: Copy;
+
+    /// The `Copy` list of legal actions at a node — computed once per node and
+    /// indexed by action position `0..len`.
+    type Actions: Copy + AsRef<[Self::Action]>;
+
+    /// Number of players (always 2 for the heads-up blueprint games).
+    fn num_players(&self) -> usize;
+
+    /// A fresh cursor at the pre-deal chance root.
+    fn root(&self) -> Self::Cursor;
+
+    fn is_terminal(&self, cursor: &Self::Cursor) -> bool;
+    fn is_chance(&self, cursor: &Self::Cursor) -> bool;
+
+    /// Terminal utility for `player` (zero-sum).  Only valid at terminal nodes.
+    fn utility(&self, cursor: &Self::Cursor, player: usize) -> f64;
+
+    /// The player to act at a decision node.
+    fn current_player(&self, cursor: &Self::Cursor) -> usize;
+
+    /// The legal actions at the current decision node.
+    fn legal(&self, cursor: &Self::Cursor) -> Self::Actions;
+
+    /// Globally-unique information-set key for the acting player at `cursor`.
+    fn info_key(&self, cursor: &Self::Cursor) -> u64;
+
+    /// Apply the action at index `a` in [`legal`](CursorGame::legal) — `action`
+    /// is `legal(cursor)[a]`, passed in so the cursor need not recompute the
+    /// legal set.  `a` is recorded for perfect-recall history; the change is
+    /// reversed by [`undo`](CursorGame::undo).
+    fn apply(&self, cursor: &mut Self::Cursor, a: usize, action: Self::Action);
+
+    /// Reverse the most recent [`apply`](CursorGame::apply).
+    fn undo(&self, cursor: &mut Self::Cursor);
+
+    /// Deal a chance outcome **in place** at the root, drawing uniform `[0, 1)`
+    /// units from `next_unit`.  Reversed by [`undo_chance`](CursorGame::undo_chance).
+    fn sample_chance(&self, cursor: &mut Self::Cursor, next_unit: impl FnMut() -> f64);
+
+    /// Reverse [`sample_chance`](CursorGame::sample_chance), returning the cursor
+    /// to the pre-deal root.
+    fn undo_chance(&self, cursor: &mut Self::Cursor);
+}
+
+/// A [`CursorGame`] whose information-set space is **known up front** and maps to
+/// a dense integer range, so the sampled solver can store regrets in a flat
+/// Structure-of-Arrays table (computed index, no hashing, no dynamic discovery)
+/// instead of a `HashMap` — the ~10×-smaller store the memory budget assumes.
+///
+/// The index is a pure function of the public situation (street, card bucket,
+/// betting-sequence id), so the table layout is fixed at construction.  Only
+/// games with a bounded, enumerable info-set space implement this; the validation
+/// games and the unabstracted blueprint stay on the `HashMap` solver.
+pub trait IndexedGame: CursorGame {
+    /// Exclusive upper bound on [`info_set_index`](IndexedGame::info_set_index).
+    fn info_set_capacity(&self) -> usize;
+
+    /// Dense index in `0..info_set_capacity()` for the acting player's info set.
+    fn info_set_index(&self, cursor: &Self::Cursor) -> usize;
+
+    /// Number of legal actions at the info set with the given index (fixes the
+    /// flat table's per-info-set width).
+    fn actions_at(&self, index: usize) -> usize;
+}

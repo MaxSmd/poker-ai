@@ -24,16 +24,23 @@
 //!
 //! [`is_chance_enumerable`]: Game::is_chance_enumerable
 
+use poker_core::action::{Action, ActionList};
 use poker_core::legal_actions;
 use poker_core::state::{GameState, MAX_PLAYERS, NO_CARD};
 
-use super::nlhe::fnv1a;
 use super::Game;
+use crate::util::hash::Fnv1a;
 use crate::abstraction::bucket_map::BucketMap;
-use crate::abstraction::canonical::canonical_key;
+use crate::abstraction::canonical::preflop_index;
+use crate::abstraction::hand_index::HandIndexer;
 
 /// Number of cards consumed by a heads-up deal: 2 hole cards each + 5 board.
 const DEAL_CARDS: usize = 9;
+
+/// Maximum game-tree depth a single hand can reach (`apply` calls without an
+/// `undo`).  Sized to `poker_core`'s own undo-stack cap so the inline cursor
+/// history can never overflow where the engine itself would not.
+const MAX_DEPTH: usize = poker_core::undo::MAX_UNDO_DEPTH;
 
 /// A heads-up NLHE game with sampled deals and per-street card abstraction.
 pub struct BlueprintHoldem {
@@ -44,6 +51,9 @@ pub struct BlueprintHoldem {
     /// Information abstraction for the post-flop streets, indexed
     /// `flop = 0, turn = 1, river = 2`.  `None` ⇒ that street is unabstracted.
     street_buckets: [Option<BucketMap>; 3],
+    /// Dense hand indexers per post-flop street (`[2,3] / [2,4] / [2,5]`), used
+    /// for the unabstracted fallback key when a street has no bucket map.
+    indexers: [HandIndexer; 3],
 }
 
 /// A node: the pre-deal chance root (`gs == None`) or a play node wrapping a
@@ -61,7 +71,18 @@ impl BlueprintHoldem {
         let mut stacks = [0u32; MAX_PLAYERS];
         stacks[0] = stack;
         stacks[1] = stack;
-        Self { stacks, big_blind, small_blind, button, street_buckets: [None, None, None] }
+        Self {
+            stacks,
+            big_blind,
+            small_blind,
+            button,
+            street_buckets: [None, None, None],
+            indexers: [
+                HandIndexer::new(&[2, 3]),
+                HandIndexer::new(&[2, 4]),
+                HandIndexer::new(&[2, 5]),
+            ],
+        }
     }
 
     /// Attach a street's information abstraction (`flop = 0, turn = 1,
@@ -96,17 +117,47 @@ impl BlueprintHoldem {
         let visible = board.len();
         if visible == 0 {
             // Pre-flop: the 169 suit-canonical starting-hand classes.
-            return fnv1a(&canonical_key(hole, &[]));
+            return preflop_index(hole) as u64;
         }
         let street = visible - 3; // flop = 0, turn = 1, river = 2
         match self.street_buckets.get(street).and_then(Option::as_ref) {
             Some(map) => match map.bucket(hole, board) {
                 Some(b) => b as u64,
-                // Outside the clustered set: stay correct by not abstracting.
-                None => fnv1a(&canonical_key(hole, board)),
+                // Outside the built set: stay correct by not abstracting.
+                None => self.raw_index(street, hole, board),
             },
-            None => fnv1a(&canonical_key(hole, board)),
+            None => self.raw_index(street, hole, board),
         }
+    }
+
+    /// Unabstracted key for a post-flop street: the raw dense hand index (which
+    /// is itself suit-isomorphic and collision-free).  Used when no bucket map
+    /// covers the situation — the same role the suit-canonical key played before.
+    fn raw_index(&self, street: usize, hole: &[u8; 2], board: &[u8]) -> u64 {
+        let mut cards = [0u8; 7];
+        cards[0] = hole[0];
+        cards[1] = hole[1];
+        cards[2..2 + board.len()].copy_from_slice(board);
+        self.indexers[street].index(&cards[..2 + board.len()])
+    }
+
+    /// Fold the information-set key for the acting player at `gs` with the given
+    /// perfect-recall `history` (action indices), streamed straight into FNV-1a
+    /// so neither the clone-based nor the cursor-based path allocates a `Vec`.
+    fn info_key_for(&self, gs: &GameState, history: &[u8]) -> u64 {
+        let player = gs.current_player();
+        let mut hole = gs.hole_cards[player];
+        hole.sort_unstable();
+        let visible = gs.board_cards_count();
+        let bucket = self.situation_bucket(&hole, &gs.board[..visible]);
+
+        let mut h = Fnv1a::new();
+        h.write(player as u8);
+        h.write(visible as u8);
+        h.write_all(&bucket.to_le_bytes());
+        h.write(0xFF); // separator so bucket bytes / history can't blur
+        h.write_all(history);
+        h.finish()
     }
 }
 
@@ -173,19 +224,80 @@ impl Game for BlueprintHoldem {
 
     fn info_key(&self, state: &BlueprintState) -> u64 {
         let gs = state.gs.as_ref().expect("info_key at a play node");
-        let player = gs.current_player();
-        let mut hole = gs.hole_cards[player];
-        hole.sort_unstable();
-        let visible = gs.board_cards_count();
-        let bucket = self.situation_bucket(&hole, &gs.board[..visible]);
+        self.info_key_for(gs, &state.history)
+    }
+}
 
-        let mut bytes = Vec::with_capacity(11 + state.history.len());
-        bytes.push(player as u8);
-        bytes.push(visible as u8);
-        bytes.extend_from_slice(&bucket.to_le_bytes());
-        bytes.push(0xFF); // separator so bucket bytes / history can't blur
-        bytes.extend_from_slice(&state.history);
-        fnv1a(&bytes)
+/// A zero-allocation traversal cursor for [`BlueprintHoldem`]: one `GameState`
+/// walked in place via `apply_action`/`undo_action`, plus an inline
+/// perfect-recall history (no per-node `Vec`).
+pub struct BlueprintCursor {
+    /// `None` at the pre-deal chance root; `Some` once a deal has been sampled.
+    gs: Option<GameState>,
+    /// Action indices taken from the root, the perfect-recall history.
+    history: [u8; MAX_DEPTH],
+    /// Current depth — number of valid entries in `history`.
+    depth: usize,
+}
+
+impl super::CursorGame for BlueprintHoldem {
+    type Cursor = BlueprintCursor;
+    type Action = Action;
+    type Actions = ActionList;
+
+    fn num_players(&self) -> usize {
+        2
+    }
+
+    fn root(&self) -> BlueprintCursor {
+        BlueprintCursor { gs: None, history: [0; MAX_DEPTH], depth: 0 }
+    }
+
+    fn is_terminal(&self, c: &BlueprintCursor) -> bool {
+        c.gs.as_ref().is_some_and(|g| g.is_terminal())
+    }
+
+    fn is_chance(&self, c: &BlueprintCursor) -> bool {
+        c.gs.is_none()
+    }
+
+    fn utility(&self, c: &BlueprintCursor, player: usize) -> f64 {
+        let gs = c.gs.as_ref().expect("utility at a play node");
+        gs.terminal_payoffs()[player] as f64 / self.big_blind as f64
+    }
+
+    fn current_player(&self, c: &BlueprintCursor) -> usize {
+        c.gs.as_ref().expect("current_player at a play node").current_player()
+    }
+
+    fn legal(&self, c: &BlueprintCursor) -> ActionList {
+        legal_actions(c.gs.as_ref().expect("legal at a play node"))
+    }
+
+    fn info_key(&self, c: &BlueprintCursor) -> u64 {
+        let gs = c.gs.as_ref().expect("info_key at a play node");
+        self.info_key_for(gs, &c.history[..c.depth])
+    }
+
+    fn apply(&self, c: &mut BlueprintCursor, a: usize, action: Action) {
+        c.gs.as_mut().expect("apply at a play node").apply_action(action);
+        c.history[c.depth] = a as u8;
+        c.depth += 1;
+    }
+
+    fn undo(&self, c: &mut BlueprintCursor) {
+        c.depth -= 1;
+        c.gs.as_mut().expect("undo at a play node").undo_action();
+    }
+
+    fn sample_chance(&self, c: &mut BlueprintCursor, next_unit: impl FnMut() -> f64) {
+        c.gs = Some(self.deal(next_unit));
+        c.depth = 0;
+    }
+
+    fn undo_chance(&self, c: &mut BlueprintCursor) {
+        c.gs = None;
+        c.depth = 0;
     }
 }
 

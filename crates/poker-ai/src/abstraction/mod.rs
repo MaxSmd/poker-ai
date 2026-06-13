@@ -3,3 +3,4 @@ pub mod canonical;
 pub mod clustering;
 pub mod equity_cache;
 pub mod features;
+pub mod hand_index;

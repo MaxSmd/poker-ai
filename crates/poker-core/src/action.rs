@@ -62,6 +62,13 @@ impl std::ops::Deref for ActionList {
     }
 }
 
+impl AsRef<[Action]> for ActionList {
+    #[inline]
+    fn as_ref(&self) -> &[Action] {
+        self
+    }
+}
+
 /// Returns the legal abstract actions available for the current player in `state`.
 ///
 /// Uses the blueprint action abstraction from [`betting`]:

@@ -1,39 +1,57 @@
-//! Canonical equity cache (Phase 2).
+//! Canonical equity cache (Phase 2) — a **flat array** over the dense hand
+//! index.
 //!
 //! Equity-distribution computation over millions of boards is the most
-//! compute-bound offline step in the whole project, and it is embarrassingly
-//! parallel and full of redundancy: every dealt situation is suit-isomorphic to
-//! many others.  The cache does the work **once per canonical situation**
-//! ([`super::canonical`]) and serializes the result, so re-clustering
-//! experiments (different bucket counts, turn-conditioned-on-flop passes) read
-//! histograms back instead of recomputing rollouts.
+//! compute-bound offline step, and it is full of suit-isomorphic redundancy.
+//! Keyed on the dense [`HandIndexer`], the cache is a flat `Vec<f32>`: slot
+//! `index(hole, board)` holds that canonical situation's `bins`-bin histogram.
+//! No hashing, no `Vec<u8>` keys, and the offline build fills the slots by
+//! partitioning the index range (see `bin/cluster`) instead of merging per-board
+//! maps.
 //!
-//! Histograms are stored as `f32` to halve the on-disk and in-RAM footprint;
-//! they are promoted to `f64` only when handed to the clusterer.
+//! Unfilled slots carry a `NaN` sentinel, so a *partial* build (the local
+//! flop/prefix pass) and a full one (the cloud burst) share the same structure.
+//! Histograms are `f32` to halve the footprint; the clusterer promotes to `f64`.
 
-use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use super::canonical::canonical_key;
 use super::features::ehs_histogram;
+use super::hand_index::HandIndexer;
 
-/// A map from canonical `(hole, board)` key to its equity-distribution
-/// histogram.
-#[derive(Debug, Default, Serialize, Deserialize)]
+/// A flat equity cache: one `bins`-bin histogram per dense canonical index.
 pub struct EquityCache {
-    /// Number of histogram bins every entry uses.
     bins: usize,
-    /// Canonical key bytes → histogram.
-    entries: HashMap<Vec<u8>, Vec<f32>>,
+    indexer: HandIndexer,
+    /// `bins × indexer.size()` values; slot `i` occupies `data[i*bins..][..bins]`.
+    /// The first bin of an unfilled slot is `NaN`.
+    data: Vec<f32>,
+}
+
+/// Serialized form (the indexer is rebuilt from `rounds` on load).
+#[derive(Serialize, Deserialize)]
+struct Persist {
+    bins: usize,
+    rounds: Vec<u8>,
+    data: Vec<f32>,
 }
 
 impl EquityCache {
-    /// Create an empty cache for `bins`-bin histograms.
-    pub fn new(bins: usize) -> Self {
-        Self { bins, entries: HashMap::new() }
+    /// An empty cache (all slots `NaN`) for the given round structure (e.g.
+    /// `[2, 3]` for a flop situation).
+    pub fn new(bins: usize, cards_per_round: &[u8]) -> Self {
+        let indexer = HandIndexer::new(cards_per_round);
+        let data = vec![f32::NAN; bins * indexer.size() as usize];
+        Self { bins, indexer, data }
+    }
+
+    /// Wrap a pre-filled flat `data` array (the parallel build path).
+    pub fn from_parts(bins: usize, cards_per_round: &[u8], data: Vec<f32>) -> Self {
+        let indexer = HandIndexer::new(cards_per_round);
+        debug_assert_eq!(data.len(), bins * indexer.size() as usize, "data length must be bins × size");
+        Self { bins, indexer, data }
     }
 
     /// Histogram bin count.
@@ -41,30 +59,55 @@ impl EquityCache {
         self.bins
     }
 
-    /// Number of distinct (canonical) situations stored.
+    /// The dense indexer this cache is keyed on.
+    pub fn indexer(&self) -> &HandIndexer {
+        &self.indexer
+    }
+
+    /// Total slot capacity (= `indexer.size()`).
+    pub fn capacity(&self) -> usize {
+        self.indexer.size() as usize
+    }
+
+    /// Number of **filled** slots.
     pub fn len(&self) -> usize {
-        self.entries.len()
+        (0..self.capacity()).filter(|&i| !self.data[i * self.bins].is_nan()).count()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.len() == 0
     }
 
-    /// Look up the histogram for a situation (canonicalized on the way in).
-    pub fn get(&self, hole: &[u8], board: &[u8]) -> Option<&Vec<f32>> {
-        self.entries.get(&canonical_key(hole, board))
+    /// Dense slot index for a situation.
+    fn slot(&self, hole: &[u8], board: &[u8]) -> usize {
+        let mut cards = [0u8; 7];
+        let n = hole.len() + board.len();
+        cards[..hole.len()].copy_from_slice(hole);
+        cards[hole.len()..n].copy_from_slice(board);
+        self.indexer.index(&cards[..n]) as usize
     }
 
-    /// Insert a pre-computed histogram under a situation's canonical key.
+    /// Histogram for a situation, or `None` if its slot is unfilled.
+    pub fn get(&self, hole: &[u8], board: &[u8]) -> Option<&[f32]> {
+        let i = self.slot(hole, board);
+        let slot = &self.data[i * self.bins..][..self.bins];
+        if slot[0].is_nan() {
+            None
+        } else {
+            Some(slot)
+        }
+    }
+
+    /// Write a histogram into a situation's slot.
     pub fn insert(&mut self, hole: &[u8], board: &[u8], histogram: Vec<f32>) {
         debug_assert_eq!(histogram.len(), self.bins, "histogram length must match `bins`");
-        self.entries.insert(canonical_key(hole, board), histogram);
+        let i = self.slot(hole, board);
+        self.data[i * self.bins..][..self.bins].copy_from_slice(&histogram);
     }
 
-    /// Compute the equity histogram for a situation and store it — but only if
-    /// its canonical key is not already present.  Returns `true` if work was
-    /// done, `false` if the canonical situation was already cached.  This is the
-    /// dedup that turns an O(dealt situations) job into O(canonical situations).
+    /// Compute and store the equity histogram for a situation, but only if its
+    /// slot is empty.  Returns `true` if work was done.  The canonical dedup that
+    /// turns O(dealt) into O(canonical).
     pub fn compute_if_absent(&mut self, hole: &[u8; 2], board: &[u8]) -> bool {
         let bins = self.bins;
         self.compute_if_absent_with(hole, board, || {
@@ -73,51 +116,49 @@ impl EquityCache {
     }
 
     /// Like [`compute_if_absent`](Self::compute_if_absent) but the histogram is
-    /// produced by `make`, called only on a miss.  Lets the caller choose the
-    /// feature computation — e.g. a Monte-Carlo rollout for the flop and turn,
-    /// where exact enumeration is too slow — while keeping the canonical dedup.
+    /// produced by `make`, called only on a miss (lets the caller pick the
+    /// feature — MC for flop/turn, exact for river — while keeping the dedup).
     pub fn compute_if_absent_with(
         &mut self,
         hole: &[u8; 2],
         board: &[u8],
         make: impl FnOnce() -> Vec<f32>,
     ) -> bool {
-        let key = canonical_key(hole, board);
-        if self.entries.contains_key(&key) {
+        let i = self.slot(hole, board);
+        if !self.data[i * self.bins].is_nan() {
             return false;
         }
         let hist = make();
         debug_assert_eq!(hist.len(), self.bins, "histogram length must match `bins`");
-        self.entries.insert(key, hist);
+        self.data[i * self.bins..][..self.bins].copy_from_slice(&hist);
         true
     }
 
-    /// Iterate `(canonical key, histogram)` pairs — the input to clustering.
-    pub fn iter(&self) -> impl Iterator<Item = (&Vec<u8>, &Vec<f32>)> {
-        self.entries.iter()
-    }
-
-    /// Fold another cache's entries into this one (dedup by canonical key).  Used
-    /// to merge per-board caches built in parallel; merging in a fixed board
-    /// order keeps the result deterministic regardless of which thread built
-    /// which board.
-    pub fn merge(&mut self, other: EquityCache) {
-        debug_assert_eq!(self.bins, other.bins, "merging caches must share bin count");
-        for (key, hist) in other.entries {
-            self.entries.entry(key).or_insert(hist);
-        }
+    /// Iterate `(slot index, histogram)` over the **filled** slots — the input to
+    /// clustering.
+    pub fn iter(&self) -> impl Iterator<Item = (usize, &[f32])> {
+        (0..self.capacity()).filter_map(move |i| {
+            let slot = &self.data[i * self.bins..][..self.bins];
+            (!slot[0].is_nan()).then_some((i, slot))
+        })
     }
 
     /// Serialize to a bincode file.
     pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
-        let bytes = bincode::serialize(self).map_err(io::Error::other)?;
+        let persist = Persist {
+            bins: self.bins,
+            rounds: self.indexer.cards_per_round().to_vec(),
+            data: self.data.clone(),
+        };
+        let bytes = bincode::serialize(&persist).map_err(io::Error::other)?;
         std::fs::write(path, bytes)
     }
 
-    /// Load from a bincode file.
+    /// Load from a bincode file (rebuilds the indexer from the stored rounds).
     pub fn load(path: impl AsRef<Path>) -> io::Result<Self> {
         let bytes = std::fs::read(path)?;
-        bincode::deserialize(&bytes).map_err(io::Error::other)
+        let p: Persist = bincode::deserialize(&bytes).map_err(io::Error::other)?;
+        Ok(Self::from_parts(p.bins, &p.rounds, p.data))
     }
 }
 
@@ -128,7 +169,7 @@ mod tests {
 
     #[test]
     fn dedups_suit_isomorphic_situations() {
-        let mut cache = EquityCache::new(10);
+        let mut cache = EquityCache::new(10, &[2, 3]);
         let hole = [make_card(12, 0), make_card(11, 0)]; // A♠K♠
         let board = [make_card(5, 0), make_card(9, 1), make_card(2, 2)];
 
@@ -140,15 +181,14 @@ mod tests {
         let board2: Vec<u8> = board.iter().map(|&c| rot(c)).collect();
         assert!(!cache.compute_if_absent(&hole2, &board2), "isomorphic situation is a cache hit");
 
-        assert_eq!(cache.len(), 1, "both situations share one canonical entry");
-        // And the histogram is retrievable through either representation.
+        assert_eq!(cache.len(), 1, "both situations share one canonical slot");
         assert!(cache.get(&hole, &board).is_some());
         assert_eq!(cache.get(&hole, &board), cache.get(&hole2, &board2));
     }
 
     #[test]
     fn save_load_round_trips() {
-        let mut cache = EquityCache::new(8);
+        let mut cache = EquityCache::new(8, &[2, 3]);
         cache.insert(
             &[make_card(12, 0), make_card(12, 1)],
             &[make_card(11, 0), make_card(7, 1), make_card(2, 2)],

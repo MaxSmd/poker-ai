@@ -27,31 +27,7 @@
 
 use crate::games::Game;
 use crate::solver::best_response::Strategy;
-
-/// xorshift64* `[0, 1)` draw advancing `state` — the same deterministic PRNG the
-/// solvers use, so evaluation runs are reproducible.
-fn next_unit(state: &mut u64) -> f64 {
-    let mut x = *state;
-    x ^= x >> 12;
-    x ^= x << 25;
-    x ^= x >> 27;
-    *state = x;
-    (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
-}
-
-/// Sample an index from a probability stream given a uniform `r ∈ [0, 1)`.
-fn sample(probs: impl Iterator<Item = f64>, r: f64) -> usize {
-    let mut acc = 0.0;
-    let mut last = 0;
-    for (i, p) in probs.enumerate() {
-        last = i;
-        acc += p;
-        if r < acc {
-            return i;
-        }
-    }
-    last
-}
+use crate::util::rng::{sample_index as sample, xorshift_next_unit as next_unit};
 
 /// Strategy probabilities at a state (uniform if the info set is unseen), the
 /// same fallback convention as the best-response code.

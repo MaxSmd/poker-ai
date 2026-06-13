@@ -28,12 +28,16 @@ use poker_core::action::Action;
 use poker_core::legal_actions;
 use poker_core::state::{GameState, MAX_PLAYERS, NO_CARD};
 
-use super::nlhe::fnv1a;
 use super::Game;
-use crate::abstraction::canonical::canonical_key;
+use crate::util::hash::Fnv1a;
+use crate::abstraction::canonical::preflop_index;
 
 /// Cards consumed by a heads-up deal: 2 hole cards each + 5 board.
 const DEAL_CARDS: usize = 9;
+
+/// Maximum decisions in a push/fold hand (SB then BB) — the cursor's inline
+/// history is sized to this with generous headroom.
+const MAX_DEPTH: usize = 4;
 
 /// A heads-up push/fold NLHE game with sampled deals.
 pub struct PushFoldHoldem {
@@ -94,6 +98,32 @@ impl PushFoldHoldem {
         }
         debug_assert!(has_fold, "push/fold decision nodes always allow folding");
         [Action::Fold, commit.expect("a chips-committing action is always available")]
+    }
+
+    /// Fold the SB-open / BB-vs-shove information-set key, streamed straight into
+    /// FNV-1a so neither the clone-based nor the cursor-based path allocates.
+    /// Pre-flop only: the 169-class pre-flop index plus the perfect-recall
+    /// history.
+    fn info_key_for(gs: &GameState, history: &[u8]) -> u64 {
+        let player = gs.current_player();
+        let hole = gs.hole_cards[player];
+        Self::preflop_key(player, &hole, history)
+    }
+
+    /// The information-set key for a pre-flop `(player, hole, history)`.  Public
+    /// so the trainer's shove-chart reconstruction stays in lock-step with the
+    /// solver (a wrong reconstruction silently reads the wrong strategy).
+    pub fn preflop_key(player: usize, hole: &[u8; 2], history: &[u8]) -> u64 {
+        let mut sorted = *hole;
+        sorted.sort_unstable();
+        let class = preflop_index(&sorted);
+
+        let mut h = Fnv1a::new();
+        h.write(player as u8);
+        h.write_all(&class.to_le_bytes());
+        h.write(0xFF);
+        h.write_all(history);
+        h.finish()
     }
 }
 
@@ -157,27 +187,115 @@ impl Game for PushFoldHoldem {
 
     fn info_key(&self, state: &PushFoldState) -> u64 {
         let gs = state.gs.as_ref().expect("info_key at a play node");
+        Self::info_key_for(gs, &state.history)
+    }
+}
+
+/// A zero-allocation traversal cursor for [`PushFoldHoldem`]: one `GameState`
+/// walked in place, plus an inline perfect-recall history.
+pub struct PushFoldCursor {
+    /// `None` at the pre-deal chance root; `Some` once a deal has been sampled.
+    gs: Option<GameState>,
+    /// Action indices taken from the root (`0 = fold, 1 = commit`).
+    history: [u8; MAX_DEPTH],
+    /// Current depth — number of valid entries in `history`.
+    depth: usize,
+}
+
+impl super::CursorGame for PushFoldHoldem {
+    type Cursor = PushFoldCursor;
+    type Action = Action;
+    type Actions = [Action; 2];
+
+    fn num_players(&self) -> usize {
+        2
+    }
+
+    fn root(&self) -> PushFoldCursor {
+        PushFoldCursor { gs: None, history: [0; MAX_DEPTH], depth: 0 }
+    }
+
+    fn is_terminal(&self, c: &PushFoldCursor) -> bool {
+        c.gs.as_ref().is_some_and(|g| g.is_terminal())
+    }
+
+    fn is_chance(&self, c: &PushFoldCursor) -> bool {
+        c.gs.is_none()
+    }
+
+    fn utility(&self, c: &PushFoldCursor, player: usize) -> f64 {
+        let gs = c.gs.as_ref().expect("utility at a play node");
+        gs.terminal_payoffs()[player] as f64 / self.big_blind as f64
+    }
+
+    fn current_player(&self, c: &PushFoldCursor) -> usize {
+        c.gs.as_ref().expect("current_player at a play node").current_player()
+    }
+
+    fn legal(&self, c: &PushFoldCursor) -> [Action; 2] {
+        Self::menu(c.gs.as_ref().expect("legal at a play node"))
+    }
+
+    fn info_key(&self, c: &PushFoldCursor) -> u64 {
+        let gs = c.gs.as_ref().expect("info_key at a play node");
+        Self::info_key_for(gs, &c.history[..c.depth])
+    }
+
+    fn apply(&self, c: &mut PushFoldCursor, a: usize, action: Action) {
+        c.gs.as_mut().expect("apply at a play node").apply_action(action);
+        c.history[c.depth] = a as u8;
+        c.depth += 1;
+    }
+
+    fn undo(&self, c: &mut PushFoldCursor) {
+        c.depth -= 1;
+        c.gs.as_mut().expect("undo at a play node").undo_action();
+    }
+
+    fn sample_chance(&self, c: &mut PushFoldCursor, next_unit: impl FnMut() -> f64) {
+        c.gs = Some(self.deal(next_unit));
+        c.depth = 0;
+    }
+
+    fn undo_chance(&self, c: &mut PushFoldCursor) {
+        c.gs = None;
+        c.depth = 0;
+    }
+}
+
+/// The 169 suit-canonical pre-flop starting-hand classes.
+const PREFLOP_CLASSES: usize = 169;
+
+impl super::IndexedGame for PushFoldHoldem {
+    /// Two betting sequences (SB open, BB vs shove) × 169 pre-flop classes.
+    fn info_set_capacity(&self) -> usize {
+        2 * PREFLOP_CLASSES
+    }
+
+    /// `sequence · 169 + preflop_class`, where the sequence is the decision depth
+    /// (0 = SB open with empty history, 1 = BB facing the shove).  This is a
+    /// bijection onto `0..338` and partitions exactly as the `HashMap` info key.
+    fn info_set_index(&self, c: &PushFoldCursor) -> usize {
+        debug_assert!(c.depth < 2, "push/fold has at most two decisions per hand");
+        let gs = c.gs.as_ref().expect("info_set_index at a play node");
         let player = gs.current_player();
         let mut hole = gs.hole_cards[player];
         hole.sort_unstable();
-        // Pre-flop only: the 169 suit-canonical starting-hand classes, plus the
-        // perfect-recall history (distinguishes SB-open from BB-vs-shove).
-        let class = canonical_key(&hole, &[]);
-        let mut bytes = Vec::with_capacity(4 + class.len() + state.history.len());
-        bytes.push(player as u8);
-        bytes.extend_from_slice(&class);
-        bytes.push(0xFF);
-        bytes.extend_from_slice(&state.history);
-        fnv1a(&bytes)
+        c.depth * PREFLOP_CLASSES + preflop_index(&hole) as usize
+    }
+
+    fn actions_at(&self, _index: usize) -> usize {
+        2
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::abstraction::canonical::preflop_index;
     use crate::solver::cfr::Variant;
     use crate::solver::dcfr::Discount;
-    use crate::solver::mccfr::Mccfr;
+    use crate::solver::mccfr::{Mccfr, SoaMccfr};
     use poker_core::make_card;
     use std::collections::HashMap;
 
@@ -231,15 +349,9 @@ mod tests {
 
         let game = PushFoldHoldem::new(40, 2, 1, 0);
         let shove_prob = |hole: [u8; 2]| -> f64 {
-            // Reconstruct the SB opening info key for this exact hand.
-            let mut h = hole;
-            h.sort_unstable();
-            let class = canonical_key(&h, &[]);
-            let mut bytes = Vec::new();
-            bytes.push(0u8); // SB is player 0 (button)
-            bytes.extend_from_slice(&class);
-            bytes.push(0xFF); // empty history
-            let key = fnv1a(&bytes);
+            // Reconstruct the SB opening info key for this exact hand (player 0,
+            // empty history) via the same helper the solver keys on.
+            let key = PushFoldHoldem::preflop_key(0, &hole, &[]);
             avg.get(&key).map(|p| p[1]).unwrap_or(0.0) // p[1] = commit/shove
         };
         let _ = &game;
@@ -247,6 +359,80 @@ mod tests {
         let trash = shove_prob([make_card(5, 0), make_card(0, 1)]); // 7-2 offsuit
         assert!(aces > trash, "AA shove {aces} should exceed 72o shove {trash}");
         assert!(aces > 0.9, "AA should shove almost always, got {aces}");
+    }
+
+    #[test]
+    fn soa_table_footprint_is_tiny() {
+        // The flat store holds 3 f32 accumulators × 2 actions = 24 bytes/info set,
+        // versus the HashMap Node's five heap vecs (~350 B) — the ~10× the memory
+        // budget is about.
+        let soa = SoaMccfr::new(PushFoldHoldem::new(40, 2, 1, 0), Variant::Vanilla);
+        assert_eq!(soa.bytes_per_info_set(), 24);
+    }
+
+    #[test]
+    fn soa_converges_like_the_hashmap_solver() {
+        // The flat f32 SoA store reaches the same push/fold solution as the f64
+        // HashMap reference (within tolerance — f32 storage and a separate code
+        // path mean it is not bit-identical, see the module note).
+        let iters = 150_000;
+        let cfg = || PushFoldHoldem::new(40, 2, 1, 0);
+
+        let mut hash = Mccfr::with_seed(cfg(), Variant::Dcfr(Discount::RECOMMENDED), 1).with_baseline();
+        hash.train_fast(iters);
+        let havg = hash.average_strategy();
+
+        let mut soa = SoaMccfr::with_seed(cfg(), Variant::Dcfr(Discount::RECOMMENDED), 1).with_baseline();
+        soa.train(iters);
+
+        // Compare the SB opening shove probability for every starting hand.
+        let (mut sum, mut max, mut n) = (0.0f64, 0.0f64, 0u32);
+        for a in 0..52u8 {
+            for b in (a + 1)..52u8 {
+                let hole = [a, b];
+                let h = havg.get(&PushFoldHoldem::preflop_key(0, &hole, &[])).map(|p| p[1]).unwrap_or(0.0);
+                let s = soa.average_strategy_at(preflop_index(&hole) as usize)[1];
+                let d = (h - s).abs();
+                sum += d;
+                max = max.max(d);
+                n += 1;
+            }
+        }
+        let mean = sum / n as f64;
+        assert!(mean < 0.03, "SoA vs HashMap mean SB-shove diff {mean} too large");
+        assert!(max < 0.15, "SoA vs HashMap max SB-shove diff {max} too large");
+
+        let aa = soa.average_strategy_at(preflop_index(&[make_card(12, 0), make_card(12, 1)]) as usize)[1];
+        let trash = soa.average_strategy_at(preflop_index(&[make_card(5, 0), make_card(0, 1)]) as usize)[1];
+        assert!(aa > 0.9 && aa > trash, "SoA chart shape: AA {aa} vs 72o {trash}");
+    }
+
+    #[test]
+    fn soa_checkpoint_round_trips() {
+        // A flat-table checkpoint resumes bit-identically (f32 arrays + RNG +
+        // counters round-trip exactly through bincode).
+        let cfg = || PushFoldHoldem::new(40, 2, 1, 0);
+        let mut whole = SoaMccfr::with_seed(cfg(), Variant::Dcfr(Discount::RECOMMENDED), 11).with_baseline();
+        whole.train(40_000);
+
+        let mut part = SoaMccfr::with_seed(cfg(), Variant::Dcfr(Discount::RECOMMENDED), 11).with_baseline();
+        part.train(20_000);
+        let path = std::env::temp_dir().join(format!("soa_ckpt_{}.bin", std::process::id()));
+        part.save_checkpoint(&path).unwrap();
+        drop(part);
+
+        let mut resumed = SoaMccfr::load_checkpoint(&path, cfg()).unwrap();
+        assert_eq!(resumed.iterations(), 20_000);
+        resumed.train(20_000);
+        std::fs::remove_file(&path).ok();
+
+        for idx in 0..2 * 169 {
+            assert_eq!(
+                whole.average_strategy_at(idx),
+                resumed.average_strategy_at(idx),
+                "SoA resume must be bit-identical at info set {idx}"
+            );
+        }
     }
 
     /// The push/fold equilibrium is computed without the curated-deal trick, so

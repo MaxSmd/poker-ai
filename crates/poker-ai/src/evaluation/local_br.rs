@@ -23,15 +23,7 @@
 use std::collections::HashMap;
 
 use crate::games::Game;
-
-fn next_unit(state: &mut u64) -> f64 {
-    let mut x = *state;
-    x ^= x >> 12;
-    x ^= x << 25;
-    x ^= x >> 27;
-    *state = x;
-    (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
-}
+use crate::util::rng::{sample_index, xorshift_next_unit as next_unit};
 
 /// Running mean of each action's value at a responder info set.
 #[derive(Clone)]
@@ -99,15 +91,7 @@ fn accumulate<G: Game>(
 }
 
 fn sample(probs: &[f64], rng: &mut u64) -> usize {
-    let r = next_unit(rng);
-    let mut acc = 0.0;
-    for (i, &p) in probs.iter().enumerate() {
-        acc += p;
-        if r < acc {
-            return i;
-        }
-    }
-    probs.len() - 1
+    sample_index(probs.iter().copied(), next_unit(rng))
 }
 
 /// Phase 2: exact value to `traverser` of the committed greedy policy `g`

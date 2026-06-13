@@ -23,6 +23,8 @@
 
 use rayon::prelude::*;
 
+use crate::util::rng::Rng;
+
 /// Result of a clustering run.
 pub struct KMeans {
     /// Cluster index in `0..k` for each input point.
@@ -36,18 +38,6 @@ fn dist_sq(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum()
 }
 
-struct Rng(u64);
-impl Rng {
-    fn unit(&mut self) -> f64 {
-        let mut x = self.0;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.0 = x;
-        (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
-    }
-}
-
 /// Cluster `data` (one histogram per row, all the same length) into `k` groups
 /// using K-Means++ initialization and Lloyd's algorithm under L2 distance.
 ///
@@ -58,7 +48,7 @@ pub fn kmeans(data: &[Vec<f64>], k: usize, seed: u64, max_iters: usize) -> KMean
     assert!(!data.is_empty(), "cannot cluster an empty dataset");
     let k = k.min(data.len());
     let dim = data[0].len();
-    let mut rng = Rng(seed | 1);
+    let mut rng = Rng::new(seed);
 
     // ── K-Means++ seeding ────────────────────────────────────────────────────
     let mut centroids: Vec<Vec<f64>> = Vec::with_capacity(k);
@@ -164,9 +154,119 @@ pub fn kmeans_plus_plus(data: &[Vec<f64>], k: usize) -> Vec<usize> {
     kmeans(data, k, 0xC0FF_EE12_3456_789A, 100).assignments
 }
 
+/// Globally-optimal 1-D clustering into `k` contiguous groups (Ckmeans dynamic
+/// program), for a **scalar** feature such as river equity.
+///
+/// K-means on a scalar is the wrong tool — Lloyd's only finds a local optimum and
+/// (on the river's near-degenerate distribution) collapses into incoherent
+/// catch-all buckets.  In one dimension the optimum is a set of contiguous
+/// intervals, found exactly by the O(k·m²) DP that minimises the weighted
+/// within-cluster sum of squares.  `values` must be sorted ascending and
+/// distinct; `weights[i]` is how many situations carry `values[i]`.  Returns the
+/// cluster id (`0..k`, non-decreasing with value) for each input value.
+/// Deterministic — no seed, no iteration count.
+pub fn cluster_1d(values: &[f64], weights: &[u64], k: usize) -> Vec<usize> {
+    let m = values.len();
+    assert_eq!(weights.len(), m, "values and weights must have equal length");
+    assert!(m >= 1 && k >= 1, "need ≥1 value and ≥1 cluster");
+    debug_assert!(values.windows(2).all(|w| w[0] < w[1]), "values must be sorted and distinct");
+
+    let k = k.min(m);
+    if k == 1 {
+        return vec![0; m];
+    }
+    if k == m {
+        return (0..m).collect();
+    }
+
+    // Prefix sums of w, w·x, w·x² → O(1) weighted SSE of any contiguous range.
+    let (mut pw, mut pwx, mut pwx2) = (vec![0f64; m + 1], vec![0f64; m + 1], vec![0f64; m + 1]);
+    for i in 0..m {
+        let (w, x) = (weights[i] as f64, values[i]);
+        pw[i + 1] = pw[i] + w;
+        pwx[i + 1] = pwx[i] + w * x;
+        pwx2[i + 1] = pwx2[i] + w * x * x;
+    }
+    // Weighted SSE of points in [a, b): Σw·x² − (Σw·x)²/Σw.
+    let cost = |a: usize, b: usize| -> f64 {
+        let w = pw[b] - pw[a];
+        if w <= 0.0 {
+            return 0.0;
+        }
+        let sx = pwx[b] - pwx[a];
+        (pwx2[b] - pwx2[a]) - sx * sx / w
+    };
+
+    // d[j][i] = min cost of clustering the first i values into j clusters;
+    // split[j][i] = start of the last (j-th) cluster.
+    let mut d = vec![vec![f64::INFINITY; m + 1]; k + 1];
+    let mut split = vec![vec![0usize; m + 1]; k + 1];
+    d[0][0] = 0.0;
+    for j in 1..=k {
+        for i in j..=m {
+            for t in (j - 1)..i {
+                let c = d[j - 1][t] + cost(t, i);
+                if c < d[j][i] {
+                    d[j][i] = c;
+                    split[j][i] = t;
+                }
+            }
+        }
+    }
+
+    let mut assign = vec![0usize; m];
+    let mut i = m;
+    for j in (1..=k).rev() {
+        let t = split[j][i];
+        for a in assign.iter_mut().take(i).skip(t) {
+            *a = j - 1;
+        }
+        i = t;
+    }
+    assign
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cluster_1d_is_contiguous_monotone_and_deterministic() {
+        let values = [0.0, 0.1, 0.12, 0.5, 0.52, 0.9, 0.95];
+        let weights = [1u64; 7];
+        let a = cluster_1d(&values, &weights, 3);
+        let b = cluster_1d(&values, &weights, 3);
+        assert_eq!(a, b, "deterministic");
+        // Non-decreasing with value, and exactly 3 contiguous groups.
+        assert!(a.windows(2).all(|w| w[0] <= w[1]), "monotone");
+        assert_eq!(*a.iter().max().unwrap(), 2, "uses all 3 clusters");
+        // The three natural groups (≈0, ≈0.5, ≈0.9) must each be one cluster.
+        assert_eq!(a[0], a[2]);
+        assert_eq!(a[3], a[4]);
+        assert_eq!(a[5], a[6]);
+        assert_ne!(a[0], a[3]);
+        assert_ne!(a[3], a[5]);
+    }
+
+    #[test]
+    fn cluster_1d_trivial_cases() {
+        let v = [0.1, 0.2, 0.3, 0.4];
+        let w = [1u64; 4];
+        assert_eq!(cluster_1d(&v, &w, 1), vec![0, 0, 0, 0]);
+        assert_eq!(cluster_1d(&v, &w, 4), vec![0, 1, 2, 3]);
+        // k larger than the number of distinct values clamps to one-per-value.
+        assert_eq!(cluster_1d(&v, &w, 9), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn cluster_1d_respects_weights() {
+        // A heavy mass at 0.30/0.31 should not be split before the lone outliers
+        // are separated: with k=2 the optimal split isolates the far point.
+        let values = [0.30, 0.31, 0.32, 0.95];
+        let weights = [100u64, 100, 100, 1];
+        let a = cluster_1d(&values, &weights, 2);
+        assert_eq!(a, vec![0, 0, 0, 1], "the dense mass stays together, outlier splits off");
+    }
 
     #[test]
     fn separates_well_separated_clusters() {

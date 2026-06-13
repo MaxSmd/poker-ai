@@ -15,8 +15,8 @@
 //!
 //! Run: cargo run --release --example inspect_buckets [k]
 
-use poker_ai::abstraction::clustering::kmeans;
-use poker_ai::abstraction::features::river_equity;
+use poker_ai::abstraction::clustering::cluster_1d;
+use poker_ai::abstraction::features::{board_equities, combo_index};
 use poker_core::{make_card, rank_of, suit_of};
 
 const RANKS: [char; 13] = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A'];
@@ -44,29 +44,39 @@ fn main() {
     }
     let deck: Vec<u8> = (0u8..52).filter(|c| used & (1 << c) == 0).collect();
 
-    // Every hole pair on this board, clustered on its scalar river equity.
+    // Every hole pair on this board, scored in one O(n log n) sweep, then
+    // clustered on the scalar river equity with the exact 1-D DP — the same path
+    // the production river abstraction uses.
+    let mut buf = [f32::NAN; 1326];
+    board_equities(board, &mut buf);
     let mut hands: Vec<[u8; 2]> = Vec::new();
-    let mut feats: Vec<Vec<f64>> = Vec::new();
     let mut equities: Vec<f64> = Vec::new();
     for i in 0..deck.len() {
         for j in (i + 1)..deck.len() {
-            let hole = [deck[i], deck[j]];
-            let eq = river_equity(hole, board);
-            hands.push(hole);
-            feats.push(vec![eq]);
-            equities.push(eq);
+            hands.push([deck[i], deck[j]]);
+            equities.push(buf[combo_index(deck[i], deck[j])] as f64);
         }
     }
 
     let board_str: String = board.iter().map(|&c| card_str(c) + " ").collect();
     println!("Board: {board_str} — {} hands clustered into {k} buckets\n", hands.len());
 
-    let result = kmeans(&feats, k, 1, 100);
+    // Distinct equity values + counts → globally-optimal 1-D assignment.
+    let mut values = equities.clone();
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    values.dedup();
+    let lookup = |e: f64| values.partition_point(|&v| v < e);
+    let mut weights = vec![0u64; values.len()];
+    for &e in &equities {
+        weights[lookup(e)] += 1;
+    }
+    let assign = cluster_1d(&values, &weights, k);
+    let num_clusters = assign.iter().copied().max().map_or(0, |m| m + 1);
 
     // Gather per-bucket members, then order buckets by mean equity for reading.
-    let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); result.centroids.len()];
-    for (idx, &b) in result.assignments.iter().enumerate() {
-        buckets[b].push(idx);
+    let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); num_clusters];
+    for (idx, &e) in equities.iter().enumerate() {
+        buckets[assign[lookup(e)]].push(idx);
     }
     let mut order: Vec<usize> = (0..buckets.len()).collect();
     let mean_eq = |b: &Vec<usize>| -> f64 {

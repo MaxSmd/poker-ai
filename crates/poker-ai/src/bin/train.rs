@@ -29,12 +29,12 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
-use poker_ai::abstraction::canonical::canonical_key;
+use poker_ai::abstraction::canonical::preflop_index;
 use poker_ai::evaluation::exploitability::push_fold_exploitability;
 use poker_ai::games::push_fold::PushFoldHoldem;
 use poker_ai::solver::cfr::Variant;
 use poker_ai::solver::dcfr::Discount;
-use poker_ai::solver::mccfr::Mccfr;
+use poker_ai::solver::mccfr::{Mccfr, SoaMccfr};
 use poker_ai::solver::pruning::PruningConfig;
 
 const BIG_BLIND: u32 = 2;
@@ -53,6 +53,23 @@ struct RunConfig {
 /// RBP threshold tuned to push/fold's regret scale (payoffs are ±stack chips).
 fn pushfold_pruning() -> PruningConfig {
     PruningConfig { theta: -5_000.0, k: 100, start_fraction: 0.2, refresh_interval: 10_000 }
+}
+
+/// Emit one machine-readable JSON metrics line for an external experiment
+/// tracker — the `scripts/train_wandb.py` Weights & Biases logger parses these.
+/// A **no-op** unless `POKER_AI_METRICS` is set in the environment, so plain
+/// `train` runs are byte-identical to before (the wrapper sets the var).
+///
+/// `tag` is the line prefix (`wandb-config` once at startup, `wandb` per
+/// checkpoint); each `value` must already be a valid JSON literal (numbers bare,
+/// strings quoted — use `format!("{s:?}")` for a `String`).
+fn emit_metric(tag: &str, fields: &[(&str, String)]) {
+    if std::env::var_os("POKER_AI_METRICS").is_none() {
+        return;
+    }
+    let body =
+        fields.iter().map(|(k, v)| format!("\"{k}\":{v}")).collect::<Vec<_>>().join(",");
+    println!("@{tag} {{{body}}}");
 }
 
 /// Build a (fresh, untrained) solver with `cfg` applied.
@@ -83,9 +100,11 @@ fn train_with(
 ) -> (HashMap<u64, Vec<f64>>, std::time::Duration, u64) {
     let mut solver = build_solver(stack, seed, iters, cfg);
     let start = Instant::now();
+    // Cursor fast path: zero per-node allocation, bit-identical to train/
+    // train_parallel for a fixed seed (PushFoldHoldem implements CursorGame).
     match cfg.parallel_batch {
-        Some(batch) => solver.train_parallel(iters, batch),
-        None => solver.train(iters),
+        Some(batch) => solver.train_parallel_fast(iters, batch),
+        None => solver.train_fast(iters),
     }
     (solver.average_strategy(), start.elapsed(), solver.nodes_visited())
 }
@@ -93,8 +112,8 @@ fn train_with(
 /// Advance `solver` by `step` iterations using the configured training path.
 fn train_step(solver: &mut Mccfr<PushFoldHoldem>, step: u64, cfg: RunConfig) {
     match cfg.parallel_batch {
-        Some(batch) => solver.train_parallel(step, batch),
-        None => solver.train(step),
+        Some(batch) => solver.train_parallel_fast(step, batch),
+        None => solver.train_fast(step),
     }
 }
 
@@ -102,6 +121,10 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(|s| s.as_str()) == Some("compare") {
         run_comparison(&args);
+        return;
+    }
+    if args.iter().any(|a| a == "--soa") {
+        run_soa(&args);
         return;
     }
 
@@ -161,6 +184,18 @@ fn main() {
     let eval_game = PushFoldHoldem::new(stack, BIG_BLIND, SMALL_BLIND, 0);
     let expl_deals = 2_000_000;
 
+    emit_metric(
+        "wandb-config",
+        &[
+            ("mode", "\"pushfold\"".into()),
+            ("iters", iters.to_string()),
+            ("stack_bb", stack_bb.to_string()),
+            ("seed", seed.to_string()),
+            ("resume", resume.to_string()),
+            ("features", format!("{feat:?}")),
+        ],
+    );
+
     // Train in chunks, checkpointing after each so an interruption costs at most
     // one chunk of work.  Resume picks up from `solver.iterations()`.
     let start = Instant::now();
@@ -177,6 +212,17 @@ fn main() {
             expl * 1000.0,
             solver.nodes_visited(),
             start.elapsed().as_secs_f64()
+        );
+        emit_metric(
+            "wandb",
+            &[
+                ("iteration", solver.iterations().to_string()),
+                ("pct", (solver.iterations() * 100 / iters).to_string()),
+                ("info_sets", solver.num_info_sets().to_string()),
+                ("exploitability_mbb", format!("{:.4}", expl * 1000.0)),
+                ("nodes", solver.nodes_visited().to_string()),
+                ("elapsed_s", format!("{:.3}", start.elapsed().as_secs_f64())),
+            ],
         );
     }
 
@@ -233,29 +279,89 @@ fn run_comparison(args: &[String]) {
     }
 }
 
-/// Render the SB opening shove range as a 13×13 grid (upper triangle = suited).
-/// A quick eyeball check that the blueprint looks like a real push/fold chart:
-/// monotone, premiums always shoving, trash folding.
+/// Train push/fold on the flat **SoA** [`RegretTable`] store (the ~10×-smaller
+/// blueprint storage), via `--soa`.  Uses DCFR + the VR-MCCFR baseline; `--parallel`
+/// uses the SoA parallel path (which keeps the baseline).
+fn run_soa(args: &[String]) {
+    let nums: Vec<&String> = args[1..].iter().filter(|a| !a.starts_with("--")).collect();
+    let iters: u64 = nums.first().and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
+    let stack_bb: u32 = nums.get(1).and_then(|s| s.parse().ok()).unwrap_or(20);
+    let seed: u64 = nums.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
+    let stack = stack_bb * BIG_BLIND;
+    let parallel_batch = args.iter().find_map(|a| {
+        a.strip_prefix("--parallel").map(|r| r.strip_prefix('=').and_then(|b| b.parse().ok()).unwrap_or(256))
+    });
+
+    let mode = parallel_batch.map_or("serial".to_string(), |b| format!("parallel(batch={b})"));
+    println!("Training push/fold via flat SoA RegretTable: {iters} iters, {stack_bb}bb, seed {seed} [{mode}]");
+    emit_metric(
+        "wandb-config",
+        &[
+            ("mode", "\"pushfold-soa\"".into()),
+            ("iters", iters.to_string()),
+            ("stack_bb", stack_bb.to_string()),
+            ("seed", seed.to_string()),
+            ("features", format!("{mode:?}")),
+        ],
+    );
+    let mut solver = SoaMccfr::with_seed(
+        PushFoldHoldem::new(stack, BIG_BLIND, SMALL_BLIND, 0),
+        Variant::Dcfr(Discount::RECOMMENDED),
+        seed,
+    )
+    .with_baseline();
+    println!("Flat table: {} bytes/info set (vs ~350 for the HashMap Node)", solver.bytes_per_info_set());
+
+    let dir = Path::new("data");
+    std::fs::create_dir_all(dir).expect("create data/");
+    let ckpt = dir.join("blueprint_pushfold_soa.ckpt");
+    let start = Instant::now();
+    let chunk = (iters / 10).max(1);
+    while solver.iterations() < iters {
+        let step = chunk.min(iters - solver.iterations());
+        match parallel_batch {
+            Some(b) => solver.train_parallel(step, b),
+            None => solver.train(step),
+        }
+        solver.save_checkpoint(&ckpt).expect("write SoA checkpoint");
+        println!(
+            "  {:>4}%  {} nodes  ({:.1}s)  [checkpointed]",
+            solver.iterations() * 100 / iters,
+            solver.nodes_visited(),
+            start.elapsed().as_secs_f64()
+        );
+        emit_metric(
+            "wandb",
+            &[
+                ("iteration", solver.iterations().to_string()),
+                ("pct", (solver.iterations() * 100 / iters).to_string()),
+                ("nodes", solver.nodes_visited().to_string()),
+                ("elapsed_s", format!("{:.3}", start.elapsed().as_secs_f64())),
+            ],
+        );
+    }
+
+    // SB opening shove = info set (sequence 0, preflop class) = preflop_index.
+    print_chart(stack, |c0, c1| solver.average_strategy_at(preflop_index(&[c0, c1]) as usize)[1] as f32);
+}
+
+/// Render the SB opening shove range as a 13×13 grid (upper triangle = suited)
+/// from a HashMap-keyed average strategy.
 fn print_shove_chart(stack: u32, avg: &HashMap<u64, Vec<f32>>) {
+    // The SB opening info key for a concrete two-card hand (player 0, empty
+    // history), via the same helper the solver keys on.
+    print_chart(stack, |c0, c1| {
+        let key = PushFoldHoldem::preflop_key(0, &[c0, c1], &[]);
+        avg.get(&key).map(|p| p[1]).unwrap_or(0.0)
+    });
+}
+
+/// Render the SB opening shove range as a 13×13 grid given a `shove(c0, c1)`
+/// probability lookup.  A quick eyeball check that the blueprint looks like a
+/// real push/fold chart: monotone, premiums always shoving, trash folding.
+fn print_chart(stack: u32, shove: impl Fn(u8, u8) -> f32) {
     use poker_core::make_card;
     const R: [char; 13] = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A'];
-
-    // The SB opening info key for a concrete two-card hand — must match
-    // games::push_fold::info_key (player 0, canonical class, empty history).
-    let shove = |c0: u8, c1: u8| -> f32 {
-        let mut h = [c0, c1];
-        h.sort_unstable();
-        let class = canonical_key(&h, &[]);
-        let mut bytes = vec![0u8];
-        bytes.extend_from_slice(&class);
-        bytes.push(0xFF);
-        let mut hsh: u64 = 0xcbf2_9ce4_8422_2325;
-        for &b in &bytes {
-            hsh ^= b as u64;
-            hsh = hsh.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        avg.get(&hsh).map(|p| p[1]).unwrap_or(0.0)
-    };
 
     println!("\nSB opening shove % at {}bb (upper triangle suited):", stack / BIG_BLIND);
     print!("    ");

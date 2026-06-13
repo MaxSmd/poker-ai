@@ -18,27 +18,7 @@
 
 use crate::games::Game;
 use crate::solver::best_response::Strategy;
-
-/// Deterministic xorshift64* `[0, 1)` draw.
-fn next_unit(state: &mut u64) -> f64 {
-    let mut x = *state;
-    x ^= x >> 12;
-    x ^= x << 25;
-    x ^= x >> 27;
-    *state = x;
-    (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
-}
-
-fn sample(probs: &[f64], r: f64) -> usize {
-    let mut acc = 0.0;
-    for (i, &p) in probs.iter().enumerate() {
-        acc += p;
-        if r < acc {
-            return i;
-        }
-    }
-    probs.len() - 1
-}
+use crate::util::rng::{sample_index, xorshift_next_unit as next_unit};
 
 /// Play one hand where `seat[p]` is the strategy controlling player `p`; return
 /// every player's payoff.  Chance and both players are sampled.
@@ -52,7 +32,7 @@ fn play_hand<G: Game>(game: &G, seat: [&Strategy; 2], rng: &mut u64) -> [f64; 2]
             if game.is_chance_enumerable(&state) {
                 let outcomes = game.chance_outcomes(&state);
                 let probs: Vec<f64> = outcomes.iter().map(|&(_, p)| p).collect();
-                let i = sample(&probs, next_unit(rng));
+                let i = sample_index(probs.iter().copied(), next_unit(rng));
                 state = outcomes.into_iter().nth(i).unwrap().0;
             } else {
                 state = game.sample_chance(&state, || next_unit(rng));
@@ -63,7 +43,7 @@ fn play_hand<G: Game>(game: &G, seat: [&Strategy; 2], rng: &mut u64) -> [f64; 2]
         let n = game.num_actions(&state);
         let key = game.info_key(&state);
         let strat = seat[player].get(&key).cloned().unwrap_or_else(|| vec![1.0 / n as f64; n]);
-        let a = sample(&strat, next_unit(rng));
+        let a = sample_index(strat.iter().copied(), next_unit(rng));
         state = game.apply(&state, a);
     }
 }

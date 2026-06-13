@@ -45,6 +45,242 @@ pub fn river_equity(hole: [u8; 2], board: [u8; 5]) -> f64 {
     (win as f64 + 0.5 * tie as f64) / total as f64
 }
 
+/// Lower-triangular index of a hole pair `{a, b}` over the 52 cards into
+/// `0..1326` (order-independent).
+pub fn combo_index(a: u8, b: u8) -> usize {
+    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+    (hi as usize) * (hi as usize - 1) / 2 + lo as usize
+}
+
+/// Inverse of [`combo_index`]: the `(lo, hi)` cards (`lo < hi`) for a combo index
+/// in `0..1326`.
+pub fn combo_cards(index: usize) -> [u8; 2] {
+    let mut hi = 1usize;
+    while (hi + 1) * hi / 2 <= index {
+        hi += 1;
+    }
+    let lo = index - hi * (hi - 1) / 2;
+    [lo as u8, hi as u8]
+}
+
+/// Exact equity-vs-random for **every** hole combo on a complete `board`, in one
+/// O(n log n) sweep instead of an O(n²) enumeration per hand.
+///
+/// `out[combo_index(a, b)]` receives `P(win) + 0.5·P(tie)` for each of the 1081
+/// holes that avoid the board; combos that use a board card are left as `NaN`.
+///
+/// Each combo is ranked once; sorting by rank, a single sweep keeps a running
+/// count of strictly-weaker combos plus a per-card tally, so for hero `{a, b}`
+/// the opponents it beats are `weaker_total − weaker_with_a − weaker_with_b`
+/// (the only combo holding both `a` and `b` is the hero itself, so there is no
+/// double-count to add back).
+pub fn board_equities(board: [u8; 5], out: &mut [f32; 1326]) {
+    out.fill(f32::NAN);
+    let mut used = 0u64;
+    for &c in &board {
+        used |= 1 << c;
+    }
+    let live: Vec<u8> = (0u8..52).filter(|c| used & (1 << c) == 0).collect();
+
+    // Rank every hole combo once.  `live` is ascending, so `a < b`.
+    let mut combos: Vec<(u32, u8, u8)> = Vec::with_capacity(1081);
+    for i in 0..live.len() {
+        let a = live[i];
+        for &b in &live[i + 1..] {
+            let r = evaluate_7_lut(&[a, b, board[0], board[1], board[2], board[3], board[4]]);
+            combos.push((r, a, b));
+        }
+    }
+    combos.sort_unstable_by_key(|&(r, _, _)| r);
+
+    // Every hero faces C(45,2) = 990 opponent combos (52 − 5 board − 2 hero).
+    const OPPONENTS: f64 = 990.0;
+    let mut global_below = 0u32; // combos in strictly-weaker tiers
+    let mut below = [0u32; 52]; // …of which, those containing card c
+    let mut tier_card = [0u32; 52]; // combos in the current tier containing card c
+
+    let mut i = 0;
+    while i < combos.len() {
+        let rank = combos[i].0;
+        let mut j = i;
+        while j < combos.len() && combos[j].0 == rank {
+            tier_card[combos[j].1 as usize] += 1;
+            tier_card[combos[j].2 as usize] += 1;
+            j += 1;
+        }
+        let tier = (j - i) as u32;
+
+        for &(_, a, b) in &combos[i..j] {
+            let (a, b) = (a as usize, b as usize);
+            let weaker = global_below - below[a] - below[b];
+            // Tied opponents: tier combos holding neither a nor b (+1 re-adds the
+            // hero, the lone combo holding both, which was subtracted twice).
+            // Add the +1 first so the intermediate never goes negative (u32).
+            let tied = tier + 1 - tier_card[a] - tier_card[b];
+            let equity = (weaker as f64 + 0.5 * tied as f64) / OPPONENTS;
+            out[combo_index(a as u8, b as u8)] = equity as f32;
+        }
+
+        // Fold this tier into the running totals and clear its tally.
+        global_below += tier;
+        for &(_, a, b) in &combos[i..j] {
+            below[a as usize] += 1;
+            below[b as usize] += 1;
+            tier_card[a as usize] = 0;
+            tier_card[b as usize] = 0;
+        }
+        i = j;
+    }
+}
+
+/// Reach-weighted river showdown **counterfactual values** for every hero combo
+/// on a complete `board` — the vectorized terminal of public-tree CFR (finding
+/// #2).  `opp_reach[o]` is the opponent's reach probability for combo `o`;
+/// `out[h]` becomes the hero's net-chip value if both reach the showdown with
+/// `half_pot` chips each at risk:
+///
+/// ```text
+/// out[h] = half_pot · Σ_o opp_reach[o] · (+1 win / 0 tie / −1 lose)
+/// ```
+///
+/// This is exactly [`board_equities`] with unit opponent counts replaced by
+/// reach weights — one O(n log n) sort + sweep over all 1081 combos instead of
+/// the 1326×1326 pairwise showdown.  **Card removal (blockers) is automatic**:
+/// the `below[a]/below[b]` / `card[a]/card[b]` subtractions drop every opponent
+/// combo that shares a card with the hero (or the board), so a one-hot
+/// `opp_reach` reproduces [`hand_vs_hand_equity`] and a uniform one reproduces
+/// `board_equities`.  Hero combos that use a board card are left `0.0`.
+pub fn board_cfvs(board: [u8; 5], opp_reach: &[f64; 1326], half_pot: f64, out: &mut [f64; 1326]) {
+    out.fill(0.0);
+    let mut used = 0u64;
+    for &c in &board {
+        used |= 1 << c;
+    }
+    let live: Vec<u8> = (0u8..52).filter(|c| used & (1 << c) == 0).collect();
+
+    // Total opponent reach and per-card reach, for the blocker-corrected
+    // "valid opponents" denominator under each hero hand.
+    let mut total_w = 0.0;
+    let mut card_w = [0.0; 52];
+    let mut combos: Vec<(u32, u8, u8)> = Vec::with_capacity(1081);
+    for i in 0..live.len() {
+        let a = live[i];
+        for &b in &live[i + 1..] {
+            let r = opp_reach[combo_index(a, b)];
+            total_w += r;
+            card_w[a as usize] += r;
+            card_w[b as usize] += r;
+            let rank = evaluate_7_lut(&[a, b, board[0], board[1], board[2], board[3], board[4]]);
+            combos.push((rank, a, b));
+        }
+    }
+    combos.sort_unstable_by_key(|&(r, _, _)| r);
+
+    let mut g_below = 0.0; // reach of strictly-weaker tiers
+    let mut below = [0.0; 52]; // …holding card c
+    let mut tier_card = [0.0; 52]; // current-tier reach holding card c
+
+    let mut i = 0;
+    while i < combos.len() {
+        let rank = combos[i].0;
+        let mut j = i;
+        let mut tier_w = 0.0;
+        while j < combos.len() && combos[j].0 == rank {
+            let (_, a, b) = combos[j];
+            let r = opp_reach[combo_index(a, b)];
+            tier_card[a as usize] += r;
+            tier_card[b as usize] += r;
+            tier_w += r;
+            j += 1;
+        }
+
+        for &(_, a, b) in &combos[i..j] {
+            let (a, b) = (a as usize, b as usize);
+            let rh = opp_reach[combo_index(a as u8, b as u8)];
+            // Weaker / tied / stronger opponent reach, blockers removed.  Re-add
+            // the hero's own combo (subtracted twice via card a and card b).
+            let weaker = g_below - below[a] - below[b];
+            let tied = tier_w - tier_card[a] - tier_card[b] + rh;
+            let valid = total_w - card_w[a] - card_w[b] + rh;
+            let stronger = valid - weaker - tied;
+            out[combo_index(a as u8, b as u8)] = half_pot * (weaker - stronger);
+        }
+
+        g_below += tier_w;
+        for &(_, a, b) in &combos[i..j] {
+            below[a as usize] += opp_reach[combo_index(a, b)];
+            below[b as usize] += opp_reach[combo_index(a, b)];
+            tier_card[a as usize] = 0.0;
+            tier_card[b as usize] = 0.0;
+        }
+        i = j;
+    }
+}
+
+/// Exact equity-distribution histograms for **every** hole combo on a partial
+/// `board` (length 3 or 4) — or the scalar river equity (length 5) — built by
+/// running [`board_equities`] over every runout.  Returned row-major: row
+/// `combo_index(a, b)` is a `bins`-bucket histogram summing to 1 (zeros for
+/// holes that use a board card).  This is the exact, low-noise replacement for
+/// the Monte-Carlo `ehs_histogram_mc` in the offline build.
+pub fn board_histograms(board: &[u8], bins: usize) -> Vec<f32> {
+    assert!((3..=5).contains(&board.len()), "board must have 3–5 cards");
+    let mut used = 0u64;
+    for &c in board {
+        used |= 1 << c;
+    }
+    let runout_cards: Vec<u8> = (0u8..52).filter(|c| used & (1 << c) == 0).collect();
+    let need = 5 - board.len();
+
+    let mut full = [0u8; 5];
+    full[..board.len()].copy_from_slice(board);
+    let mut buf = [f32::NAN; 1326];
+    let mut hist = vec![0f32; 1326 * bins];
+    let mut counts = vec![0u32; 1326];
+
+    let mut accumulate = |full: [u8; 5], hist: &mut [f32], counts: &mut [u32]| {
+        board_equities(full, &mut buf);
+        for (ci, &e) in buf.iter().enumerate() {
+            if e.is_nan() {
+                continue;
+            }
+            let bin = ((e * bins as f32) as usize).min(bins - 1);
+            hist[ci * bins + bin] += 1.0;
+            counts[ci] += 1;
+        }
+    };
+
+    match need {
+        0 => accumulate(full, &mut hist, &mut counts),
+        1 => {
+            for &c in &runout_cards {
+                full[board.len()] = c;
+                accumulate(full, &mut hist, &mut counts);
+            }
+        }
+        2 => {
+            for x in 0..runout_cards.len() {
+                for y in (x + 1)..runout_cards.len() {
+                    full[3] = runout_cards[x];
+                    full[4] = runout_cards[y];
+                    accumulate(full, &mut hist, &mut counts);
+                }
+            }
+        }
+        _ => unreachable!("board has 3–5 cards"),
+    }
+
+    for ci in 0..1326 {
+        if counts[ci] > 0 {
+            let n = counts[ci] as f32;
+            for h in &mut hist[ci * bins..][..bins] {
+                *h /= n;
+            }
+        }
+    }
+    hist
+}
+
 /// Exact equity of `h0` against the *specific* opponent hand `h1` on a partial
 /// `board` (length 3, 4, or 5), enumerating every runout.
 ///
@@ -270,6 +506,54 @@ mod tests {
     }
 
     #[test]
+    fn board_cfvs_uniform_reach_matches_board_equities() {
+        // With every opponent at reach 1, the reach-weighted showdown sweep is
+        // the unit-count sweep: out[h] = half_pot · 990 · (2·equity − 1).
+        let board = dry_board();
+        let mut eq = [f32::NAN; 1326];
+        board_equities(board, &mut eq);
+        let reach = [1.0_f64; 1326];
+        let half_pot = 7.0;
+        let mut cfv = [0.0_f64; 1326];
+        board_cfvs(board, &reach, half_pot, &mut cfv);
+
+        for h in 0..1326 {
+            if eq[h].is_nan() {
+                assert_eq!(cfv[h], 0.0, "blocked hero combo is zero");
+                continue;
+            }
+            let expected = half_pot * 990.0 * (2.0 * eq[h] as f64 - 1.0);
+            // board_equities stores f32, so allow its rounding (≈ 7e-4 at this
+            // scale); board_cfvs itself is exact f64.
+            assert!((cfv[h] - expected).abs() < 1e-2, "combo {h}: {} vs {expected}", cfv[h]);
+        }
+    }
+
+    #[test]
+    fn board_cfvs_one_hot_reach_matches_hand_vs_hand() {
+        // A single opponent hand at reach 1: the hero's value is ±half_pot (win /
+        // lose) or 0 (tie) — i.e. half_pot·(2·hand_vs_hand_equity − 1).
+        let board = dry_board();
+        let opp = [make_card(5, 1), make_card(3, 1)]; // some specific hand
+        let mut reach = [0.0_f64; 1326];
+        reach[combo_index(opp[0], opp[1])] = 1.0;
+        let half_pot = 5.0;
+        let mut cfv = [0.0_f64; 1326];
+        board_cfvs(board, &reach, half_pot, &mut cfv);
+
+        let hero = [make_card(12, 1), make_card(12, 2)]; // trip aces — beats opp
+        let e = hand_vs_hand_equity(hero, opp, &board);
+        let expected = half_pot * (2.0 * e - 1.0);
+        assert!(
+            (cfv[combo_index(hero[0], hero[1])] - expected).abs() < 1e-9,
+            "one-hot reach must equal hand-vs-hand"
+        );
+        // A hero sharing a card with the only opponent has no valid showdown ⇒ 0.
+        let blocker = [make_card(5, 1), make_card(9, 0)];
+        assert_eq!(cfv[combo_index(blocker[0], blocker[1])], 0.0, "blocker ⇒ no opponent ⇒ 0");
+    }
+
+    #[test]
     fn equity_in_unit_interval() {
         let board = dry_board();
         let hole = [make_card(12, 1), make_card(12, 2)]; // pair of aces (with board A) → trips
@@ -337,13 +621,7 @@ mod tests {
     /// A tiny deterministic unit source for the MC tests.
     fn unit_stream(seed: u64) -> impl FnMut() -> f64 {
         let mut s = seed | 1;
-        move || {
-            s ^= s >> 12;
-            s ^= s << 25;
-            s ^= s >> 27;
-            let v = s.wrapping_mul(0x2545_F491_4F6C_DD1D);
-            (v >> 11) as f64 / (1u64 << 53) as f64
-        }
+        move || crate::util::rng::xorshift_next_unit(&mut s)
     }
 
     #[test]
@@ -377,6 +655,101 @@ mod tests {
         let mc_mean: f64 =
             h.iter().enumerate().map(|(i, &p)| p * (i as f64 + 0.5) / bins as f64).sum();
         assert!((mc_mean - exact).abs() < 0.03, "MC mean {mc_mean} vs exact EHS {exact}");
+    }
+
+    // A coordinated, flushy board to exercise ties and flushes in the sweep.
+    fn wet_board() -> [u8; 5] {
+        [
+            make_card(10, 0), // Tc
+            make_card(9, 0),  // 9c
+            make_card(8, 0),  // 8c
+            make_card(3, 1),  // 5d
+            make_card(2, 2),  // 4h
+        ]
+    }
+
+    #[test]
+    fn board_equities_match_river_equity_for_every_hole() {
+        // The sweep must equal the O(n²) oracle exactly (same integer counts ⇒
+        // bit-identical f32) for every one of the 1081 holes.
+        for board in [dry_board(), wet_board()] {
+            let mut out = [f32::NAN; 1326];
+            board_equities(board, &mut out);
+            let mut used = 0u64;
+            for &c in &board {
+                used |= 1 << c;
+            }
+            let live: Vec<u8> = (0u8..52).filter(|c| used & (1 << c) == 0).collect();
+            for i in 0..live.len() {
+                for j in (i + 1)..live.len() {
+                    let (a, b) = (live[i], live[j]);
+                    let want = river_equity([a, b], board) as f32;
+                    assert_eq!(out[combo_index(a, b)], want, "sweep ≠ oracle for {a},{b}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn board_equities_mean_is_one_half() {
+        let board = dry_board();
+        let mut out = [f32::NAN; 1326];
+        board_equities(board, &mut out);
+        let vals: Vec<f64> = out.iter().filter(|e| !e.is_nan()).map(|&e| e as f64).collect();
+        assert_eq!(vals.len(), 1081);
+        let mean = vals.iter().sum::<f64>() / vals.len() as f64;
+        assert!((mean - 0.5).abs() < 1e-6, "mean equity {mean} should be ~0.5");
+    }
+
+    #[test]
+    fn board_histograms_match_exact_enumeration() {
+        // board_histograms must reproduce a direct per-runout enumeration exactly
+        // (same f32 equities, same binning, same per-hole denominator).  Checked
+        // on a turn board (4 cards) and a flop board (3 cards) for a few holes.
+        let bins = 50;
+        for board in [&dry_board()[..4], &dry_board()[..3]] {
+            let rows = board_histograms(board, bins);
+            let mut used = 0u64;
+            for &c in board {
+                used |= 1 << c;
+            }
+            let live: Vec<u8> = (0u8..52).filter(|c| used & (1 << c) == 0).collect();
+            // A handful of representative holes (full sweep is exercised by the
+            // equity gate above; here we check the runout accumulation).
+            for &(a, b) in &[(live[0], live[1]), (live[5], live[20]), (live[10], live[40])] {
+                // Reference: enumerate completions with f32 equities, bin identically.
+                let mut reference = vec![0f32; bins];
+                let mut n = 0u32;
+                let mut completion = |full: [u8; 5]| {
+                    let e = river_equity([a, b], full) as f32;
+                    let bin = ((e * bins as f32) as usize).min(bins - 1);
+                    reference[bin] += 1.0;
+                    n += 1;
+                };
+                let mut full = [0u8; 5];
+                full[..board.len()].copy_from_slice(board);
+                if board.len() == 4 {
+                    for &r in live.iter().filter(|&&c| c != a && c != b) {
+                        full[4] = r;
+                        completion(full);
+                    }
+                } else {
+                    let run: Vec<u8> = live.iter().copied().filter(|&c| c != a && c != b).collect();
+                    for x in 0..run.len() {
+                        for y in (x + 1)..run.len() {
+                            full[3] = run[x];
+                            full[4] = run[y];
+                            completion(full);
+                        }
+                    }
+                }
+                for r in &mut reference {
+                    *r /= n as f32;
+                }
+                let row = &rows[combo_index(a, b) * bins..][..bins];
+                assert_eq!(row, &reference[..], "histogram ≠ enumeration for {a},{b}");
+            }
+        }
     }
 
     #[test]

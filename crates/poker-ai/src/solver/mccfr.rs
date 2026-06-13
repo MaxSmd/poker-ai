@@ -29,26 +29,14 @@ use serde::{Deserialize, Serialize};
 
 use super::cfr::Variant;
 use super::pruning::PruningConfig;
-use crate::games::Game;
+use super::regret_table::RegretTable;
+use crate::games::{CursorGame, Game, IndexedGame};
+use crate::util::rng::{sample_index, xorshift_next_unit};
 
 /// EMA learning rate for the running baseline.  A single value per
 /// (info set, action) is updated toward observed counterfactual values — the
 /// "third f32 accumulator" the memory budget reserves for VR-MCCFR.
 const BASELINE_RATE: f64 = 0.1;
-
-/// xorshift64* step producing a uniform `[0, 1)` value and advancing `state`.
-/// Free-standing so it can drive both the solver's own draws and a borrowed-rng
-/// closure handed to [`Game::sample_chance`] without aliasing `self`.
-fn xorshift_next_unit(state: &mut u64) -> f64 {
-    let mut x = *state;
-    x ^= x >> 12;
-    x ^= x << 25;
-    x ^= x >> 27;
-    *state = x;
-    let v = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
-    // Top 53 bits → uniform in [0, 1).
-    (v >> 11) as f64 / (1u64 << 53) as f64
-}
 
 /// Per-information-set accumulators (mirrors the full-traversal solver, plus the
 /// VR-MCCFR baseline).
@@ -280,14 +268,7 @@ impl<G: Game> Mccfr<G> {
     /// Sample an index from a probability distribution.
     fn sample(&mut self, probs: &[f64]) -> usize {
         let r = self.next_unit();
-        let mut acc = 0.0;
-        for (i, &p) in probs.iter().enumerate() {
-            acc += p;
-            if r < acc {
-                return i;
-            }
-        }
-        probs.len() - 1
+        sample_index(probs.iter().copied(), r)
     }
 
     /// External-sampling traversal returning the sampled counterfactual value of
@@ -501,10 +482,14 @@ impl<G: Game> Mccfr<G> {
     // The trade-off is staleness: within a batch every iteration sees the same
     // strategy, so a large batch is more parallel but converges per-iteration a
     // little slower.  Modest batches recover most of the speed-up with no
-    // material convergence loss.  The parallel path is the plain external-sampling
-    // estimator (no baseline / optimistic / pruning) — those variance and
-    // compute refinements live on the serial [`train`](Self::train) path, and
-    // composing them with batched snapshots is a separate piece of work.
+    // material convergence loss.
+    //
+    // The **VR-MCCFR baseline is supported** here (the plan's headline variance
+    // lever, which the cloud-burst path needs): workers read the start-of-batch
+    // baseline snapshot as the control variate and emit per-(info set, action)
+    // target deltas that are merged as EMA steps in iteration order, so the result
+    // stays deterministic.  Optimistic and pruning remain serial-only — they
+    // compose poorly with batch staleness and were inert on push/fold (Step 15).
 
     /// Train with `total_iters` iterations, running `batch` iterations in
     /// parallel at a time (mini-batch MCCFR).  Deterministic for a fixed seed and
@@ -557,6 +542,15 @@ impl<G: Game> Mccfr<G> {
         }
     }
 
+    /// Read-only **snapshot** of an info set's baseline (start-of-batch state),
+    /// zeros if unseen — the control variate the parallel traversal reads.
+    fn baseline_ro(&self, key: u64, num_actions: usize) -> Vec<f64> {
+        match self.nodes.get(&key) {
+            Some(node) => node.baseline.clone(),
+            None => vec![0.0; num_actions],
+        }
+    }
+
     /// External-sampling traversal that **reads** the shared store and writes its
     /// regret / average-strategy contributions into `delta` (the parallel,
     /// lock-free counterpart of [`traverse`](Self::traverse), without the
@@ -600,6 +594,12 @@ impl<G: Game> Mccfr<G> {
             for a in 0..num_actions {
                 acc[a] += util[a] - node_value;
             }
+            if self.use_baseline {
+                let sgn = Self::sign(traverser);
+                for a in 0..num_actions {
+                    record_baseline(delta, key, num_actions, a, sgn * util[a]);
+                }
+            }
             node_value
         } else {
             let weight = match self.variant {
@@ -612,8 +612,34 @@ impl<G: Game> Mccfr<G> {
             }
             let a = sample_index(strategy.iter().copied(), xorshift_next_unit(rng));
             let child = self.game.apply(state, a);
-            self.traverse_ro(&child, traverser, rng, delta, t)
+            let v_child = self.traverse_ro(&child, traverser, rng, delta, t);
+            self.corrected_opponent_value(key, &strategy, a, v_child, traverser, delta)
         }
+    }
+
+    /// At a sampled opponent node, apply the VR-MCCFR control variate using the
+    /// snapshot baseline and record the realized target — shared by both parallel
+    /// traversals.  With the baseline off this is just `v_child`.
+    fn corrected_opponent_value(
+        &self,
+        key: u64,
+        strategy: &[f64],
+        a: usize,
+        v_child: f64,
+        traverser: usize,
+        delta: &mut Delta,
+    ) -> f64 {
+        if !self.use_baseline {
+            return v_child;
+        }
+        let n = strategy.len();
+        let sgn = Self::sign(traverser);
+        let v0 = sgn * v_child; // player-0 perspective
+        let snap = self.baseline_ro(key, n);
+        let baseline_exp: f64 = (0..n).map(|i| strategy[i] * snap[i]).sum();
+        let corrected0 = baseline_exp + (v0 - snap[a]);
+        record_baseline(delta, key, n, a, v0);
+        sgn * corrected0
     }
 
     /// Merge one iteration's [`Delta`] into the master store, applying the same
@@ -641,6 +667,252 @@ impl<G: Game> Mccfr<G> {
                 node.strategy_sum[a] += s[a];
             }
         }
+        // VR-MCCFR baseline: one EMA step toward this iteration's mean target per
+        // (info set, action), applied in iteration order so the result is
+        // deterministic regardless of thread scheduling.
+        if self.use_baseline {
+            for (key, sums) in delta.baseline_sum {
+                let cnt = &delta.baseline_cnt[&key];
+                let node = self.nodes.entry(key).or_insert_with(|| Node::new(sums.len()));
+                for a in 0..node.baseline.len() {
+                    if cnt[a] > 0 {
+                        let mean = sums[a] / cnt[a] as f64;
+                        node.baseline[a] += BASELINE_RATE * (mean - node.baseline[a]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── Cursor fast path ─────────────────────────────────────────────────────────
+//
+// The clone-based [`Game`] trait returns a freshly-allocated child on every
+// `apply`.  For the real-mechanics blueprint games that wrap a
+// `poker_core::GameState`, that clone drags along a pre-allocated `UndoStack`, so
+// the traversal heap-allocates on *every node* — discarding the zero-allocation
+// mutate-and-undo design `poker_core` was built for.  These methods are the same
+// external-sampling MCCFR as above, but driven through [`CursorGame`]: a single
+// `GameState` is walked in place (`apply`/`undo`), the legal-action list is
+// computed once per node and held on the stack frame, and information keys are
+// folded without a per-node `Vec`.  They reuse every regret/strategy/baseline
+// helper unchanged and are **bit-identical** to the clone-based path for a fixed
+// seed (proven by the `*_matches_clone_*` tests).
+impl<G: Game + CursorGame> Mccfr<G> {
+    /// Cursor-based counterpart of [`train`](Self::train): zero per-node
+    /// allocation.  Bit-identical to `train` for a fixed seed on a game that
+    /// implements both [`Game`] and [`CursorGame`].
+    pub fn train_fast(&mut self, iters: u64) {
+        let mut cursor = CursorGame::root(&self.game);
+        for _ in 0..iters {
+            self.iterations += 1;
+            let t = self.iterations;
+            let players = CursorGame::num_players(&self.game);
+            for traverser in 0..players {
+                // `cursor` starts (and is left) at the pre-deal root; the chance
+                // branch deals it in place and restores it before returning.
+                self.traverse_cursor(&mut cursor, traverser, t);
+            }
+        }
+    }
+
+    /// External-sampling traversal over a [`CursorGame`] cursor — the structural
+    /// mirror of [`traverse`](Self::traverse), reaching children via
+    /// `apply`/`undo` instead of cloning.  Leaves `cursor` exactly as it found it.
+    fn traverse_cursor(
+        &mut self,
+        cursor: &mut <G as CursorGame>::Cursor,
+        traverser: usize,
+        t: u64,
+    ) -> f64 {
+        self.nodes_visited += 1;
+        if CursorGame::is_terminal(&self.game, cursor) {
+            return CursorGame::utility(&self.game, cursor, traverser);
+        }
+        if CursorGame::is_chance(&self.game, cursor) {
+            // Non-enumerable chance (a full random deal): deal in place, recurse,
+            // then restore the pre-deal root.  No per-outcome control variate is
+            // possible (the outcome list does not exist).
+            let mut r = self.rng;
+            CursorGame::sample_chance(&self.game, cursor, || xorshift_next_unit(&mut r));
+            self.rng = r;
+            let v = self.traverse_cursor(cursor, traverser, t);
+            CursorGame::undo_chance(&self.game, cursor);
+            return v;
+        }
+
+        let player = CursorGame::current_player(&self.game, cursor);
+        let key = CursorGame::info_key(&self.game, cursor);
+        // Legal actions computed once per node and held on this stack frame.
+        let actions = CursorGame::legal(&self.game, cursor);
+        let acts = actions.as_ref();
+        let num_actions = acts.len();
+        let strategy = self.nodes.entry(key).or_insert_with(|| Node::new(num_actions)).strategy();
+
+        if player == traverser {
+            let prune_now = match self.pruning {
+                Some((cfg, start)) => t > start && !cfg.is_refresh_iteration(t),
+                None => false,
+            };
+            let consec = if prune_now {
+                self.nodes.get(&key).map(|n| n.consec_below.clone())
+            } else {
+                None
+            };
+
+            let mut util = vec![0.0; num_actions];
+            let mut traversed = vec![true; num_actions];
+            let mut node_value = 0.0;
+            for a in 0..num_actions {
+                let pruned = match (&consec, self.pruning) {
+                    (Some(cb), Some((cfg, _))) => cfg.should_prune(cb[a]),
+                    _ => false,
+                };
+                if pruned {
+                    traversed[a] = false;
+                    continue;
+                }
+                CursorGame::apply(&self.game, cursor, a, acts[a]);
+                util[a] = self.traverse_cursor(cursor, traverser, t);
+                CursorGame::undo(&self.game, cursor);
+                node_value += strategy[a] * util[a];
+            }
+            self.update_regret(key, t, &util, node_value, &traversed);
+            if self.use_baseline {
+                let sgn = Self::sign(traverser);
+                let node = self.nodes.get_mut(&key).expect("inserted in traverse");
+                for a in 0..num_actions {
+                    if traversed[a] {
+                        node.baseline[a] += BASELINE_RATE * (sgn * util[a] - node.baseline[a]);
+                    }
+                }
+            }
+            node_value
+        } else {
+            self.update_strategy(key, t, &strategy);
+            let a = self.sample(&strategy);
+            CursorGame::apply(&self.game, cursor, a, acts[a]);
+            let v_child = self.traverse_cursor(cursor, traverser, t);
+            CursorGame::undo(&self.game, cursor);
+
+            if !self.use_baseline {
+                return v_child;
+            }
+            let sgn = Self::sign(traverser);
+            let v0 = sgn * v_child;
+            let (baseline_exp, baseline_a) = {
+                let node = self.nodes.get(&key).expect("inserted in traverse");
+                let exp: f64 = (0..num_actions).map(|i| strategy[i] * node.baseline[i]).sum();
+                (exp, node.baseline[a])
+            };
+            let corrected0 = baseline_exp + (v0 - baseline_a);
+            {
+                let node = self.nodes.get_mut(&key).expect("inserted in traverse");
+                node.baseline[a] += BASELINE_RATE * (v0 - node.baseline[a]);
+            }
+            sgn * corrected0
+        }
+    }
+
+    /// Cursor-based counterpart of [`train_parallel`](Self::train_parallel):
+    /// mini-batch MCCFR with each worker walking its own in-place cursor.
+    /// Bit-identical to `train_parallel` for a fixed seed and `batch`.
+    pub fn train_parallel_fast(&mut self, total_iters: u64, batch: u64)
+    where
+        G: Sync,
+    {
+        let batch = batch.max(1);
+        let players = CursorGame::num_players(&self.game);
+        let mut done = 0u64;
+        while done < total_iters {
+            let this = batch.min(total_iters - done);
+            let base = self.iterations;
+
+            let deltas: Vec<Delta> = (0..this)
+                .into_par_iter()
+                .map(|i| {
+                    let t = base + i + 1;
+                    let mut rng = splitmix(self.rng, t);
+                    let mut delta = Delta::default();
+                    let mut cursor = CursorGame::root(&self.game);
+                    for traverser in 0..players {
+                        self.traverse_ro_cursor(&mut cursor, traverser, &mut rng, &mut delta, t);
+                    }
+                    delta
+                })
+                .collect();
+
+            for (i, delta) in deltas.into_iter().enumerate() {
+                self.iterations += 1;
+                self.apply_delta(delta, base + i as u64 + 1);
+            }
+            done += this;
+        }
+    }
+
+    /// Read-only cursor traversal writing into `delta` — the cursor counterpart
+    /// of [`traverse_ro`](Self::traverse_ro).  Leaves `cursor` as it found it.
+    fn traverse_ro_cursor(
+        &self,
+        cursor: &mut <G as CursorGame>::Cursor,
+        traverser: usize,
+        rng: &mut u64,
+        delta: &mut Delta,
+        t: u64,
+    ) -> f64 {
+        delta.nodes_visited += 1;
+        if CursorGame::is_terminal(&self.game, cursor) {
+            return CursorGame::utility(&self.game, cursor, traverser);
+        }
+        if CursorGame::is_chance(&self.game, cursor) {
+            CursorGame::sample_chance(&self.game, cursor, || xorshift_next_unit(rng));
+            let v = self.traverse_ro_cursor(cursor, traverser, rng, delta, t);
+            CursorGame::undo_chance(&self.game, cursor);
+            return v;
+        }
+
+        let player = CursorGame::current_player(&self.game, cursor);
+        let key = CursorGame::info_key(&self.game, cursor);
+        let actions = CursorGame::legal(&self.game, cursor);
+        let acts = actions.as_ref();
+        let num_actions = acts.len();
+        let strategy = self.strategy_ro(key, num_actions);
+
+        if player == traverser {
+            let mut util = vec![0.0; num_actions];
+            let mut node_value = 0.0;
+            for a in 0..num_actions {
+                CursorGame::apply(&self.game, cursor, a, acts[a]);
+                util[a] = self.traverse_ro_cursor(cursor, traverser, rng, delta, t);
+                CursorGame::undo(&self.game, cursor);
+                node_value += strategy[a] * util[a];
+            }
+            let acc = delta.regret_inst.entry(key).or_insert_with(|| vec![0.0; num_actions]);
+            for a in 0..num_actions {
+                acc[a] += util[a] - node_value;
+            }
+            if self.use_baseline {
+                let sgn = Self::sign(traverser);
+                for a in 0..num_actions {
+                    record_baseline(delta, key, num_actions, a, sgn * util[a]);
+                }
+            }
+            node_value
+        } else {
+            let weight = match self.variant {
+                Variant::Vanilla => 1.0,
+                Variant::Dcfr(d) => d.strategy_weight(t),
+            };
+            let acc = delta.strat.entry(key).or_insert_with(|| vec![0.0; num_actions]);
+            for a in 0..num_actions {
+                acc[a] += weight * strategy[a];
+            }
+            let a = sample_index(strategy.iter().copied(), xorshift_next_unit(rng));
+            CursorGame::apply(&self.game, cursor, a, acts[a]);
+            let v_child = self.traverse_ro_cursor(cursor, traverser, rng, delta, t);
+            CursorGame::undo(&self.game, cursor);
+            self.corrected_opponent_value(key, &strategy, a, v_child, traverser, delta)
+        }
     }
 }
 
@@ -654,8 +926,395 @@ struct Delta {
     regret_inst: HashMap<u64, Vec<f64>>,
     /// Summed `weight · σ(a)` at opponent nodes (the average-strategy numerator).
     strat: HashMap<u64, Vec<f64>>,
+    /// VR-MCCFR baseline targets observed this iteration, in player-0 perspective:
+    /// summed target value and visit count per (info set, action).  Merged into
+    /// the running baseline as an EMA step in iteration order (deterministic).
+    baseline_sum: HashMap<u64, Vec<f64>>,
+    baseline_cnt: HashMap<u64, Vec<u32>>,
     /// Node entries this worker visited (folded into the global counter on merge,
     /// since the shared counter can't be touched from the parallel `&self` path).
+    nodes_visited: u64,
+}
+
+/// Record one VR-MCCFR baseline target (player-0 perspective) into a worker's
+/// delta — accumulated, then merged as an EMA step in iteration order.
+fn record_baseline(delta: &mut Delta, key: u64, n: usize, a: usize, target: f64) {
+    delta.baseline_sum.entry(key).or_insert_with(|| vec![0.0; n])[a] += target;
+    delta.baseline_cnt.entry(key).or_insert_with(|| vec![0; n])[a] += 1;
+}
+
+// ── SoA (flat) blueprint solver ──────────────────────────────────────────────
+//
+// For an [`IndexedGame`] the info-set space is known up front, so regrets live in
+// a flat `f32` [`RegretTable`] addressed by a computed index — the ~10×-smaller
+// store the memory budget assumes — instead of the `HashMap<u64, Node>`.  The
+// HashMap solver above is untouched (it stays the correctness reference for the
+// validation games); this is a separate, parallel implementation of the same
+// external-sampling DCFR + VR-MCCFR baseline, storing into the SoA table.
+// Arithmetic in `f64`, stored `f32`.  Optimistic / pruning are not implemented
+// here (inert on push/fold; the full blueprint can add the optional table arrays
+// later).  The transient per-iteration delta reuses [`Delta`] keyed by the
+// info-set index cast to `u64`.
+pub struct SoaMccfr<G: IndexedGame> {
+    game: G,
+    variant: Variant,
+    use_baseline: bool,
+    table: RegretTable,
+    rng: u64,
+    iterations: u64,
+    nodes_visited: u64,
+}
+
+impl<G: IndexedGame> SoaMccfr<G> {
+    /// Create a solver with a fixed default seed.
+    pub fn new(game: G, variant: Variant) -> Self {
+        Self::with_seed(game, variant, 0x2545_F491_4F6C_DD1D)
+    }
+
+    /// Create a solver with an explicit RNG seed; the flat table is laid out from
+    /// the game's known info-set capacity.
+    pub fn with_seed(game: G, variant: Variant, seed: u64) -> Self {
+        let capacity = game.info_set_capacity();
+        let table = RegretTable::with_layout(capacity, |i| game.actions_at(i), false, false);
+        Self { game, variant, use_baseline: false, table, rng: seed | 1, iterations: 0, nodes_visited: 0 }
+    }
+
+    /// Enable the VR-MCCFR baseline (control variate).
+    pub fn with_baseline(mut self) -> Self {
+        self.use_baseline = true;
+        self
+    }
+
+    pub fn iterations(&self) -> u64 {
+        self.iterations
+    }
+
+    pub fn nodes_visited(&self) -> u64 {
+        self.nodes_visited
+    }
+
+    /// Per-info-set storage footprint (bytes) of the flat table.
+    pub fn bytes_per_info_set(&self) -> usize {
+        self.table.bytes_per_info_set()
+    }
+
+    /// Average (deployable) strategy at a dense info-set index.
+    pub fn average_strategy_at(&self, index: usize) -> Vec<f64> {
+        let mut out = Vec::new();
+        self.table.average_into(index, &mut out);
+        out
+    }
+
+    /// Run `iters` external-sampling iterations (serial).
+    pub fn train(&mut self, iters: u64) {
+        let mut cursor = CursorGame::root(&self.game);
+        for _ in 0..iters {
+            self.iterations += 1;
+            let t = self.iterations;
+            let players = CursorGame::num_players(&self.game);
+            for traverser in 0..players {
+                self.traverse(&mut cursor, traverser, t);
+            }
+        }
+    }
+
+    fn sample(&mut self, probs: &[f64]) -> usize {
+        sample_index(probs.iter().copied(), xorshift_next_unit(&mut self.rng))
+    }
+
+    fn traverse(&mut self, cursor: &mut G::Cursor, traverser: usize, t: u64) -> f64 {
+        self.nodes_visited += 1;
+        if CursorGame::is_terminal(&self.game, cursor) {
+            return CursorGame::utility(&self.game, cursor, traverser);
+        }
+        if CursorGame::is_chance(&self.game, cursor) {
+            let mut r = self.rng;
+            CursorGame::sample_chance(&self.game, cursor, || xorshift_next_unit(&mut r));
+            self.rng = r;
+            let v = self.traverse(cursor, traverser, t);
+            CursorGame::undo_chance(&self.game, cursor);
+            return v;
+        }
+
+        let player = CursorGame::current_player(&self.game, cursor);
+        let index = self.game.info_set_index(cursor);
+        let actions = CursorGame::legal(&self.game, cursor);
+        let acts = actions.as_ref();
+        let num_actions = acts.len();
+        let mut strategy = Vec::new();
+        self.table.strategy_into(index, &mut strategy);
+
+        if player == traverser {
+            let mut util = vec![0.0; num_actions];
+            let mut node_value = 0.0;
+            for a in 0..num_actions {
+                CursorGame::apply(&self.game, cursor, a, acts[a]);
+                util[a] = self.traverse(cursor, traverser, t);
+                CursorGame::undo(&self.game, cursor);
+                node_value += strategy[a] * util[a];
+            }
+            self.update_regret(index, t, &util, node_value);
+            if self.use_baseline {
+                let sgn = Self::sign(traverser);
+                let b = self.table.baseline_mut(index);
+                for a in 0..num_actions {
+                    b[a] = (b[a] as f64 + BASELINE_RATE * (sgn * util[a] - b[a] as f64)) as f32;
+                }
+            }
+            node_value
+        } else {
+            self.update_strategy(index, t, &strategy);
+            let a = self.sample(&strategy);
+            CursorGame::apply(&self.game, cursor, a, acts[a]);
+            let v_child = self.traverse(cursor, traverser, t);
+            CursorGame::undo(&self.game, cursor);
+            if !self.use_baseline {
+                return v_child;
+            }
+            let sgn = Self::sign(traverser);
+            let v0 = sgn * v_child;
+            let (baseline_exp, baseline_a) = {
+                let b = self.table.baseline(index);
+                ((0..num_actions).map(|i| strategy[i] * b[i] as f64).sum::<f64>(), b[a] as f64)
+            };
+            let corrected0 = baseline_exp + (v0 - baseline_a);
+            let b = self.table.baseline_mut(index);
+            b[a] = (b[a] as f64 + BASELINE_RATE * (v0 - b[a] as f64)) as f32;
+            sgn * corrected0
+        }
+    }
+
+    fn sign(traverser: usize) -> f64 {
+        if traverser == 0 {
+            1.0
+        } else {
+            -1.0
+        }
+    }
+
+    fn update_regret(&mut self, index: usize, t: u64, util: &[f64], node_value: f64) {
+        let (pos, neg) = match self.variant {
+            Variant::Vanilla => (1.0, 1.0),
+            Variant::Dcfr(d) => (d.positive_factor(t), d.negative_factor(t)),
+        };
+        let discount = matches!(self.variant, Variant::Dcfr(_));
+        let regret = self.table.regret_mut(index);
+        for a in 0..regret.len() {
+            let mut r = regret[a] as f64;
+            if discount {
+                r *= if r > 0.0 { pos } else { neg };
+            }
+            r += util[a] - node_value;
+            regret[a] = r as f32;
+        }
+    }
+
+    fn update_strategy(&mut self, index: usize, t: u64, strategy: &[f64]) {
+        let weight = match self.variant {
+            Variant::Vanilla => 1.0,
+            Variant::Dcfr(d) => d.strategy_weight(t),
+        };
+        let s = self.table.strategy_sum_mut(index);
+        for a in 0..s.len() {
+            s[a] = (s[a] as f64 + weight * strategy[a]) as f32;
+        }
+    }
+
+    /// Mini-batch parallel training (mirrors [`Mccfr::train_parallel_fast`]),
+    /// merging index-keyed deltas — including the baseline — in iteration order.
+    pub fn train_parallel(&mut self, total_iters: u64, batch: u64)
+    where
+        G: Sync,
+    {
+        let batch = batch.max(1);
+        let players = CursorGame::num_players(&self.game);
+        let mut done = 0u64;
+        while done < total_iters {
+            let this = batch.min(total_iters - done);
+            let base = self.iterations;
+            let deltas: Vec<Delta> = (0..this)
+                .into_par_iter()
+                .map(|i| {
+                    let t = base + i + 1;
+                    let mut rng = splitmix(self.rng, t);
+                    let mut delta = Delta::default();
+                    let mut cursor = CursorGame::root(&self.game);
+                    for traverser in 0..players {
+                        self.traverse_ro(&mut cursor, traverser, &mut rng, &mut delta, t);
+                    }
+                    delta
+                })
+                .collect();
+            for (i, delta) in deltas.into_iter().enumerate() {
+                self.iterations += 1;
+                self.apply_delta(delta, base + i as u64 + 1);
+            }
+            done += this;
+        }
+    }
+
+    fn traverse_ro(
+        &self,
+        cursor: &mut G::Cursor,
+        traverser: usize,
+        rng: &mut u64,
+        delta: &mut Delta,
+        t: u64,
+    ) -> f64 {
+        delta.nodes_visited += 1;
+        if CursorGame::is_terminal(&self.game, cursor) {
+            return CursorGame::utility(&self.game, cursor, traverser);
+        }
+        if CursorGame::is_chance(&self.game, cursor) {
+            CursorGame::sample_chance(&self.game, cursor, || xorshift_next_unit(rng));
+            let v = self.traverse_ro(cursor, traverser, rng, delta, t);
+            CursorGame::undo_chance(&self.game, cursor);
+            return v;
+        }
+
+        let player = CursorGame::current_player(&self.game, cursor);
+        let index = self.game.info_set_index(cursor);
+        let key = index as u64;
+        let actions = CursorGame::legal(&self.game, cursor);
+        let acts = actions.as_ref();
+        let num_actions = acts.len();
+        let mut strategy = Vec::new();
+        self.table.strategy_into(index, &mut strategy);
+
+        if player == traverser {
+            let mut util = vec![0.0; num_actions];
+            let mut node_value = 0.0;
+            for a in 0..num_actions {
+                CursorGame::apply(&self.game, cursor, a, acts[a]);
+                util[a] = self.traverse_ro(cursor, traverser, rng, delta, t);
+                CursorGame::undo(&self.game, cursor);
+                node_value += strategy[a] * util[a];
+            }
+            let acc = delta.regret_inst.entry(key).or_insert_with(|| vec![0.0; num_actions]);
+            for a in 0..num_actions {
+                acc[a] += util[a] - node_value;
+            }
+            if self.use_baseline {
+                let sgn = Self::sign(traverser);
+                for a in 0..num_actions {
+                    record_baseline(delta, key, num_actions, a, sgn * util[a]);
+                }
+            }
+            node_value
+        } else {
+            let weight = match self.variant {
+                Variant::Vanilla => 1.0,
+                Variant::Dcfr(d) => d.strategy_weight(t),
+            };
+            let acc = delta.strat.entry(key).or_insert_with(|| vec![0.0; num_actions]);
+            for a in 0..num_actions {
+                acc[a] += weight * strategy[a];
+            }
+            let a = sample_index(strategy.iter().copied(), xorshift_next_unit(rng));
+            CursorGame::apply(&self.game, cursor, a, acts[a]);
+            let v_child = self.traverse_ro(cursor, traverser, rng, delta, t);
+            CursorGame::undo(&self.game, cursor);
+            if !self.use_baseline {
+                return v_child;
+            }
+            let sgn = Self::sign(traverser);
+            let v0 = sgn * v_child;
+            let b = self.table.baseline(index);
+            let baseline_exp: f64 = (0..num_actions).map(|i| strategy[i] * b[i] as f64).sum();
+            let corrected0 = baseline_exp + (v0 - b[a] as f64);
+            record_baseline(delta, key, num_actions, a, v0);
+            sgn * corrected0
+        }
+    }
+
+    fn apply_delta(&mut self, delta: Delta, t: u64) {
+        let (pos, neg) = match self.variant {
+            Variant::Vanilla => (1.0, 1.0),
+            Variant::Dcfr(d) => (d.positive_factor(t), d.negative_factor(t)),
+        };
+        let discount = matches!(self.variant, Variant::Dcfr(_));
+        self.nodes_visited += delta.nodes_visited;
+        for (key, inst) in delta.regret_inst {
+            let regret = self.table.regret_mut(key as usize);
+            for a in 0..regret.len() {
+                let mut r = regret[a] as f64;
+                if discount {
+                    r *= if r > 0.0 { pos } else { neg };
+                }
+                r += inst[a];
+                regret[a] = r as f32;
+            }
+        }
+        for (key, s) in delta.strat {
+            let ss = self.table.strategy_sum_mut(key as usize);
+            for a in 0..ss.len() {
+                ss[a] = (ss[a] as f64 + s[a]) as f32;
+            }
+        }
+        if self.use_baseline {
+            for (key, sums) in delta.baseline_sum {
+                let cnt = &delta.baseline_cnt[&key];
+                let b = self.table.baseline_mut(key as usize);
+                for a in 0..b.len() {
+                    if cnt[a] > 0 {
+                        let mean = sums[a] / cnt[a] as f64;
+                        b[a] = (b[a] as f64 + BASELINE_RATE * (mean - b[a] as f64)) as f32;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Write a resumable checkpoint (the flat table plus the small scalar config).
+    pub fn save_checkpoint(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        let view = SoaCheckpointRef {
+            variant: &self.variant,
+            use_baseline: self.use_baseline,
+            table: &self.table,
+            rng: self.rng,
+            iterations: self.iterations,
+            nodes_visited: self.nodes_visited,
+        };
+        let bytes = bincode::serialize(&view).map_err(io::Error::other)?;
+        let path = path.as_ref();
+        let tmp = path.with_extension("ckpt.tmp");
+        std::fs::write(&tmp, bytes)?;
+        std::fs::rename(&tmp, path)
+    }
+
+    /// Restore from a checkpoint, re-supplying the game.
+    pub fn load_checkpoint(path: impl AsRef<Path>, game: G) -> io::Result<Self> {
+        let bytes = std::fs::read(path)?;
+        let cp: SoaCheckpointOwned = bincode::deserialize(&bytes).map_err(io::Error::other)?;
+        Ok(Self {
+            game,
+            variant: cp.variant,
+            use_baseline: cp.use_baseline,
+            table: cp.table,
+            rng: cp.rng,
+            iterations: cp.iterations,
+            nodes_visited: cp.nodes_visited,
+        })
+    }
+}
+
+#[derive(Serialize)]
+struct SoaCheckpointRef<'a> {
+    variant: &'a Variant,
+    use_baseline: bool,
+    table: &'a RegretTable,
+    rng: u64,
+    iterations: u64,
+    nodes_visited: u64,
+}
+
+#[derive(Deserialize)]
+struct SoaCheckpointOwned {
+    variant: Variant,
+    use_baseline: bool,
+    table: RegretTable,
+    rng: u64,
+    iterations: u64,
     nodes_visited: u64,
 }
 
@@ -700,25 +1359,13 @@ fn splitmix(seed: u64, iter: u64) -> u64 {
     (z ^ (z >> 31)) | 1
 }
 
-/// Sample an index from a probability stream given a uniform draw `r ∈ [0, 1)`.
-fn sample_index(probs: impl Iterator<Item = f64>, r: f64) -> usize {
-    let mut acc = 0.0;
-    let mut last = 0;
-    for (i, p) in probs.enumerate() {
-        last = i;
-        acc += p;
-        if r < acc {
-            return i;
-        }
-    }
-    last
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::games::blueprint::BlueprintHoldem;
     use crate::games::kuhn::{Kuhn, GAME_VALUE_P0};
     use crate::games::leduc::Leduc;
+    use crate::games::push_fold::PushFoldHoldem;
     use crate::solver::best_response::{exploitability, profile_value};
     use crate::solver::dcfr::Discount;
 
@@ -913,6 +1560,58 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parallel_baseline_is_deterministic() {
+        // The parallel baseline reads a read-only snapshot and merges target
+        // deltas in iteration order, so a fixed seed + batch is reproducible.
+        let run = || {
+            let mut s = Mccfr::with_seed(Kuhn, Variant::Vanilla, 5).with_baseline();
+            s.train_parallel(4_000, 32);
+            s.average_strategy()
+        };
+        let (a, b) = (run(), run());
+        assert_eq!(a.len(), b.len());
+        for (key, va) in &a {
+            for (x, y) in va.iter().zip(&b[key]) {
+                assert!((x - y).abs() < 1e-12, "parallel baseline must be deterministic");
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_baseline_converges_on_kuhn() {
+        // The control variate must not bias the parallel estimator.
+        let mut s = Mccfr::new(Kuhn, Variant::Vanilla).with_baseline();
+        s.train_parallel(100_000, 32);
+        let expl = exploitability(&Kuhn, &s.average_strategy());
+        assert!(expl < 0.02, "parallel baseline MCCFR exploitability {expl} should converge");
+    }
+
+    #[test]
+    fn parallel_baseline_reduces_variance_on_kuhn() {
+        // Over a fixed seed set, the parallel baseline's control variate lowers
+        // the mean exploitability at a fixed budget — the cloud-burst variance
+        // lever, now available on the parallel path (mirrors the serial test).
+        let seeds = 1..=12u64;
+        let (iters, batch) = (20_000, 32);
+        let mean = |with_baseline: bool| -> f64 {
+            let xs: Vec<f64> = seeds
+                .clone()
+                .map(|s| {
+                    let mut m = Mccfr::with_seed(Kuhn, Variant::Vanilla, s);
+                    if with_baseline {
+                        m = m.with_baseline();
+                    }
+                    m.train_parallel(iters, batch);
+                    exploitability(&Kuhn, &m.average_strategy())
+                })
+                .collect();
+            xs.iter().sum::<f64>() / xs.len() as f64
+        };
+        let (with, without) = (mean(true), mean(false));
+        assert!(with < without, "parallel baseline mean ({with}) should beat no-baseline ({without})");
+    }
+
     fn strategies_equal(a: &HashMap<u64, Vec<f64>>, b: &HashMap<u64, Vec<f64>>) {
         assert_eq!(a.len(), b.len(), "same info sets");
         for (key, va) in a {
@@ -990,6 +1689,102 @@ mod tests {
         assert!(path.exists(), "checkpoint written");
         assert!(!tmp.exists(), "no leftover temp file after atomic rename");
         std::fs::remove_file(&path).ok();
+    }
+
+    // ── Cursor fast path: bit-identical to the clone-based path ──────────────
+    //
+    // The whole point of the cursor path is that it changes *nothing* observable
+    // — same RNG consumption, same info keys, same updates — only the allocation
+    // behavior.  These tests pin that: a fixed seed must yield identical info-set
+    // counts, identical strategies, and identical node-visit counts across the
+    // two paths.  (Mirrors the bit-identical checkpoint-resume tests above.)
+
+    #[test]
+    fn train_fast_matches_clone_on_push_fold() {
+        let make = || PushFoldHoldem::new(40, 2, 1, 0);
+        let mut clone = Mccfr::with_seed(make(), Variant::Dcfr(Discount::RECOMMENDED), 7).with_baseline();
+        clone.train(3_000);
+        let mut fast = Mccfr::with_seed(make(), Variant::Dcfr(Discount::RECOMMENDED), 7).with_baseline();
+        fast.train_fast(3_000);
+        assert_eq!(clone.num_info_sets(), fast.num_info_sets());
+        assert_eq!(clone.nodes_visited(), fast.nodes_visited());
+        strategies_equal(&clone.average_strategy(), &fast.average_strategy());
+    }
+
+    #[test]
+    fn train_fast_matches_clone_with_optimistic_and_rbp() {
+        // Exercises the cursor traverser's prune/optimistic branches.
+        let total = 5_000;
+        let cfg = PruningConfig { theta: -5_000.0, k: 50, start_fraction: 0.2, refresh_interval: 1_000 };
+        let make = || PushFoldHoldem::new(40, 2, 1, 0);
+        let build = || {
+            Mccfr::with_seed(make(), Variant::Dcfr(Discount::RECOMMENDED), 9)
+                .with_baseline()
+                .with_optimistic()
+                .with_pruning(cfg, total)
+        };
+        let mut clone = build();
+        clone.train(total);
+        let mut fast = build();
+        fast.train_fast(total);
+        assert_eq!(clone.nodes_visited(), fast.nodes_visited());
+        strategies_equal(&clone.average_strategy(), &fast.average_strategy());
+    }
+
+    #[test]
+    fn train_parallel_fast_matches_clone_parallel_on_push_fold() {
+        let make = || PushFoldHoldem::new(40, 2, 1, 0);
+        let mut clone = Mccfr::with_seed(make(), Variant::Dcfr(Discount::RECOMMENDED), 5);
+        clone.train_parallel(4_000, 32);
+        let mut fast = Mccfr::with_seed(make(), Variant::Dcfr(Discount::RECOMMENDED), 5);
+        fast.train_parallel_fast(4_000, 32);
+        assert_eq!(clone.nodes_visited(), fast.nodes_visited());
+        strategies_equal(&clone.average_strategy(), &fast.average_strategy());
+    }
+
+    #[test]
+    fn train_fast_matches_clone_on_blueprint() {
+        // The blueprint mints fresh postflop info sets on every deal, so this
+        // also checks the two paths *discover* the same information sets.
+        let make = || BlueprintHoldem::new(40, 2, 1, 0);
+        let mut clone = Mccfr::with_seed(make(), Variant::Dcfr(Discount::RECOMMENDED), 3);
+        clone.train(1_000);
+        let mut fast = Mccfr::with_seed(make(), Variant::Dcfr(Discount::RECOMMENDED), 3);
+        fast.train_fast(1_000);
+        assert_eq!(clone.num_info_sets(), fast.num_info_sets());
+        assert_eq!(clone.nodes_visited(), fast.nodes_visited());
+        strategies_equal(&clone.average_strategy(), &fast.average_strategy());
+    }
+
+    /// Throughput of the cursor fast path vs the clone-based path on the
+    /// blueprint (deep trees ⇒ the clone-per-node undo-stack allocation hurts
+    /// most).  Prints nodes/sec for both; the fast path must not be slower.  Run
+    /// in release to get a meaningful number:
+    ///   cargo test -p poker-ai --release -- --ignored cursor_fast_path_is_faster --nocapture
+    #[test]
+    #[ignore]
+    fn cursor_fast_path_is_faster() {
+        use std::time::Instant;
+        let iters = 200_000;
+
+        let mut clone = Mccfr::with_seed(BlueprintHoldem::new(40, 2, 1, 0), Variant::Dcfr(Discount::RECOMMENDED), 1);
+        let t0 = Instant::now();
+        clone.train(iters);
+        let clone_s = t0.elapsed().as_secs_f64();
+
+        let mut fast = Mccfr::with_seed(BlueprintHoldem::new(40, 2, 1, 0), Variant::Dcfr(Discount::RECOMMENDED), 1);
+        let t0 = Instant::now();
+        fast.train_fast(iters);
+        let fast_s = t0.elapsed().as_secs_f64();
+
+        // Same work either way (bit-identical), so nodes/sec is a fair ratio.
+        assert_eq!(clone.nodes_visited(), fast.nodes_visited());
+        let nodes = clone.nodes_visited() as f64;
+        println!(
+            "blueprint {iters} iters: clone {:.2}s ({:.0} nodes/s) vs cursor {:.2}s ({:.0} nodes/s) — {:.2}x",
+            clone_s, nodes / clone_s, fast_s, nodes / fast_s, clone_s / fast_s
+        );
+        assert!(fast_s <= clone_s * 1.05, "cursor path should not be slower (clone {clone_s:.2}s, fast {fast_s:.2}s)");
     }
 
     /// MCCFR converges on Leduc too — slower and noisier than full traversal, so
