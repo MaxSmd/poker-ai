@@ -14,13 +14,20 @@ Usage:
                                   -- <train args...>
 
 Examples:
+    # push/fold blueprint
     python scripts/train_wandb.py -- 1000000 20 1 --optimistic
     python scripts/train_wandb.py --name rbp-run -- 2000000 20 1 --rbp
     python scripts/train_wandb.py --mode offline -- 500000 20 1 --soa
 
+    # full heads-up NLHE blueprint (needs the cluster-built abstraction in data/;
+    # --cap=1 fits a 64 GB box, --expl adds a sampled-exploitability metric)
+    python scripts/train_wandb.py --name hu-cap1 -- blueprint 50000000 20 1 --cap=1
+    python scripts/train_wandb.py -- blueprint 50000000 20 1 --cap=1 --parallel --expl
+
 Any arguments after `--` (or any unrecognised args) are forwarded verbatim to
-the `train` binary; see `train.rs` for its flags. Logged metrics are stepped by
-training `iteration`, so the W&B charts line up across runs of different length.
+the `train` binary; `blueprint`/`compare` subcommands and all flags pass straight
+through (see `train.rs`). Logged metrics are stepped by training `iteration`, so
+the W&B charts line up across runs of different length.
 
 Requires `pip install wandb` (run `wandb login` once for online mode).
 """

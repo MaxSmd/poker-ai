@@ -14,17 +14,27 @@
 //! all holes covers every joint class.
 //!
 //!  * **River** — exact scalar equity (1 bin), clustered by the exact 1-D DP.
+//!    With `POKER_AI_RIVER_OCHS=1`, the river instead uses the exact
+//!    [`OCHS_K`]-dim opponent-cluster-equity feature, clustered by L2 K-Means++
+//!    (strictly better buckets at equal count — see `examples/bench_ochs.rs` —
+//!    at a K× larger equity cache; the bucket map is unchanged size).
 //!  * **Flop / turn** — exact equity-distribution histograms, clustered by L2
 //!    K-Means++.
 //!
 //! **Scale.** Full coverage is the cloud burst (`cap = 0` on a big machine).
 //! Locally, `cap` limits the boards processed, and any street whose flat cache
-//! would exceed the memory budget is skipped (turn @ 50 bins = 2.8 GB).
+//! would exceed the memory budget is skipped (turn @ 50 bins = 2.8 GB, so the
+//! 1.5 GB default skips it). On a bigger box raise the budget with
+//! `POKER_AI_CLUSTER_MEM_GB` so the turn street builds too — e.g. on a 64 GB
+//! server `POKER_AI_CLUSTER_MEM_GB=8 cluster 0` builds all three streets full.
 //!
 //! Usage:
 //!   cluster [cap] [seed]
 //!     cap   max canonical boards to process per street; 0 = full  (default 300)
 //!     seed  K-Means++ seed for flop/turn clustering                (default 1)
+//!   env:
+//!     POKER_AI_CLUSTER_MEM_GB   per-street flat-cache budget in GB  (default 1.5)
+//!     POKER_AI_RIVER_OCHS       1/true → OCHS river feature (default scalar)
 
 use std::path::Path;
 use std::time::Instant;
@@ -33,22 +43,51 @@ use rayon::prelude::*;
 
 use poker_ai::abstraction::bucket_map::BucketMap;
 use poker_ai::abstraction::equity_cache::EquityCache;
-use poker_ai::abstraction::features::{board_equities, board_histograms, combo_index};
+use poker_ai::abstraction::features::{
+    board_equities, board_histograms, board_ochs, combo_index, ochs_opponent_clusters, OCHS_K,
+};
 use poker_ai::abstraction::hand_index::HandIndexer;
 
 /// Histogram resolution for flop/turn (plan: 50-bin equity histograms).
 const BINS: usize = 50;
-/// Skip a street whose flat cache would exceed this — the cloud burst's job.
-const MEM_BUDGET_BYTES: usize = 1_500_000_000;
+/// Default per-street flat-cache budget; a street whose cache would exceed it is
+/// skipped (the cloud burst's job). Override with `POKER_AI_CLUSTER_MEM_GB` —
+/// raise it past 2.8 GB on a big box to build the turn street too.
+const DEFAULT_MEM_BUDGET_BYTES: usize = 1_500_000_000;
 /// Boards per parallel batch (bounds the merge buffer).
 const BATCH_BOARDS: usize = 256;
 
+/// Per-street flat-cache byte budget, from `POKER_AI_CLUSTER_MEM_GB` (GB, may be
+/// fractional) or the 1.5 GB default.
+fn mem_budget_bytes() -> usize {
+    match std::env::var("POKER_AI_CLUSTER_MEM_GB").ok().and_then(|s| s.parse::<f64>().ok()) {
+        Some(gb) if gb > 0.0 => (gb * 1e9) as usize,
+        _ => DEFAULT_MEM_BUDGET_BYTES,
+    }
+}
+
+/// Whether to build the river street with the OCHS opponent-cluster feature
+/// (`OCHS_K`-dim, K-Means++) instead of the default scalar equity-vs-uniform
+/// (1-bin, exact 1-D DP).  OCHS gives strictly better river buckets at the same
+/// bucket count (see `examples/bench_ochs.rs`), but its equity *cache* is K×
+/// larger (the river bucket map the solver loads is unchanged), so its flat
+/// cache (≈ 3.9 GB at full coverage) needs `POKER_AI_CLUSTER_MEM_GB` raised —
+/// the cloud burst.  Enabled by `POKER_AI_RIVER_OCHS` = `1`/`true`.
+fn river_ochs_enabled() -> bool {
+    matches!(std::env::var("POKER_AI_RIVER_OCHS").as_deref(), Ok("1") | Ok("true"))
+}
+
 /// Per-board features: `(joint slot, feature vector)` for every hole on `board`.
+///
+/// On the river, `ochs = Some(clusters)` produces the [`OCHS_K`]-dim
+/// opponent-cluster-equity feature; `None` produces the scalar equity-vs-uniform
+/// (1 bin).  Flop/turn always produce the `bins`-bucket equity histogram.
 fn board_features(
     board: &[u8],
     river: bool,
     bins: usize,
     joint_ix: &HandIndexer,
+    ochs: Option<&[u8; 169]>,
 ) -> Vec<(usize, Vec<f32>)> {
     let mut used = 0u64;
     for &c in board {
@@ -60,9 +99,14 @@ fn board_features(
     let mut cards = [0u8; 7];
     cards[2..2 + board.len()].copy_from_slice(board);
     let mut river_buf = [f32::NAN; 1326];
+    let mut ochs_buf = [[f32::NAN; OCHS_K]; 1326];
     let hists = if river { Vec::new() } else { board_histograms(board, bins) };
     if river {
-        board_equities(board.try_into().expect("river board is 5 cards"), &mut river_buf);
+        let b5: [u8; 5] = board.try_into().expect("river board is 5 cards");
+        match ochs {
+            Some(clusters) => board_ochs(b5, clusters, &mut ochs_buf),
+            None => board_equities(b5, &mut river_buf),
+        }
     }
 
     for i in 0..live.len() {
@@ -73,7 +117,10 @@ fn board_features(
             let slot = joint_ix.index(&cards[..2 + board.len()]) as usize;
             let ci = combo_index(a, b);
             let feat = if river {
-                vec![river_buf[ci]]
+                match ochs {
+                    Some(_) => ochs_buf[ci].to_vec(),
+                    None => vec![river_buf[ci]],
+                }
             } else {
                 hists[ci * bins..][..bins].to_vec()
             };
@@ -87,15 +134,25 @@ fn board_features(
 /// cluster and persist.
 fn build_street(name: &str, board_round: u8, k: usize, seed: u64, cap: usize) {
     let river = board_round == 5;
-    let bins = if river { 1 } else { BINS };
+    // River: scalar equity-vs-uniform (1 bin) by default, or the OCHS_K-dim
+    // opponent-cluster feature when POKER_AI_RIVER_OCHS is set.
+    let ochs = if river && river_ochs_enabled() { Some(ochs_opponent_clusters()) } else { None };
+    let bins = match (river, ochs.is_some()) {
+        (true, true) => OCHS_K,
+        (true, false) => 1,
+        (false, _) => BINS,
+    };
     let joint_ix = HandIndexer::new(&[2, board_round]);
     let n_joint = joint_ix.size() as usize;
 
     let need = bins.saturating_mul(n_joint).saturating_mul(4);
-    if need > MEM_BUDGET_BYTES {
+    let budget = mem_budget_bytes();
+    if need > budget {
         println!(
-            "  [{name}] joint N={n_joint} → flat cache {:.1} GB exceeds budget; skipped (cloud burst)",
-            need as f64 / 1e9
+            "  [{name}] joint N={n_joint} → flat cache {:.1} GB exceeds budget {:.1} GB; \
+             skipped (raise POKER_AI_CLUSTER_MEM_GB)",
+            need as f64 / 1e9,
+            budget as f64 / 1e9
         );
         return;
     }
@@ -113,7 +170,7 @@ fn build_street(name: &str, board_round: u8, k: usize, seed: u64, cap: usize) {
         // hole to the same joint slot, so a shared parallel write would race).
         let batch: Vec<Vec<(usize, Vec<f32>)>> = (bi..end)
             .into_par_iter()
-            .map(|b| board_features(&board_ix.unindex(b as u64), river, bins, &joint_ix))
+            .map(|b| board_features(&board_ix.unindex(b as u64), river, bins, &joint_ix, ochs.as_ref()))
             .collect();
         for board_out in batch {
             for (slot, feat) in board_out {
@@ -150,7 +207,11 @@ fn main() {
     let seed: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
 
     let cap_str = if cap == 0 { "full".to_string() } else { cap.to_string() };
-    println!("Building card abstraction (exact sweep; cap {cap_str} boards/street, seed {seed})");
+    println!(
+        "Building card abstraction (exact sweep; cap {cap_str} boards/street, seed {seed}, \
+         mem budget {:.1} GB/street)",
+        mem_budget_bytes() as f64 / 1e9
+    );
     // Plan bucket targets: flop/turn 500–800, river 800–1200.  Capped to the
     // number of filled situations at small scales.
     build_street("flop", 3, 500, seed, cap);

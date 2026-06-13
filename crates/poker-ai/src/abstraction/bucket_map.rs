@@ -101,6 +101,29 @@ impl BucketMap {
         self.num_buckets
     }
 
+    /// A **test** map that reports `num_buckets` but stores no assignments —
+    /// for dense-indexing tests where a street's [`bucket`](BucketMap::bucket)
+    /// is never queried (e.g. a pre-flop-only betting tree still needs every
+    /// post-flop street's map *present* to build the index).  O(1); calling
+    /// [`bucket`](BucketMap::bucket) on it panics (empty slot table).
+    #[cfg(test)]
+    pub(crate) fn placeholder(rounds: &[u8], num_buckets: u32) -> Self {
+        Self { num_buckets, indexer: HandIndexer::new(rounds), buckets: Vec::new() }
+    }
+
+    /// A **test** full-coverage map assigning every canonical situation bucket
+    /// `index % k` — a cheap deterministic abstraction with total coverage, so
+    /// the dense SoA index has no out-of-set situations.  The flat slot table is
+    /// the full indexer size (cheap for the flop, large for turn/river — use in
+    /// `#[ignore]`d release tests for those).
+    #[cfg(test)]
+    pub(crate) fn full_coverage_mod(rounds: &[u8], k: u16) -> Self {
+        let indexer = HandIndexer::new(rounds);
+        let size = indexer.size() as usize;
+        let buckets = (0..size).map(|i| (i as u16) % k).collect();
+        Self { num_buckets: k as u32, indexer, buckets }
+    }
+
     /// Number of assigned (built) slots.
     pub fn len(&self) -> usize {
         self.buckets.iter().filter(|&&b| b != UNASSIGNED).count()

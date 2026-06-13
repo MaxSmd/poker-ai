@@ -102,6 +102,13 @@ impl RegretTable {
         self.num_actions[info_set] as usize
     }
 
+    /// Whether `info_set` was ever updated (any non-zero strategy-sum mass) — used
+    /// to skip never-reached slots when exporting a deployable strategy, so the
+    /// SoA artifact carries only visited info sets, like the `HashMap` path.
+    pub fn is_visited(&self, info_set: usize) -> bool {
+        self.strategy_sum[self.span(info_set)].iter().any(|&x| x != 0.0)
+    }
+
     pub fn regret_mut(&mut self, info_set: usize) -> &mut [f32] {
         let span = self.span(info_set);
         &mut self.regret[span]

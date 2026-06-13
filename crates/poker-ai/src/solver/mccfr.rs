@@ -1005,6 +1005,17 @@ impl<G: IndexedGame> SoaMccfr<G> {
         out
     }
 
+    /// Number of info sets in the flat table (the game's
+    /// [`info_set_capacity`](crate::games::IndexedGame::info_set_capacity)).
+    pub fn capacity(&self) -> usize {
+        self.table.capacity()
+    }
+
+    /// Whether the info set at `index` was ever reached (has strategy mass).
+    pub fn is_visited(&self, index: usize) -> bool {
+        self.table.is_visited(index)
+    }
+
     /// Run `iters` external-sampling iterations (serial).
     pub fn train(&mut self, iters: u64) {
         let mut cursor = CursorGame::root(&self.game);

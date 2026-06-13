@@ -54,6 +54,55 @@ pub struct BlueprintHoldem {
     /// Dense hand indexers per post-flop street (`[2,3] / [2,4] / [2,5]`), used
     /// for the unabstracted fallback key when a street has no bucket map.
     indexers: [HandIndexer; 3],
+    /// Maximum number of **raises per street** the betting abstraction allows.
+    /// This is the dominant tree-size / memory lever (see `memory_estimate`):
+    /// `poker_core` itself caps nothing (it re-offers reraises until stacks
+    /// deplete), so bounding it is a blueprint-abstraction choice that lives
+    /// here, not in the faithful engine.  `u32::MAX` (the `new` default) means
+    /// uncapped — identical to the raw engine behaviour.
+    raise_cap: u32,
+    /// Dense info-set indexing for the flat SoA regret store, built by
+    /// [`with_indexing`](BlueprintHoldem::with_indexing).  `None` until then;
+    /// only the `HashMap`-keyed [`Game`]/[`super::CursorGame`] paths work without
+    /// it.  Present ⇒ the game also implements [`super::IndexedGame`].
+    indexing: Option<Indexing>,
+}
+
+/// A deal-independent enumeration of the abstract betting tree under the raise
+/// cap, mapping every reachable decision **history** to a dense sequence id — the
+/// backbone of the flat SoA info-set index.
+///
+/// The key fact that makes this exact: legal actions depend only on the *public*
+/// chip state (pot / current bet / stacks / street), never on card identities.
+/// So one skeleton deal enumerates every betting sequence the solver can ever
+/// reach, and a dense info-set index is simply `sequence_offset + card_bucket`,
+/// where the card bucket ranges over `0..buckets_for(street)`.  This partitions
+/// information sets **identically** to the `HashMap` key
+/// [`info_key_for`](BlueprintHoldem::info_key_for) (which keys on
+/// `player + visible + bucket + history`, and player/visible are themselves pure
+/// functions of the history) — proven by `indexed_partition_matches_info_key`.
+struct Indexing {
+    /// Per decision node: child node id for each action index (`-1` = the action
+    /// leads to a terminal, i.e. no child decision node).
+    children: Vec<[i32; 8]>,
+    /// Per node: board cards visible (`0` pre-flop / `3` flop / `4` turn /
+    /// `5` river) → which street's bucket count this node draws from.
+    visible: Vec<u8>,
+    /// Per node: the player to act (only used to reconstruct the info key on
+    /// export — [`info_key_at`](BlueprintHoldem::info_key_at)).
+    to_act: Vec<u8>,
+    /// Per node: number of (capped) legal actions — the flat table's width.
+    num_actions: Vec<u8>,
+    /// Per node: parent node id (`-1` at the root) and the action index taken
+    /// from the parent, to rebuild the perfect-recall history on export.
+    parent: Vec<i32>,
+    in_action: Vec<u8>,
+    /// Per node: base dense index of its `buckets_for(visible)` bucket block.
+    seq_offset: Vec<u32>,
+    /// Number of legal actions per dense info-set index (drives the table layout).
+    actions_by_index: Vec<u8>,
+    /// Total info sets = `Σ buckets_for(visible[node])`.
+    capacity: usize,
 }
 
 /// A node: the pre-deal chance root (`gs == None`) or a play node wrapping a
@@ -62,6 +111,9 @@ pub struct BlueprintHoldem {
 pub struct BlueprintState {
     gs: Option<GameState>,
     history: Vec<u8>,
+    /// Raises made so far on the **current** street (resets each street) — drives
+    /// the [`BlueprintHoldem::raise_cap`] betting abstraction.
+    street_raises: u8,
 }
 
 impl BlueprintHoldem {
@@ -82,6 +134,8 @@ impl BlueprintHoldem {
                 HandIndexer::new(&[2, 4]),
                 HandIndexer::new(&[2, 5]),
             ],
+            raise_cap: u32::MAX,
+            indexing: None,
         }
     }
 
@@ -90,6 +144,202 @@ impl BlueprintHoldem {
     pub fn with_street_bucket(mut self, street: usize, buckets: BucketMap) -> Self {
         self.street_buckets[street] = Some(buckets);
         self
+    }
+
+    /// Cap the betting abstraction at `cap` raises per street (the feasibility
+    /// lever in `memory_estimate`: cap 1 ≈ 297 MB / 9.3 M heads-up info sets,
+    /// cap 2 ≈ 53 GB).  `0` is treated as `1` (at least the opening raise must
+    /// stay legal or the tree degenerates to check/call only).
+    pub fn with_raise_cap(mut self, cap: u32) -> Self {
+        self.raise_cap = cap.max(1);
+        self
+    }
+
+    /// Build the dense info-set [`Indexing`] so the game can drive the flat SoA
+    /// regret store ([`super::IndexedGame`] / [`crate::solver::mccfr::SoaMccfr`])
+    /// — the ~10×-smaller blueprint store the memory budget assumes (finding #4).
+    ///
+    /// Requires a **finite raise cap** (the uncapped betting tree is unbounded)
+    /// and a **full-coverage** abstraction on every post-flop street (the dense
+    /// index has one slot per `(sequence, bucket)`, so an out-of-set situation
+    /// has nowhere to go — unlike the `HashMap` path, which mints a fresh raw
+    /// key).  Both are exactly the cloud-burst configuration; call this last,
+    /// after [`with_raise_cap`](BlueprintHoldem::with_raise_cap) and
+    /// [`with_street_bucket`](BlueprintHoldem::with_street_bucket).
+    pub fn with_indexing(mut self) -> Self {
+        assert!(
+            self.raise_cap != u32::MAX,
+            "SoA indexing needs a finite raise cap (call with_raise_cap first); \
+             the uncapped betting tree is unbounded"
+        );
+        assert!(
+            self.street_buckets.iter().all(Option::is_some),
+            "SoA indexing needs full-coverage flop/turn/river bucket maps \
+             (call with_street_bucket for every post-flop street)"
+        );
+        self.indexing = Some(self.build_indexing());
+        self
+    }
+
+    fn indexing(&self) -> &Indexing {
+        self.indexing.as_ref().expect("call with_indexing() before SoA training")
+    }
+
+    /// Number of card buckets a street contributes: 169 pre-flop classes, else
+    /// the loaded bucket map's count.
+    fn buckets_for_visible(&self, visible: u8) -> u32 {
+        match visible {
+            0 => 169,
+            3..=5 => {
+                self.street_buckets[visible as usize - 3].as_ref().expect("map present").num_buckets()
+            }
+            other => unreachable!("impossible board-card count {other}"),
+        }
+    }
+
+    /// Enumerate the abstract betting tree from a skeleton deal (card identities
+    /// are irrelevant to betting legality), then lay out the dense info-set
+    /// index by giving each decision node a contiguous `buckets_for(street)` block.
+    fn build_indexing(&self) -> Indexing {
+        // Skeleton deal: any nine distinct real cards drive the public tree.
+        let mut holes = [[NO_CARD; 2]; MAX_PLAYERS];
+        holes[0] = [0, 1];
+        holes[1] = [2, 3];
+        let board = [4, 5, 6, 7, 8];
+        let gs = GameState::new(2, self.big_blind, self.small_blind, self.stacks, holes, board, self.button);
+
+        let mut idx = Indexing {
+            children: Vec::new(),
+            visible: Vec::new(),
+            to_act: Vec::new(),
+            num_actions: Vec::new(),
+            parent: Vec::new(),
+            in_action: Vec::new(),
+            seq_offset: Vec::new(),
+            actions_by_index: Vec::new(),
+            capacity: 0,
+        };
+        self.walk_tree(&gs, 0, -1, 0, &mut idx);
+
+        let mut cap = 0u32;
+        for node in 0..idx.visible.len() {
+            idx.seq_offset.push(cap);
+            let nb = self.buckets_for_visible(idx.visible[node]);
+            for _ in 0..nb {
+                idx.actions_by_index.push(idx.num_actions[node]);
+            }
+            cap += nb;
+        }
+        idx.capacity = cap as usize;
+        idx
+    }
+
+    /// Depth-first enumeration: allocate a node for the decision at `gs`, then
+    /// recurse over its capped legal actions.  Returns the node id, or `-1` if
+    /// `gs` is terminal (so the parent records "no child here").
+    fn walk_tree(&self, gs: &GameState, street_raises: u8, parent: i32, in_action: u8, idx: &mut Indexing) -> i32 {
+        if gs.is_terminal() {
+            return -1;
+        }
+        let acts = self.capped_legal(gs, street_raises);
+        let id = idx.children.len();
+        idx.children.push([-1; 8]);
+        idx.visible.push(gs.board_cards_count() as u8);
+        idx.to_act.push(gs.current_player() as u8);
+        idx.num_actions.push(acts.len() as u8);
+        idx.parent.push(parent);
+        idx.in_action.push(in_action);
+        for a in 0..acts.len() {
+            let (old_street, old_bet) = (gs.street, gs.current_bet);
+            let mut child = gs.clone();
+            child.apply_action(acts[a]);
+            let sr = Self::next_raises(street_raises, old_street, old_bet, &child);
+            let child_id = self.walk_tree(&child, sr, id as i32, a as u8, idx);
+            idx.children[id][a] = child_id;
+        }
+        id as i32
+    }
+
+    /// The current player's card bucket, in `0..buckets_for(visible)`.  Mirrors
+    /// [`situation_bucket`](BlueprintHoldem::situation_bucket) under full
+    /// coverage (the precondition of [`with_indexing`]); an out-of-set situation
+    /// — which cannot occur with a full-coverage map — falls back to bucket `0`.
+    fn dense_bucket(&self, hole: &[u8; 2], board: &[u8]) -> usize {
+        let visible = board.len();
+        if visible == 0 {
+            return preflop_index(hole) as usize;
+        }
+        self.street_buckets[visible - 3]
+            .as_ref()
+            .expect("map present")
+            .bucket(hole, board)
+            .map(|b| b as usize)
+            .unwrap_or(0)
+    }
+
+    /// Reconstruct the `HashMap` info key for a dense index, so an SoA-trained
+    /// strategy exports to the **same** `HashMap<u64, _>` artifact as the
+    /// `HashMap`-solver path (identical bytes — see
+    /// [`info_key_for`](BlueprintHoldem::info_key_for)).
+    pub fn info_key_at(&self, index: usize) -> u64 {
+        let idx = self.indexing();
+        // The node owning this index is the last whose block starts at/below it.
+        let node = idx.seq_offset.partition_point(|&o| o as usize <= index) - 1;
+        let bucket = (index - idx.seq_offset[node] as usize) as u64;
+
+        // Rebuild the perfect-recall history from the parent chain.
+        let mut history = Vec::new();
+        let mut n = node as i32;
+        while idx.parent[n as usize] >= 0 {
+            history.push(idx.in_action[n as usize]);
+            n = idx.parent[n as usize];
+        }
+        history.reverse();
+
+        let mut h = Fnv1a::new();
+        h.write(idx.to_act[node]);
+        h.write(idx.visible[node]);
+        h.write_all(&bucket.to_le_bytes());
+        h.write(0xFF);
+        h.write_all(&history);
+        h.finish()
+    }
+
+    /// Legal actions at `gs` after applying the raise-cap betting abstraction:
+    /// once `street_raises` reaches the cap, voluntary aggression (any `Raise`,
+    /// and a voluntary `AllIn`) is removed, leaving fold / check / call — but a
+    /// *forced* all-in call (when neither check nor call is offered) is kept so
+    /// every node retains a legal action.  Both the clone and cursor paths route
+    /// through this, so action indices (and thus info keys) stay identical.
+    fn capped_legal(&self, gs: &GameState, street_raises: u8) -> ActionList {
+        let full = legal_actions(gs);
+        if (street_raises as u32) < self.raise_cap {
+            return full;
+        }
+        let has_passive = full.iter().any(|a| matches!(a, Action::Check | Action::Call));
+        let mut buf = [Action::Fold; 8];
+        let mut n = 0;
+        for &a in full.iter() {
+            let drop = matches!(a, Action::Raise(_)) || (matches!(a, Action::AllIn) && has_passive);
+            if !drop {
+                buf[n] = a;
+                n += 1;
+            }
+        }
+        ActionList::from_actions(&buf[..n])
+    }
+
+    /// Raises on the current street after an action took `gs` from `old_street`/
+    /// `old_bet` to its present state: reset on a street change, +1 when the bet
+    /// level rose (a raise or all-in-raise), unchanged otherwise.
+    fn next_raises(prev: u8, old_street: u8, old_bet: u32, gs: &GameState) -> u8 {
+        if gs.street != old_street {
+            0
+        } else if gs.current_bet > old_bet {
+            prev.saturating_add(1)
+        } else {
+            prev
+        }
     }
 
     /// Deal both hands and the full board from a freshly shuffled deck, drawing
@@ -169,7 +419,7 @@ impl Game for BlueprintHoldem {
     }
 
     fn root(&self) -> BlueprintState {
-        BlueprintState { gs: None, history: Vec::new() }
+        BlueprintState { gs: None, history: Vec::new(), street_raises: 0 }
     }
 
     fn is_terminal(&self, state: &BlueprintState) -> bool {
@@ -200,7 +450,7 @@ impl Game for BlueprintHoldem {
         _state: &BlueprintState,
         next_unit: impl FnMut() -> f64,
     ) -> BlueprintState {
-        BlueprintState { gs: Some(self.deal(next_unit)), history: Vec::new() }
+        BlueprintState { gs: Some(self.deal(next_unit)), history: Vec::new(), street_raises: 0 }
     }
 
     fn current_player(&self, state: &BlueprintState) -> usize {
@@ -209,17 +459,19 @@ impl Game for BlueprintHoldem {
 
     fn num_actions(&self, state: &BlueprintState) -> usize {
         let gs = state.gs.as_ref().expect("num_actions at a play node");
-        legal_actions(gs).len()
+        self.capped_legal(gs, state.street_raises).len()
     }
 
     fn apply(&self, state: &BlueprintState, action: usize) -> BlueprintState {
         let gs = state.gs.as_ref().expect("apply at a play node");
-        let act = legal_actions(gs)[action];
+        let act = self.capped_legal(gs, state.street_raises)[action];
+        let (old_street, old_bet) = (gs.street, gs.current_bet);
         let mut next_gs = gs.clone();
         next_gs.apply_action(act);
+        let street_raises = Self::next_raises(state.street_raises, old_street, old_bet, &next_gs);
         let mut history = state.history.clone();
         history.push(action as u8);
-        BlueprintState { gs: Some(next_gs), history }
+        BlueprintState { gs: Some(next_gs), history, street_raises }
     }
 
     fn info_key(&self, state: &BlueprintState) -> u64 {
@@ -238,6 +490,12 @@ pub struct BlueprintCursor {
     history: [u8; MAX_DEPTH],
     /// Current depth — number of valid entries in `history`.
     depth: usize,
+    /// Raises made so far on the current street (the cursor counterpart of
+    /// [`BlueprintState::street_raises`], maintained in place by `apply`/`undo`).
+    street_raises: u8,
+    /// `street_raises` *before* the action at each depth, so `undo` can restore
+    /// it in O(1) (the inline counterpart of cloning the state).
+    raises_at: [u8; MAX_DEPTH],
 }
 
 impl super::CursorGame for BlueprintHoldem {
@@ -250,7 +508,13 @@ impl super::CursorGame for BlueprintHoldem {
     }
 
     fn root(&self) -> BlueprintCursor {
-        BlueprintCursor { gs: None, history: [0; MAX_DEPTH], depth: 0 }
+        BlueprintCursor {
+            gs: None,
+            history: [0; MAX_DEPTH],
+            depth: 0,
+            street_raises: 0,
+            raises_at: [0; MAX_DEPTH],
+        }
     }
 
     fn is_terminal(&self, c: &BlueprintCursor) -> bool {
@@ -271,7 +535,7 @@ impl super::CursorGame for BlueprintHoldem {
     }
 
     fn legal(&self, c: &BlueprintCursor) -> ActionList {
-        legal_actions(c.gs.as_ref().expect("legal at a play node"))
+        self.capped_legal(c.gs.as_ref().expect("legal at a play node"), c.street_raises)
     }
 
     fn info_key(&self, c: &BlueprintCursor) -> u64 {
@@ -280,24 +544,64 @@ impl super::CursorGame for BlueprintHoldem {
     }
 
     fn apply(&self, c: &mut BlueprintCursor, a: usize, action: Action) {
-        c.gs.as_mut().expect("apply at a play node").apply_action(action);
+        let gs = c.gs.as_mut().expect("apply at a play node");
+        let (old_street, old_bet) = (gs.street, gs.current_bet);
+        gs.apply_action(action);
+        c.raises_at[c.depth] = c.street_raises;
+        c.street_raises = Self::next_raises(c.street_raises, old_street, old_bet, gs);
         c.history[c.depth] = a as u8;
         c.depth += 1;
     }
 
     fn undo(&self, c: &mut BlueprintCursor) {
         c.depth -= 1;
+        c.street_raises = c.raises_at[c.depth];
         c.gs.as_mut().expect("undo at a play node").undo_action();
     }
 
     fn sample_chance(&self, c: &mut BlueprintCursor, next_unit: impl FnMut() -> f64) {
         c.gs = Some(self.deal(next_unit));
         c.depth = 0;
+        c.street_raises = 0;
     }
 
     fn undo_chance(&self, c: &mut BlueprintCursor) {
         c.gs = None;
         c.depth = 0;
+        c.street_raises = 0;
+    }
+}
+
+impl super::IndexedGame for BlueprintHoldem {
+    fn info_set_capacity(&self) -> usize {
+        self.indexing().capacity
+    }
+
+    /// `sequence_offset + card_bucket`.  The sequence is found by walking the
+    /// enumerated betting tree along the cursor's inline history (O(depth), no
+    /// allocation); the bucket is the acting player's current-street card bucket.
+    fn info_set_index(&self, c: &BlueprintCursor) -> usize {
+        let idx = self.indexing();
+        let gs = c.gs.as_ref().expect("info_set_index at a play node");
+
+        let mut node = 0usize;
+        for &a in &c.history[..c.depth] {
+            node = idx.children[node][a as usize] as usize;
+        }
+        debug_assert_eq!(idx.to_act[node] as usize, gs.current_player(), "tree node player matches");
+
+        let player = gs.current_player();
+        let mut hole = gs.hole_cards[player];
+        hole.sort_unstable();
+        let visible = gs.board_cards_count();
+        debug_assert_eq!(idx.visible[node] as usize, visible, "tree node street matches");
+        let bucket = self.dense_bucket(&hole, &gs.board[..visible]);
+
+        idx.seq_offset[node] as usize + bucket
+    }
+
+    fn actions_at(&self, index: usize) -> usize {
+        self.indexing().actions_by_index[index] as usize
     }
 }
 
@@ -361,7 +665,7 @@ mod tests {
             h[1] = holes[1];
             let board = [NO_CARD; 5];
             let gs = GameState::new(2, 2, 1, game.stacks, h, board, 0);
-            BlueprintState { gs: Some(gs), history: Vec::new() }
+            BlueprintState { gs: Some(gs), history: Vec::new(), street_raises: 0 }
         };
         // A♠K♠ vs 7♦7♣  →  rotate every suit  →  A♥K♥ vs 7♣7♠.
         let base = mk([[make_card(12, 0), make_card(11, 0)], [make_card(5, 1), make_card(5, 2)]]);
@@ -412,5 +716,161 @@ mod tests {
             s.num_info_sets()
         };
         assert_eq!(run(), run(), "same seed must visit the same info sets");
+    }
+
+    #[test]
+    fn raise_cap_removes_voluntary_aggression_at_the_cap() {
+        let game = BlueprintHoldem::new(200, 2, 1, 0).with_raise_cap(1);
+        // Deep-stacked heads-up preflop: SB to act faces a raise/all-in menu.
+        let mut h = [[NO_CARD; 2]; MAX_PLAYERS];
+        h[0] = [make_card(12, 0), make_card(11, 0)];
+        h[1] = [make_card(5, 1), make_card(5, 2)];
+        let gs = GameState::new(2, 2, 1, game.stacks, h, [NO_CARD; 5], 0);
+
+        // Below the cap (0 raises so far) the opening raise is still offered.
+        let under = game.capped_legal(&gs, 0);
+        assert!(
+            under.iter().any(|a| matches!(a, Action::Raise(_))),
+            "opening raise must be legal below the cap, got {under:?}"
+        );
+
+        // At the cap (1 raise already made) all voluntary aggression is gone,
+        // but a passive action always remains.
+        let at = game.capped_legal(&gs, 1);
+        assert!(
+            at.iter().all(|a| !matches!(a, Action::Raise(_) | Action::AllIn)),
+            "no reraise / voluntary all-in at the cap, got {at:?}"
+        );
+        assert!(
+            at.iter().any(|a| matches!(a, Action::Fold | Action::Call | Action::Check)),
+            "a passive action must remain, got {at:?}"
+        );
+
+        // The uncapped default never filters, however many raises have happened.
+        let uncapped = BlueprintHoldem::new(200, 2, 1, 0);
+        assert!(uncapped.capped_legal(&gs, 9).iter().any(|a| matches!(a, Action::Raise(_))));
+    }
+
+    #[test]
+    fn capped_clone_and_cursor_paths_agree() {
+        // The cursor path maintains `street_raises` in place via apply/undo; it
+        // must visit exactly the same (capped) info sets as the clone path.
+        use crate::games::CursorGame;
+        let mk = || BlueprintHoldem::new(40, 2, 1, 0).with_raise_cap(1);
+        let _ = CursorGame::root(&mk()); // ensure the capped game is a CursorGame
+
+        let mut clone_path = Mccfr::with_seed(mk(), Variant::Dcfr(Discount::RECOMMENDED), 5);
+        clone_path.train(500);
+        let mut cursor_path = Mccfr::with_seed(mk(), Variant::Dcfr(Discount::RECOMMENDED), 5);
+        cursor_path.train_fast(500);
+        assert_eq!(
+            clone_path.num_info_sets(),
+            cursor_path.num_info_sets(),
+            "capped legal lists must match between the clone and cursor paths"
+        );
+    }
+
+    #[test]
+    fn indexed_preflop_only_partition_and_key_round_trip() {
+        use crate::games::{CursorGame, IndexedGame};
+        // stack == big blind: the BB is all-in from its blind, so the SB faces a
+        // single fold/all-in decision and no post-flop node is ever created.  The
+        // placeholder maps are therefore never queried — this keeps the test O(1)
+        // while exercising the full IndexedGame plumbing (capacity, index,
+        // actions_at, and the info_key_at export inverse).
+        let game = BlueprintHoldem::new(2, 2, 1, 0)
+            .with_raise_cap(1)
+            .with_street_bucket(0, BucketMap::placeholder(&[2, 3], 50))
+            .with_street_bucket(1, BucketMap::placeholder(&[2, 4], 50))
+            .with_street_bucket(2, BucketMap::placeholder(&[2, 5], 50))
+            .with_indexing();
+
+        let cap = game.info_set_capacity();
+        assert!(cap >= 169 && cap % 169 == 0, "preflop-only capacity is a multiple of 169, got {cap}");
+
+        // The dense index and the HashMap info key must induce the SAME partition,
+        // and info_key_at must invert the index back to that key.
+        let mut by_key: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+        let mut by_idx: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
+        for seed in 0..500u64 {
+            let mut c = CursorGame::root(&game);
+            CursorGame::sample_chance(&game, &mut c, unit_stream(seed));
+            let key = CursorGame::info_key(&game, &c);
+            let idx = game.info_set_index(&c);
+            assert!(idx < cap, "index in range");
+            assert_eq!(game.actions_at(idx), 2, "fold/all-in menu");
+            assert_eq!(game.info_key_at(idx), key, "info_key_at inverts the dense index");
+            assert_eq!(*by_key.entry(key).or_insert(idx), idx, "key -> one index");
+            assert_eq!(*by_idx.entry(idx).or_insert(key), key, "index -> one key");
+        }
+        assert!(by_key.len() > 100, "should see many distinct starting-hand classes");
+    }
+
+    /// Full post-flop coverage: builds the turn/river full-coverage maps (~280 MB)
+    /// so the dense index has no out-of-set situation.  Confirms the dense index
+    /// partitions information sets identically to the `HashMap` key on every
+    /// street, that `info_key_at` inverts it, and that the SoA solver trains over
+    /// the indexed full game to valid distributions.
+    ///   cargo test -p poker-ai --release -- --ignored indexed_blueprint_postflop_and_soa
+    #[test]
+    #[ignore]
+    fn indexed_blueprint_postflop_and_soa() {
+        use crate::games::{CursorGame, IndexedGame};
+        use crate::solver::mccfr::SoaMccfr;
+
+        let mk = || {
+            BlueprintHoldem::new(12, 2, 1, 0) // 6bb: check lines reach every street under cap 1
+                .with_raise_cap(1)
+                .with_street_bucket(0, BucketMap::full_coverage_mod(&[2, 3], 40))
+                .with_street_bucket(1, BucketMap::full_coverage_mod(&[2, 4], 40))
+                .with_street_bucket(2, BucketMap::full_coverage_mod(&[2, 5], 40))
+                .with_indexing()
+        };
+        let game = mk();
+        let cap = game.info_set_capacity();
+        assert!(cap > 0, "non-empty index");
+
+        // Roll out full hands, checking the partition + round-trip at every
+        // decision node on every street.
+        let mut by_key: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+        let mut rng = 0x00C0_FFEEu64;
+        let mut next = || {
+            rng ^= rng >> 12;
+            rng ^= rng << 25;
+            rng ^= rng >> 27;
+            (rng.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for _ in 0..3000 {
+            let mut c = CursorGame::root(&game);
+            CursorGame::sample_chance(&game, &mut c, &mut next);
+            while !CursorGame::is_terminal(&game, &c) {
+                let key = CursorGame::info_key(&game, &c);
+                let idx = game.info_set_index(&c);
+                assert!(idx < cap, "index in range");
+                assert_eq!(game.info_key_at(idx), key, "info_key_at inverts the dense index");
+                assert_eq!(*by_key.entry(key).or_insert(idx), idx, "key -> one index (same partition)");
+                let acts = CursorGame::legal(&game, &c);
+                let n = acts.as_ref().len();
+                let a = ((next() * n as f64) as usize).min(n - 1);
+                CursorGame::apply(&game, &mut c, a, acts.as_ref()[a]);
+            }
+        }
+        assert!(by_key.len() > 200, "should exercise many post-flop info sets, got {}", by_key.len());
+
+        // The SoA solver trains over the indexed full game and yields valid
+        // probability distributions at every visited info set.
+        let mut soa = SoaMccfr::with_seed(mk(), Variant::Dcfr(Discount::RECOMMENDED), 1).with_baseline();
+        soa.train(20_000);
+        let mut visited = 0;
+        for i in 0..soa.capacity() {
+            if soa.is_visited(i) {
+                visited += 1;
+                let p = soa.average_strategy_at(i);
+                let sum: f64 = p.iter().sum();
+                assert!((sum - 1.0).abs() < 1e-9, "distribution at {i} sums to {sum}");
+                assert!(p.iter().all(|&x| x >= 0.0));
+            }
+        }
+        assert!(visited > 100, "SoA training should visit many info sets, got {visited}");
     }
 }

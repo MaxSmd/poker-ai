@@ -24,13 +24,22 @@
 //!     Trains the base config and each Phase 3 feature in turn and prints a
 //!     recorded before/after table (final exploitability, wall-time, node
 //!     visits) — the evidence the features pay off on the real trainer.
+//!
+//!   train blueprint [iters] [stack_bb] [seed] [flags]
+//!     Trains the full abstracted heads-up NLHE blueprint ([`BlueprintHoldem`]),
+//!     loading the `cluster`-built card abstraction from data/ and capping the
+//!     betting abstraction at `--cap=N` raises/street (default 1 — the memory
+//!     feasibility lever).  See [`run_blueprint`] for the full flag list.
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
+use poker_ai::abstraction::bucket_map::BucketMap;
 use poker_ai::abstraction::canonical::preflop_index;
 use poker_ai::evaluation::exploitability::push_fold_exploitability;
+use poker_ai::evaluation::local_br::sampled_exploitability;
+use poker_ai::games::blueprint::BlueprintHoldem;
 use poker_ai::games::push_fold::PushFoldHoldem;
 use poker_ai::solver::cfr::Variant;
 use poker_ai::solver::dcfr::Discount;
@@ -121,6 +130,10 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(|s| s.as_str()) == Some("compare") {
         run_comparison(&args);
+        return;
+    }
+    if args.get(1).map(|s| s.as_str()) == Some("blueprint") {
+        run_blueprint(&args);
         return;
     }
     if args.iter().any(|a| a == "--soa") {
@@ -343,6 +356,323 @@ fn run_soa(args: &[String]) {
 
     // SB opening shove = info set (sequence 0, preflop class) = preflop_index.
     print_chart(stack, |c0, c1| solver.average_strategy_at(preflop_index(&[c0, c1]) as usize)[1] as f32);
+}
+
+/// Load the abstracted heads-up [`BlueprintHoldem`] for a real full-game training
+/// run: equal `stack` chips, raise abstraction capped at `cap` raises/street, and
+/// whatever per-street `{flop,turn,river}_buckets.bin` maps exist in `dir`
+/// attached (a missing map leaves that street unabstracted — correct, but its
+/// info sets won't plateau, which is the signal that the abstraction is needed).
+fn load_blueprint_game(dir: &Path, stack: u32, cap: u32, verbose: bool) -> BlueprintHoldem {
+    let mut game = BlueprintHoldem::new(stack, BIG_BLIND, SMALL_BLIND, 0).with_raise_cap(cap);
+    for (street, name) in [(0usize, "flop"), (1, "turn"), (2, "river")] {
+        let path = dir.join(format!("{name}_buckets.bin"));
+        match BucketMap::load(&path) {
+            Ok(map) => {
+                if verbose {
+                    println!("  {name}: {} buckets loaded from {}", map.num_buckets(), path.display());
+                }
+                game = game.with_street_bucket(street, map);
+            }
+            Err(_) if verbose => {
+                println!("  {name}: no abstraction at {} — street stays unabstracted", path.display());
+            }
+            Err(_) => {}
+        }
+    }
+    game
+}
+
+/// Train the **full heads-up NLHE blueprint** ([`BlueprintHoldem`]) — the real
+/// abstracted game, the cloud-burst training target — with external-sampling
+/// DCFR + the VR-MCCFR baseline, checkpointing each chunk (so a preempted spot
+/// instance resumes with `--resume`).  Card abstraction is loaded from the
+/// `cluster`-built `data/{flop,turn,river}_buckets.bin`; the betting abstraction
+/// is capped at `--cap` raises/street (the feasibility lever — cap 1 fits a
+/// 64 GB box, see `memory_estimate`).
+///
+/// Usage:
+///   train blueprint [iters] [stack_bb] [seed] [flags]
+///     --cap=N            raises per street (default 1)
+///     --soa              flat SoA regret store (~10× smaller; needs full-coverage
+///                        maps + finite cap — the cap-2/128 GB path, finding #4)
+///     --optimistic       predictive regret updates (serial path only; not --soa)
+///     --parallel[=BATCH] mini-batch parallel MCCFR (keeps the baseline)
+///     --resume           continue from data/blueprint_holdem[_soa].ckpt
+///     --expl             also measure sampled exploitability each checkpoint
+///     --expl-iters=N     BR build/eval iterations for --expl (default 100000)
+fn run_blueprint(args: &[String]) {
+    if args.iter().any(|a| a == "--soa") {
+        run_blueprint_soa(args);
+        return;
+    }
+    let nums: Vec<&String> = args[2..].iter().filter(|a| !a.starts_with("--")).collect();
+    let iters: u64 = nums.first().and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
+    let stack_bb: u32 = nums.get(1).and_then(|s| s.parse().ok()).unwrap_or(20);
+    let seed: u64 = nums.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
+    let stack = stack_bb * BIG_BLIND;
+
+    let flag = |name: &str| args.iter().any(|a| a == name);
+    let cap: u32 =
+        args.iter().find_map(|a| a.strip_prefix("--cap=")).and_then(|s| s.parse().ok()).unwrap_or(1);
+    let parallel_batch = args.iter().find_map(|a| {
+        a.strip_prefix("--parallel")
+            .map(|rest| rest.strip_prefix('=').and_then(|b| b.parse().ok()).unwrap_or(256))
+    });
+    let optimistic = flag("--optimistic");
+    let resume = flag("--resume");
+    let want_expl = flag("--expl");
+    let expl_iters: u64 = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--expl-iters="))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100_000);
+
+    let mut features = vec![format!("cap={cap}")];
+    if optimistic {
+        features.push("optimistic".into());
+    }
+    if let Some(b) = parallel_batch {
+        features.push(format!("parallel(batch={b})"));
+    }
+    let feat = features.join("+");
+
+    let dir = Path::new("data");
+    std::fs::create_dir_all(dir).expect("create data/ directory");
+    let ckpt_path = dir.join("blueprint_holdem.ckpt");
+
+    println!(
+        "Training heads-up NLHE blueprint: {iters} iters, {stack_bb}bb stacks, seed {seed} [DCFR+baseline+{feat}]"
+    );
+    let mut solver = if resume && ckpt_path.exists() {
+        let game = load_blueprint_game(dir, stack, cap, true);
+        let s = Mccfr::load_checkpoint(&ckpt_path, game).expect("load checkpoint");
+        println!("Resuming from {} at iteration {}", ckpt_path.display(), s.iterations());
+        s
+    } else {
+        let game = load_blueprint_game(dir, stack, cap, true);
+        let mut s = Mccfr::with_seed(game, Variant::Dcfr(Discount::RECOMMENDED), seed).with_baseline();
+        // Optimistic is serial-only (composes poorly with batch staleness — Step 15).
+        if parallel_batch.is_none() && optimistic {
+            s = s.with_optimistic();
+        }
+        s
+    };
+
+    // A second copy of the game for the sampled best-response estimator (the
+    // solver owns its own; bucket maps aren't cheap to clone, so we just reload).
+    let eval_game = want_expl.then(|| load_blueprint_game(dir, stack, cap, false));
+
+    emit_metric(
+        "wandb-config",
+        &[
+            ("mode", "\"blueprint\"".into()),
+            ("iters", iters.to_string()),
+            ("stack_bb", stack_bb.to_string()),
+            ("seed", seed.to_string()),
+            ("raise_cap", cap.to_string()),
+            ("resume", resume.to_string()),
+            ("features", format!("{feat:?}")),
+        ],
+    );
+
+    let start = Instant::now();
+    let chunk = (iters / 10).max(1);
+    while solver.iterations() < iters {
+        let step = chunk.min(iters - solver.iterations());
+        train_step_blueprint(&mut solver, step, parallel_batch);
+        solver.save_checkpoint(&ckpt_path).expect("write checkpoint");
+
+        // Sampled exploitability is an expensive lower bound on a non-enumerable
+        // tree, so it is opt-in (`--expl`); info-set growth / nodes / time are
+        // always logged (a plateauing info-set count is the health signal).
+        let expl = eval_game.as_ref().map(|g| {
+            sampled_exploitability(g, &solver.average_strategy(), expl_iters, expl_iters, seed)
+        });
+
+        println!(
+            "  {:>4}%  {} info sets   {}{} nodes   ({:.1}s)  [checkpointed]",
+            solver.iterations() * 100 / iters,
+            solver.num_info_sets(),
+            expl.map(|e| format!("exploitability {e:>6.3} bb   ")).unwrap_or_default(),
+            solver.nodes_visited(),
+            start.elapsed().as_secs_f64()
+        );
+
+        let mut fields = vec![
+            ("iteration", solver.iterations().to_string()),
+            ("pct", (solver.iterations() * 100 / iters).to_string()),
+            ("info_sets", solver.num_info_sets().to_string()),
+            ("nodes", solver.nodes_visited().to_string()),
+            ("elapsed_s", format!("{:.3}", start.elapsed().as_secs_f64())),
+        ];
+        if let Some(e) = expl {
+            fields.push(("exploitability_bb", format!("{e:.4}")));
+        }
+        emit_metric("wandb", &fields);
+    }
+
+    // Persist the deployable average strategy as f32 (halves the footprint).
+    let avg: HashMap<u64, Vec<f32>> = solver
+        .average_strategy()
+        .into_iter()
+        .map(|(k, v)| (k, v.into_iter().map(|x| x as f32).collect()))
+        .collect();
+    let path = dir.join("blueprint_holdem.bin");
+    let bytes = bincode::serialize(&avg).expect("serialize strategy");
+    std::fs::write(&path, &bytes).expect("write strategy");
+    println!("Saved {} info sets, {} bytes -> {}", avg.len(), bytes.len(), path.display());
+}
+
+/// Advance the blueprint solver by `step` iterations on the cursor fast path
+/// (zero per-node allocation), parallel when a batch is configured.
+fn train_step_blueprint(solver: &mut Mccfr<BlueprintHoldem>, step: u64, parallel_batch: Option<u64>) {
+    match parallel_batch {
+        Some(batch) => solver.train_parallel_fast(step, batch),
+        None => solver.train_fast(step),
+    }
+}
+
+/// Train the heads-up NLHE blueprint with the **flat SoA regret store** instead
+/// of the `HashMap` — the ~10×-smaller table (finding #4) that lets the cap-2
+/// abstraction fit a 128 GB box.  Needs a finite `--cap` and full-coverage
+/// `data/{flop,turn,river}_buckets.bin` (the dense index has one slot per
+/// `(sequence, bucket)`); the game's [`BlueprintHoldem::with_indexing`] enforces
+/// both.  DCFR + the VR-MCCFR baseline; `--parallel` keeps the baseline.
+/// `--optimistic` is not available on this path (the SoA solver carries no
+/// momentum accumulator — it stayed off to keep the store minimal).
+fn run_blueprint_soa(args: &[String]) {
+    use poker_ai::solver::mccfr::SoaMccfr;
+
+    let nums: Vec<&String> = args[2..].iter().filter(|a| !a.starts_with("--")).collect();
+    let iters: u64 = nums.first().and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
+    let stack_bb: u32 = nums.get(1).and_then(|s| s.parse().ok()).unwrap_or(20);
+    let seed: u64 = nums.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
+    let stack = stack_bb * BIG_BLIND;
+
+    let cap: u32 =
+        args.iter().find_map(|a| a.strip_prefix("--cap=")).and_then(|s| s.parse().ok()).unwrap_or(1);
+    let parallel_batch = args.iter().find_map(|a| {
+        a.strip_prefix("--parallel")
+            .map(|rest| rest.strip_prefix('=').and_then(|b| b.parse().ok()).unwrap_or(256))
+    });
+    let resume = args.iter().any(|a| a == "--resume");
+    let want_expl = args.iter().any(|a| a == "--expl");
+    let expl_iters: u64 = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--expl-iters="))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100_000);
+
+    let mode = parallel_batch.map_or("serial".to_string(), |b| format!("parallel(batch={b})"));
+    let feat = format!("cap={cap}+soa+{mode}");
+
+    let dir = Path::new("data");
+    std::fs::create_dir_all(dir).expect("create data/ directory");
+    let ckpt_path = dir.join("blueprint_holdem_soa.ckpt");
+
+    println!(
+        "Training heads-up NLHE blueprint (SoA store): {iters} iters, {stack_bb}bb stacks, seed {seed} [DCFR+baseline+{feat}]"
+    );
+    let mut solver = if resume && ckpt_path.exists() {
+        let game = load_blueprint_game(dir, stack, cap, true).with_indexing();
+        let s = SoaMccfr::load_checkpoint(&ckpt_path, game).expect("load SoA checkpoint");
+        println!("Resuming from {} at iteration {}", ckpt_path.display(), s.iterations());
+        s
+    } else {
+        let game = load_blueprint_game(dir, stack, cap, true).with_indexing();
+        SoaMccfr::with_seed(game, Variant::Dcfr(Discount::RECOMMENDED), seed).with_baseline()
+    };
+    println!(
+        "Flat table: {} info sets, {} bytes/info set (vs ~350 for the HashMap Node)",
+        solver.capacity(),
+        solver.bytes_per_info_set()
+    );
+
+    // Reload the game for the sampled best-response estimator (it needs the same
+    // indexing to reconstruct keys; the solver owns its own copy).
+    let eval = want_expl.then(|| load_blueprint_game(dir, stack, cap, false).with_indexing());
+
+    emit_metric(
+        "wandb-config",
+        &[
+            ("mode", "\"blueprint-soa\"".into()),
+            ("iters", iters.to_string()),
+            ("stack_bb", stack_bb.to_string()),
+            ("seed", seed.to_string()),
+            ("raise_cap", cap.to_string()),
+            ("info_sets", solver.capacity().to_string()),
+            ("resume", resume.to_string()),
+            ("features", format!("{feat:?}")),
+        ],
+    );
+
+    let start = Instant::now();
+    let chunk = (iters / 10).max(1);
+    while solver.iterations() < iters {
+        let step = chunk.min(iters - solver.iterations());
+        match parallel_batch {
+            Some(b) => solver.train_parallel(step, b),
+            None => solver.train(step),
+        }
+        solver.save_checkpoint(&ckpt_path).expect("write SoA checkpoint");
+
+        let expl = eval.as_ref().map(|g| {
+            sampled_exploitability(g, &soa_strategy_map(g, &solver), expl_iters, expl_iters, seed)
+        });
+
+        println!(
+            "  {:>4}%  {} info sets   {}{} nodes   ({:.1}s)  [checkpointed]",
+            solver.iterations() * 100 / iters,
+            solver.capacity(),
+            expl.map(|e| format!("exploitability {e:>6.3} bb   ")).unwrap_or_default(),
+            solver.nodes_visited(),
+            start.elapsed().as_secs_f64()
+        );
+
+        let mut fields = vec![
+            ("iteration", solver.iterations().to_string()),
+            ("pct", (solver.iterations() * 100 / iters).to_string()),
+            ("info_sets", solver.capacity().to_string()),
+            ("nodes", solver.nodes_visited().to_string()),
+            ("elapsed_s", format!("{:.3}", start.elapsed().as_secs_f64())),
+        ];
+        if let Some(e) = expl {
+            fields.push(("exploitability_bb", format!("{e:.4}")));
+        }
+        emit_metric("wandb", &fields);
+    }
+
+    // Export the deployable average strategy in the SAME HashMap<u64, Vec<f32>>
+    // format the HashMap path writes (keys reconstructed via info_key_at), so the
+    // artifact is interchangeable; only visited info sets are emitted.
+    let game = load_blueprint_game(dir, stack, cap, false).with_indexing();
+    let mut avg: HashMap<u64, Vec<f32>> = HashMap::new();
+    for i in 0..solver.capacity() {
+        if solver.is_visited(i) {
+            let probs = solver.average_strategy_at(i).into_iter().map(|x| x as f32).collect();
+            avg.insert(game.info_key_at(i), probs);
+        }
+    }
+    let path = dir.join("blueprint_holdem.bin");
+    let bytes = bincode::serialize(&avg).expect("serialize strategy");
+    std::fs::write(&path, &bytes).expect("write strategy");
+    println!("Saved {} info sets, {} bytes -> {}", avg.len(), bytes.len(), path.display());
+}
+
+/// Build a `HashMap<u64, Vec<f64>>` strategy (keyed like the `HashMap` solver)
+/// from a trained SoA table, for the sampled best-response estimator.
+fn soa_strategy_map(
+    game: &BlueprintHoldem,
+    solver: &poker_ai::solver::mccfr::SoaMccfr<BlueprintHoldem>,
+) -> HashMap<u64, Vec<f64>> {
+    let mut map = HashMap::new();
+    for i in 0..solver.capacity() {
+        if solver.is_visited(i) {
+            map.insert(game.info_key_at(i), solver.average_strategy_at(i));
+        }
+    }
+    map
 }
 
 /// Render the SB opening shove range as a 13×13 grid (upper triangle = suited)

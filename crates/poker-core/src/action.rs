@@ -52,6 +52,17 @@ impl ActionList {
         self.buf[self.len] = a;
         self.len += 1;
     }
+
+    /// Build a list from a slice of actions — for abstraction layers that filter
+    /// the engine's legal set (e.g. a betting-abstraction raise cap). Panics in
+    /// debug if given more than the 8-action capacity.
+    pub fn from_actions(actions: &[Action]) -> Self {
+        let mut l = Self::new();
+        for &a in actions {
+            l.push(a);
+        }
+        l
+    }
 }
 
 impl std::ops::Deref for ActionList {

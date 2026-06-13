@@ -91,6 +91,26 @@ pub struct SubgameNode {
     continuation: Option<u8>,
 }
 
+impl SubgameNode {
+    /// Build the initial play node for a deal: `template` with the two players'
+    /// hole cards set (`holes[p]` to player `p`).  This is the deal-rooted state
+    /// the [`Subgame`] places under its chance root — exposed so the re-solving
+    /// gadget ([`crate::resolving::gadget`]) can root its Follow subtree on the
+    /// same betting tree.
+    pub fn deal(template: &GameState, holes: [[u8; 2]; 2]) -> Self {
+        let mut gs = template.clone();
+        gs.hole_cards[0] = holes[0];
+        gs.hole_cards[1] = holes[1];
+        SubgameNode { gs: Some(gs), history: Vec::new(), continuation: None }
+    }
+
+    /// Hole cards of `player` at a play node (`None` at the pre-deal chance root).
+    /// Used by counterfactual-value extraction to group deals by a player's hand.
+    pub fn hole_cards(&self, player: usize) -> Option<[u8; 2]> {
+        self.gs.as_ref().map(|gs| gs.hole_cards[player])
+    }
+}
+
 /// A depth-limited heads-up subgame as a [`Game`].
 pub struct Subgame<'a> {
     deals: Vec<Deal>,
@@ -139,6 +159,25 @@ impl<'a> Subgame<'a> {
     /// Number of enumerated deals (the chance breadth).
     pub fn num_deals(&self) -> usize {
         self.deals.len()
+    }
+
+    /// Build a **play-only context** rooted at `template` — the same betting
+    /// tree, leaf evaluation, and `info_key` behaviour as [`Self::new`], but with
+    /// no enumerated deals (`chance_outcomes` is unused).  The re-solving gadget
+    /// ([`crate::resolving::gadget`]) drives its own chance and delegates each
+    /// play node's [`Game`] methods to this context, so gadget play info sets
+    /// share the exact keyspace of a plain [`Subgame`] resolve.
+    pub fn play_context(template: &GameState, leaf_eval: &'a dyn LeafEvaluator) -> Self {
+        let big_blind = template.big_blind as f64;
+        let chooser = 1 - template.current_player();
+        let k = leaf_eval.num_continuations().max(1);
+        Self { deals: Vec::new(), outcomes: Vec::new(), leaf_eval, big_blind, k, chooser }
+    }
+
+    /// The precomputed chance children `(deal-rooted node, probability)` — the
+    /// per-deal roots counterfactual-value extraction iterates over.
+    pub fn outcomes(&self) -> &[(SubgameNode, f64)] {
+        &self.outcomes
     }
 
     /// True when the engine's current street wants a board card the template does
