@@ -69,12 +69,12 @@ fn accumulate<G: Game>(
     if player == traverser {
         let key = game.info_key(state);
         let mut vals = vec![0.0; num_actions];
-        for a in 0..num_actions {
-            vals[a] = accumulate(game, &game.apply(state, a), traverser, strategy, q, rng);
+        for (a, v) in vals.iter_mut().enumerate() {
+            *v = accumulate(game, &game.apply(state, a), traverser, strategy, q, rng);
         }
         let entry = q.entry(key).or_insert_with(|| Q { sum: vec![0.0; num_actions], count: 0.0 });
-        for a in 0..num_actions {
-            entry.sum[a] += vals[a];
+        for (s, v) in entry.sum.iter_mut().zip(&vals) {
+            *s += v;
         }
         entry.count += 1.0;
         // Propagate the value of the action that is greedy under accumulated means.

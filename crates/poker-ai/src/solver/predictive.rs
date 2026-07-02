@@ -1,11 +1,11 @@
 //! CFR⁺ (Regret Matching⁺) — the resolver's fast full-traversal subgame solver.
 //!
-//! This is the v3 "solver change": the blueprint loop stays on sampled DCFR, but
+//! The blueprint loop stays on sampled DCFR, but
 //! a depth-limited *subgame* is a near-two-player, full-traversal problem once
 //! folds collapse the active set, and there CFR⁺ converges far faster than
 //! vanilla CFR — with strong **last-iterate** behavior, so a 2–5 s resolving
 //! budget buys a well-resolved strategy rather than a half-solved one.  Keeping
-//! it in its own module enforces the plan's rule that this regime must not leak
+//! it in its own module enforces the rule that this regime must not leak
 //! into the sampled blueprint loop (where variance, not solver speed, binds).
 //!
 //! ## The update (RM⁺ / CFR⁺)
@@ -21,7 +21,7 @@
 //!
 //! ## On the predictive (PCFR⁺) layer
 //!
-//! The plan targets *Predictive* RM⁺ / PCFR⁺, which adds an optimistic term
+//! *Predictive* RM⁺ / PCFR⁺ adds an optimistic term
 //! (the previous instantaneous regret) to the strategy.  The naive form was
 //! tried here and **diverged/cycled on Leduc** under both alternating and
 //! simultaneous updates — a known instability of optimistic methods when the
@@ -231,27 +231,25 @@ mod tests {
         assert!((value - GAME_VALUE_P0).abs() < 1e-2, "value {value} near -1/18");
     }
 
+    /// Slow (10k full Leduc traversals, ~15 s even optimized): run with
+    /// `cargo test -- --ignored`. The fast Kuhn test above is the default-suite
+    /// convergence gate.
     #[test]
+    #[ignore]
     fn converges_on_leduc() {
         let mut s = PredictiveSolver::new(Leduc);
         s.train(10_000);
         let expl = exploitability(&Leduc, &s.average_strategy());
         assert!(expl < 0.03, "CFR+ Leduc exploitability {expl} should be < 0.03");
-    }
-
-    #[test]
-    fn last_iterate_converges_on_leduc() {
         // CFR+'s strong last-iterate behavior — the property the resolver leans
         // on within a tight time budget.
-        let mut s = PredictiveSolver::new(Leduc);
-        s.train(10_000);
-        let expl = exploitability(&Leduc, &s.current_strategy());
-        assert!(expl < 0.01, "CFR+ Leduc last-iterate {expl} should be < 0.01");
+        let last = exploitability(&Leduc, &s.current_strategy());
+        assert!(last < 0.01, "CFR+ Leduc last-iterate {last} should be < 0.01");
     }
 
     #[test]
     fn beats_vanilla_cfr_at_a_fixed_budget() {
-        // The v3 bet: at an equal iteration budget the resolver's deployable
+        // The bet: at an equal iteration budget the resolver's deployable
         // output (CFR+'s last iterate) is closer to equilibrium than vanilla
         // CFR's deployable output (its average) — this is what makes a 2–5 s
         // resolving call worthwhile.

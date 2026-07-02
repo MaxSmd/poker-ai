@@ -13,9 +13,10 @@
 //! affordable.
 //!
 //! The explicit-deal `Subgame` stays the **correctness oracle**: this solver
-//! emits its average strategy under the *same* `info_key` (player + hand + board
-//! + history), so [`exploitability`](crate::solver::best_response::exploitability)
-//! scores the vectorized result inside the explicit game and the two must agree.
+//! emits its average strategy under the *same* `info_key` (player + hand +
+//! board + history), so
+//! [`exploitability`](crate::solver::best_response::exploitability) scores the
+//! vectorized result inside the explicit game and the two must agree.
 //!
 //! **Scope.** This increment solves *complete-board* (river) subgames — exactly
 //! the 1326×1326 blow-up the finding targets — with exact showdown and fold
@@ -32,7 +33,7 @@ use poker_core::state::{GameState, NO_CARD};
 
 // `board_cfvs` indexes its reach/output by `features::combo_index`, so the whole
 // solver works in that ordering (NOT `belief_state`'s, a different bijection).
-use crate::abstraction::features::{board_cfvs, combo_cards, combo_index};
+use crate::abstraction::features::{board_cfvs, combo_cards};
 use crate::resolving::belief_state::{BeliefState, NUM_COMBOS};
 use crate::util::hash::fnv1a;
 
@@ -115,10 +116,10 @@ impl NodeStore {
         let weight = t as f64; // linear averaging
         for h in 0..NUM_COMBOS {
             let rp = reach_p[h];
-            for ai in 0..a {
+            for (ai, cp) in child_p.iter().enumerate().take(a) {
                 let idx = h * a + ai;
                 let r = &mut self.regret[idx];
-                *r = (*r + child_p[ai][h] - v_p[h]).max(0.0);
+                *r = (*r + cp[h] - v_p[h]).max(0.0);
                 self.strategy_sum[idx] += weight * rp * sigma[idx];
             }
         }
@@ -420,7 +421,7 @@ mod tests {
         let mut gs = GameState::new(2, 2, 1, [stack; MAX_PLAYERS], holes, board, 0);
         while gs.street < 3 && !gs.is_terminal() {
             let acts = legal_actions(&gs);
-            let act = if acts.iter().any(|&a| a == Action::Check) { Action::Check } else { Action::Call };
+            let act = if acts.contains(&Action::Check) { Action::Check } else { Action::Call };
             gs.apply_action(act);
         }
         gs

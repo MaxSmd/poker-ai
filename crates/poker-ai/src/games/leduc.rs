@@ -134,7 +134,8 @@ impl Game for Leduc {
 
     fn utility(&self, state: &LeducState, player: usize) -> f64 {
         let other = 1 - player;
-        let u_player = if state.folded >= 0 {
+        
+        if state.folded >= 0 {
             // Folder loses what it committed; the other wins that amount.
             if state.folded as usize == player {
                 -(state.committed[player] as f64)
@@ -152,8 +153,7 @@ impl Game for Leduc {
             } else {
                 0.0
             }
-        };
-        u_player
+        }
     }
 
     fn chance_outcomes(&self, state: &LeducState) -> Vec<(LeducState, f64)> {

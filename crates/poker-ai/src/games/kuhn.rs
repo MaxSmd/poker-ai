@@ -29,7 +29,7 @@
 //! Kuhn Poker has a known family of Nash equilibria with game value
 //! **−1/18 ≈ −0.0556** to the first player.  At equilibrium the exploitability
 //! (NashConv / 2) is zero, so a correct solver must drive it below any small ε.
-//! This is validation protocol step 1 in the plan.
+//! This is validation protocol step 1.
 
 use super::Game;
 
@@ -176,7 +176,7 @@ mod tests {
     fn vanilla_cfr_converges_to_equilibrium() {
         // Vanilla CFR converges at O(1/√T), so it needs more iterations than
         // DCFR to cross the same exploitability threshold — that slower rate is
-        // precisely why the plan adopts DCFR for the blueprint.
+        // precisely why DCFR is used for the blueprint.
         let mut solver = Cfr::new(Kuhn, Variant::Vanilla);
         solver.train(100_000);
         let avg = solver.average_strategy();

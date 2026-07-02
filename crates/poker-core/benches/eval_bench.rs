@@ -95,8 +95,8 @@ fn bench_evaluate_7_lut(c: &mut Criterion) {
 
 fn make_bench_state() -> GameState {
     let mut holes = [[NO_CARD; 2]; MAX_PLAYERS];
-    for i in 0..6 {
-        holes[i] = [make_card(i as u8, 0), make_card(i as u8 + 1, 1)];
+    for (i, h) in holes.iter_mut().take(6).enumerate() {
+        *h = [make_card(i as u8, 0), make_card(i as u8 + 1, 1)];
     }
     // Board uses ranks 7-11 (above every hole rank, which top out at 6) so no
     // card collides with a hole card — the uniqueness invariant is enforced in

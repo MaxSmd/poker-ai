@@ -79,9 +79,9 @@ impl HeadsUpHoldem {
         let p0 = [[make_card(10, 0), make_card(10, 1)], [make_card(6, 2), make_card(6, 3)]];
         let p1 = [[make_card(9, 0), make_card(9, 1)], [make_card(1, 2), make_card(1, 3)]];
         let mut deals = Vec::new();
-        for a in 0..2 {
-            for b in 0..2 {
-                deals.push(Deal { holes: [p0[a], p1[b]], board });
+        for &h0 in &p0 {
+            for &h1 in &p1 {
+                deals.push(Deal { holes: [h0, h1], board });
             }
         }
         Self::new(deals, 40, 10, 5, 0)

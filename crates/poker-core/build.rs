@@ -75,8 +75,8 @@ fn top_bits(bits: u16, n: usize) -> [u8; 5] {
 /// Flush detection is handled separately via `FLUSH_LUT`.
 fn eval_noflush(freq: &[u8; 13]) -> u32 {
     let mut rank_bits = 0u16;
-    for r in 0..13usize {
-        if freq[r] > 0 {
+    for (r, &f) in freq.iter().enumerate() {
+        if f > 0 {
             rank_bits |= 1u16 << r;
         }
     }

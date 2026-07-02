@@ -4,7 +4,7 @@
 //! [`board_histograms`]): one board scores all ~1081 holes at once in
 //! O(n log n), so the feature for every situation is **exact and ~1000× cheaper**
 //! than the old per-hand O(n²) enumeration / Monte-Carlo rollout (exact, low-noise
-//! histograms cluster better — the plan names sampling noise as the ceiling).
+//! histograms cluster better — sampling noise is the ceiling).
 //!
 //! Boards are enumerated by a suit-isomorphic board indexer and processed in
 //! parallel; each board emits `(joint slot, feature)` entries that are merged

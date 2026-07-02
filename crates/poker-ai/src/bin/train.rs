@@ -19,6 +19,10 @@
 //!     --optimistic       predictive regret updates (R += 2rₜ − r_{t−1})
 //!     --rbp              Regret-Based Pruning
 //!     --parallel[=BATCH] mini-batch parallel MCCFR (plain external sampling)
+//!     --atomic[=THREADS] (with --soa) lock-free atomic training — near-linear
+//!                        core scaling, NOT bit-deterministic (default: all cores)
+//!     --chunk=N          iterations per progress line + checkpoint (default ~1%)
+//!     --expl-every=N     run the exploitability eval only every Nth chunk (def 10)
 //!
 //!   train compare [iters] [stack_bb] [seed]
 //!     Trains the base config and each Phase 3 feature in turn and prints a
@@ -79,6 +83,37 @@ fn emit_metric(tag: &str, fields: &[(&str, String)]) {
     let body =
         fields.iter().map(|(k, v)| format!("\"{k}\":{v}")).collect::<Vec<_>>().join(",");
     println!("@{tag} {{{body}}}");
+}
+
+/// Progress + evaluation cadence for the training loops.
+///
+/// The trainer reports once per `chunk` iterations (and checkpoints there, so an
+/// interruption costs ≤ one chunk).  The default is ~1% of the run — frequent
+/// progress lines instead of the old `iters/10` (which left a 300 M-iter run
+/// silent for tens of minutes before its first line).  The sampled-exploitability
+/// eval is expensive on a non-enumerable tree, so it runs only every
+/// `expl_every`-th chunk (plus always on the final one).
+struct Cadence {
+    chunk: u64,
+    expl_every: u64,
+}
+
+/// Parse `--chunk=N` (iterations per progress line; default ~1% of `iters`) and
+/// `--expl-every=N` (run the exploitability eval every Nth chunk; default 10).
+fn parse_cadence(args: &[String], iters: u64) -> Cadence {
+    let chunk = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--chunk="))
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or((iters / 100).max(1))
+        .max(1);
+    let expl_every = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--expl-every="))
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(10)
+        .max(1);
+    Cadence { chunk, expl_every }
 }
 
 /// Build a (fresh, untrained) solver with `cfg` applied.
@@ -211,32 +246,38 @@ fn main() {
 
     // Train in chunks, checkpointing after each so an interruption costs at most
     // one chunk of work.  Resume picks up from `solver.iterations()`.
+    let cad = parse_cadence(&args, iters);
     let start = Instant::now();
-    let chunk = (iters / 10).max(1);
+    let mut chunk_idx: u64 = 0;
     while solver.iterations() < iters {
-        let step = chunk.min(iters - solver.iterations());
+        let step = cad.chunk.min(iters - solver.iterations());
         train_step(&mut solver, step, cfg);
         solver.save_checkpoint(&ckpt_path).expect("write checkpoint");
-        let expl = push_fold_exploitability(&eval_game, &solver.average_strategy(), expl_deals, 7);
+        // Exploitability is the validation number, but the 2 M-deal MC adds up
+        // across ~100 progress lines, so run it every Nth chunk (+ the last).
+        let is_last = solver.iterations() >= iters;
+        let expl = (chunk_idx.is_multiple_of(cad.expl_every) || is_last)
+            .then(|| push_fold_exploitability(&eval_game, &solver.average_strategy(), expl_deals, 7));
         println!(
-            "  {:>4}%  {} info sets   exploitability {:>6.1} mbb/g   {} nodes   ({:.1}s)  [checkpointed]",
+            "  {:>4}%  {} info sets   {}{} nodes   ({:.1}s)  [checkpointed]",
             solver.iterations() * 100 / iters,
             solver.num_info_sets(),
-            expl * 1000.0,
+            expl.map(|e| format!("exploitability {:>6.1} mbb/g   ", e * 1000.0)).unwrap_or_default(),
             solver.nodes_visited(),
             start.elapsed().as_secs_f64()
         );
-        emit_metric(
-            "wandb",
-            &[
-                ("iteration", solver.iterations().to_string()),
-                ("pct", (solver.iterations() * 100 / iters).to_string()),
-                ("info_sets", solver.num_info_sets().to_string()),
-                ("exploitability_mbb", format!("{:.4}", expl * 1000.0)),
-                ("nodes", solver.nodes_visited().to_string()),
-                ("elapsed_s", format!("{:.3}", start.elapsed().as_secs_f64())),
-            ],
-        );
+        let mut fields = vec![
+            ("iteration", solver.iterations().to_string()),
+            ("pct", (solver.iterations() * 100 / iters).to_string()),
+            ("info_sets", solver.num_info_sets().to_string()),
+            ("nodes", solver.nodes_visited().to_string()),
+            ("elapsed_s", format!("{:.3}", start.elapsed().as_secs_f64())),
+        ];
+        if let Some(e) = expl {
+            fields.push(("exploitability_mbb", format!("{:.4}", e * 1000.0)));
+        }
+        emit_metric("wandb", &fields);
+        chunk_idx += 1;
     }
 
     // Persist the average strategy as f32 (deploy-ready; halves the footprint).
@@ -304,8 +345,19 @@ fn run_soa(args: &[String]) {
     let parallel_batch = args.iter().find_map(|a| {
         a.strip_prefix("--parallel").map(|r| r.strip_prefix('=').and_then(|b| b.parse().ok()).unwrap_or(256))
     });
+    let atomic_threads: Option<usize> = args.iter().find_map(|a| {
+        a.strip_prefix("--atomic").map(|rest| {
+            rest.strip_prefix('=').and_then(|n| n.parse().ok()).unwrap_or_else(|| {
+                std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+            })
+        })
+    });
 
-    let mode = parallel_batch.map_or("serial".to_string(), |b| format!("parallel(batch={b})"));
+    let mode = match (atomic_threads, parallel_batch) {
+        (Some(th), _) => format!("atomic(threads={th})"),
+        (None, Some(b)) => format!("parallel(batch={b})"),
+        (None, None) => "serial".to_string(),
+    };
     println!("Training push/fold via flat SoA RegretTable: {iters} iters, {stack_bb}bb, seed {seed} [{mode}]");
     emit_metric(
         "wandb-config",
@@ -328,13 +380,14 @@ fn run_soa(args: &[String]) {
     let dir = Path::new("data");
     std::fs::create_dir_all(dir).expect("create data/");
     let ckpt = dir.join("blueprint_pushfold_soa.ckpt");
+    let cad = parse_cadence(args, iters);
     let start = Instant::now();
-    let chunk = (iters / 10).max(1);
     while solver.iterations() < iters {
-        let step = chunk.min(iters - solver.iterations());
-        match parallel_batch {
-            Some(b) => solver.train_parallel(step, b),
-            None => solver.train(step),
+        let step = cad.chunk.min(iters - solver.iterations());
+        match (atomic_threads, parallel_batch) {
+            (Some(th), _) => solver.train_atomic(step, th),
+            (None, Some(b)) => solver.train_parallel(step, b),
+            (None, None) => solver.train(step),
         }
         solver.save_checkpoint(&ckpt).expect("write SoA checkpoint");
         println!(
@@ -399,8 +452,10 @@ fn load_blueprint_game(dir: &Path, stack: u32, cap: u32, verbose: bool) -> Bluep
 ///     --optimistic       predictive regret updates (serial path only; not --soa)
 ///     --parallel[=BATCH] mini-batch parallel MCCFR (keeps the baseline)
 ///     --resume           continue from data/blueprint_holdem[_soa].ckpt
-///     --expl             also measure sampled exploitability each checkpoint
+///     --expl             also measure sampled exploitability (every Nth chunk)
 ///     --expl-iters=N     BR build/eval iterations for --expl (default 100000)
+///     --chunk=N          iterations per progress line + checkpoint (default ~1%)
+///     --expl-every=N     run --expl only every Nth chunk (default 10)
 fn run_blueprint(args: &[String]) {
     if args.iter().any(|a| a == "--soa") {
         run_blueprint_soa(args);
@@ -476,19 +531,23 @@ fn run_blueprint(args: &[String]) {
         ],
     );
 
+    let cad = parse_cadence(args, iters);
     let start = Instant::now();
-    let chunk = (iters / 10).max(1);
+    let mut chunk_idx: u64 = 0;
     while solver.iterations() < iters {
-        let step = chunk.min(iters - solver.iterations());
+        let step = cad.chunk.min(iters - solver.iterations());
         train_step_blueprint(&mut solver, step, parallel_batch);
         solver.save_checkpoint(&ckpt_path).expect("write checkpoint");
 
         // Sampled exploitability is an expensive lower bound on a non-enumerable
-        // tree, so it is opt-in (`--expl`); info-set growth / nodes / time are
-        // always logged (a plateauing info-set count is the health signal).
-        let expl = eval_game.as_ref().map(|g| {
-            sampled_exploitability(g, &solver.average_strategy(), expl_iters, expl_iters, seed)
-        });
+        // tree, so it is opt-in (`--expl`) AND only run every Nth chunk (plus the
+        // last); info-set growth / nodes / time are logged every chunk (a
+        // plateauing info-set count is the always-on health signal).
+        let is_last = solver.iterations() >= iters;
+        let expl = (want_expl && (chunk_idx.is_multiple_of(cad.expl_every) || is_last))
+            .then_some(eval_game.as_ref())
+            .flatten()
+            .map(|g| sampled_exploitability(g, &solver.average_strategy(), expl_iters, expl_iters, seed));
 
         println!(
             "  {:>4}%  {} info sets   {}{} nodes   ({:.1}s)  [checkpointed]",
@@ -510,6 +569,7 @@ fn run_blueprint(args: &[String]) {
             fields.push(("exploitability_bb", format!("{e:.4}")));
         }
         emit_metric("wandb", &fields);
+        chunk_idx += 1;
     }
 
     // Persist the deployable average strategy as f32 (halves the footprint).
@@ -556,6 +616,16 @@ fn run_blueprint_soa(args: &[String]) {
         a.strip_prefix("--parallel")
             .map(|rest| rest.strip_prefix('=').and_then(|b| b.parse().ok()).unwrap_or(256))
     });
+    // Lock-free atomic training (`--atomic[=THREADS]`): the many-core path —
+    // near-linear scaling, NOT bit-deterministic (see SoaMccfr::train_atomic).
+    // Takes precedence over --parallel.
+    let atomic_threads: Option<usize> = args.iter().find_map(|a| {
+        a.strip_prefix("--atomic").map(|rest| {
+            rest.strip_prefix('=').and_then(|n| n.parse().ok()).unwrap_or_else(|| {
+                std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+            })
+        })
+    });
     let resume = args.iter().any(|a| a == "--resume");
     let want_expl = args.iter().any(|a| a == "--expl");
     let expl_iters: u64 = args
@@ -564,7 +634,11 @@ fn run_blueprint_soa(args: &[String]) {
         .and_then(|s| s.parse().ok())
         .unwrap_or(100_000);
 
-    let mode = parallel_batch.map_or("serial".to_string(), |b| format!("parallel(batch={b})"));
+    let mode = match (atomic_threads, parallel_batch) {
+        (Some(th), _) => format!("atomic(threads={th})"),
+        (None, Some(b)) => format!("parallel(batch={b})"),
+        (None, None) => "serial".to_string(),
+    };
     let feat = format!("cap={cap}+soa+{mode}");
 
     let dir = Path::new("data");
@@ -607,19 +681,26 @@ fn run_blueprint_soa(args: &[String]) {
         ],
     );
 
+    let cad = parse_cadence(args, iters);
     let start = Instant::now();
-    let chunk = (iters / 10).max(1);
+    let mut chunk_idx: u64 = 0;
     while solver.iterations() < iters {
-        let step = chunk.min(iters - solver.iterations());
-        match parallel_batch {
-            Some(b) => solver.train_parallel(step, b),
-            None => solver.train(step),
+        let step = cad.chunk.min(iters - solver.iterations());
+        match (atomic_threads, parallel_batch) {
+            (Some(th), _) => solver.train_atomic(step, th),
+            (None, Some(b)) => solver.train_parallel(step, b),
+            (None, None) => solver.train(step),
         }
         solver.save_checkpoint(&ckpt_path).expect("write SoA checkpoint");
 
-        let expl = eval.as_ref().map(|g| {
-            sampled_exploitability(g, &soa_strategy_map(g, &solver), expl_iters, expl_iters, seed)
-        });
+        // Opt-in (`--expl`) and only every Nth chunk (plus the last): the sampled
+        // BR rebuilds a HashMap strategy + greedy-evaluates, far costlier than a
+        // training chunk, so it must not gate progress visibility.
+        let is_last = solver.iterations() >= iters;
+        let expl = (want_expl && (chunk_idx.is_multiple_of(cad.expl_every) || is_last))
+            .then_some(eval.as_ref())
+            .flatten()
+            .map(|g| sampled_exploitability(g, &soa_strategy_map(g, &solver), expl_iters, expl_iters, seed));
 
         println!(
             "  {:>4}%  {} info sets   {}{} nodes   ({:.1}s)  [checkpointed]",
@@ -641,6 +722,7 @@ fn run_blueprint_soa(args: &[String]) {
             fields.push(("exploitability_bb", format!("{e:.4}")));
         }
         emit_metric("wandb", &fields);
+        chunk_idx += 1;
     }
 
     // Export the deployable average strategy in the SAME HashMap<u64, Vec<f32>>

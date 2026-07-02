@@ -953,7 +953,7 @@ mod tests {
                             "cluster {c} eq {} vs oracle {want} for {a},{b}",
                             row[c]
                         );
-                        num += (win[c] + 0.5 * tie[c]);
+                        num += win[c] + 0.5 * tie[c];
                         den += tot[c];
                     }
                     // Combo-weighted average of the K cluster equities = vs-uniform.

@@ -189,20 +189,19 @@ impl<G: Game> Cfr<G> {
         let node = self.nodes.get_mut(&key).expect("node was inserted in walk");
         match self.variant {
             Variant::Vanilla => {
-                for a in 0..node.regret_sum.len() {
-                    node.regret_sum[a] += cf_reach * instantaneous(a);
-                    node.strategy_sum[a] += own_reach * strategy[a];
+                for (a, (r, s)) in node.regret_sum.iter_mut().zip(&mut node.strategy_sum).enumerate() {
+                    *r += cf_reach * instantaneous(a);
+                    *s += own_reach * strategy[a];
                 }
             }
             Variant::Dcfr(d) => {
                 let pos = d.positive_factor(t);
                 let neg = d.negative_factor(t);
                 let sw = d.strategy_weight(t);
-                for a in 0..node.regret_sum.len() {
-                    let r = &mut node.regret_sum[a];
+                for (a, (r, s)) in node.regret_sum.iter_mut().zip(&mut node.strategy_sum).enumerate() {
                     *r *= if *r > 0.0 { pos } else { neg };
                     *r += cf_reach * instantaneous(a);
-                    node.strategy_sum[a] += sw * own_reach * strategy[a];
+                    *s += sw * own_reach * strategy[a];
                 }
             }
         }

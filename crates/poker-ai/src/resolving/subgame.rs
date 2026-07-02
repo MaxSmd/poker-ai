@@ -321,10 +321,10 @@ pub struct Resolved {
 
 /// Which regret minimizer resolves the subgame.
 ///
-/// The plan's default is **predictive** (CFR⁺): in the near-two-player,
+/// The default is **predictive** (CFR⁺): in the near-two-player,
 /// full-traversal regime a subgame becomes once folds collapse the active set,
-/// CFR⁺'s fast last iterate buys the best strategy per second.  But the plan also
-/// requires a **DCFR fallback**: predictive RM⁺'s strong guarantees are a 2p0s
+/// CFR⁺'s fast last iterate buys the best strategy per second.  There is also
+/// a **DCFR fallback**: predictive RM⁺'s strong guarantees are a 2p0s
 /// result, so a *multiway* subgame (several opponents still in) should fall back
 /// to DCFR, which is empirically robust where the predictive guarantee erodes.
 /// Both consume the identical subgame tree, so the fallback is a one-line switch.
@@ -469,7 +469,7 @@ mod tests {
         while gs.street < target_street && !gs.is_terminal() {
             let acts = legal_actions(&gs);
             // Prefer Check; otherwise Call — never put extra money in.
-            let act = if acts.iter().any(|&a| a == Action::Check) {
+            let act = if acts.contains(&Action::Check) {
                 Action::Check
             } else {
                 Action::Call

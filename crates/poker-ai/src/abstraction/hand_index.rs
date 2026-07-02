@@ -2,7 +2,7 @@
 //!
 //! [`super::canonical::canonical_key`] is a *correct* suit-isomorphic key, but it
 //! is sparse — a `u64`/`Vec<u8>` scattered across the key space — so the cache
-//! and bucket map it feeds must be hash maps.  At the plan's river scale
+//! and bucket map it feeds must be hash maps.  At river scale
 //! (~10^8 canonical situations) that is tens of GB of keys and pointer chasing.
 //!
 //! A [`HandIndexer`] instead maps every canonical `(hole, board)` *bijectively*
@@ -42,6 +42,32 @@ use poker_core::{make_card, rank_of, suit_of};
 
 const SUITS: usize = 4;
 const RANKS: u8 = 13;
+/// Round-structure cap: lets the hot path use fixed-size stack buffers and pack
+/// a per-suit count vector into one `u32` (round 0 in the high byte, so `u32`
+/// order == lexicographic count-vector order).
+const MAX_ROUNDS: usize = 4;
+
+/// Pascal's triangle for the small binomials on the hot path
+/// (`n` ≤ 13 available ranks, `k` ≤ 7 cards of one suit in one round).
+const CHOOSE_SMALL: [[u64; 8]; 16] = {
+    let mut t = [[0u64; 8]; 16];
+    let mut n = 0;
+    while n < 16 {
+        t[n][0] = 1;
+        let mut k = 1;
+        while k < 8 {
+            t[n][k] = if k > n { 0 } else { t[n - 1][k - 1] + t[n - 1][k] };
+            k += 1;
+        }
+        n += 1;
+    }
+    t
+};
+
+#[inline]
+fn choose_small(n: u64, k: u64) -> u64 {
+    CHOOSE_SMALL[n as usize][k as usize]
+}
 
 /// `n choose k`, computed incrementally in `u128` (exact, no table).  Our `n`
 /// stays well under 2^32 and results fit `u64`.
@@ -65,13 +91,8 @@ fn multiset_choose(m: u64, g: usize) -> u64 {
     choose(m + g as u64 - 1, g as u64)
 }
 
-/// Colexicographic rank of a strictly-increasing position set `{p_0<…<p_{k-1}}`.
-fn combination_rank(positions: &[u64]) -> u64 {
-    positions.iter().enumerate().map(|(i, &p)| choose(p, i as u64 + 1)).sum()
-}
-
-/// Inverse of [`combination_rank`]: the `k`-subset of `0..n` (sorted ascending)
-/// at colex `rank`.
+/// The `k`-subset of `0..n` (sorted ascending) at colexicographic `rank`
+/// (inverse of the colex rank `Σ_i C(p_i, i+1)`).
 fn combination_unrank(mut rank: u64, k: usize) -> Vec<u64> {
     let mut ps = vec![0u64; k];
     for i in (0..k).rev() {
@@ -90,12 +111,6 @@ fn combination_unrank(mut rank: u64, k: usize) -> Vec<u64> {
 fn multiset_unrank(rank: u64, g: usize) -> Vec<u64> {
     let ys = combination_unrank(rank, g);
     ys.iter().enumerate().map(|(i, &y)| y - i as u64).collect()
-}
-
-/// Multiset rank of a non-decreasing `g`-tuple `xs` over `0..m`.
-fn multiset_rank(xs: &[u64]) -> u64 {
-    let ys: Vec<u64> = xs.iter().enumerate().map(|(i, &x)| x + i as u64).collect();
-    combination_rank(&ys)
 }
 
 /// One group of interchangeable suits inside a configuration (suits sharing a
@@ -126,8 +141,9 @@ pub struct HandIndexer {
     cards_per_round: Vec<u8>,
     rounds: usize,
     configs: Vec<Config>,
-    /// Group signature `[(vector, mult)…]` → configuration position.
-    lookup: HashMap<Vec<(Vec<u8>, usize)>, usize>,
+    /// Packed group signature (the four suits' count vectors, sorted descending,
+    /// one `u32` each — see [`packed_signature`]) → configuration position.
+    lookup: HashMap<u128, usize>,
     size: u64,
 }
 
@@ -136,6 +152,11 @@ impl HandIndexer {
     /// flop situation: 2 hole + 3 board).
     pub fn new(cards_per_round: &[u8]) -> Self {
         let rounds = cards_per_round.len();
+        assert!(rounds <= MAX_ROUNDS, "at most {MAX_ROUNDS} rounds supported");
+        assert!(
+            cards_per_round.iter().all(|&c| c <= 7),
+            "at most 7 cards per round (CHOOSE_SMALL bound)"
+        );
         let mut indexer = Self {
             cards_per_round: cards_per_round.to_vec(),
             rounds,
@@ -165,51 +186,58 @@ impl HandIndexer {
     /// Dense canonical index for `cards`, laid out in round order
     /// (`cards_per_round[0]` cards, then `[1]`, …).  Invariant under suit
     /// relabeling; bijective onto `0..size()`.
+    ///
+    /// Allocation-free: this runs once per info-set visit in the MCCFR hot
+    /// loop, so all intermediates live in fixed stack buffers (rank bitmasks,
+    /// packed count vectors) and the configuration lookup is one `u128` hash.
+    /// The math is unchanged from the original Vec-based version — the dense
+    /// index values (which key the on-disk bucket maps) are identical.
     pub fn index(&self, cards: &[u8]) -> u64 {
         debug_assert_eq!(cards.len(), self.total_cards(), "card count must match the round structure");
 
-        // Bucket card ranks by (suit, round).
-        let mut per_suit: [Vec<Vec<u8>>; SUITS] =
-            std::array::from_fn(|_| vec![Vec::new(); self.rounds]);
+        // Bucket card ranks by (suit, round) as bitmasks.
+        let mut masks = [[0u16; MAX_ROUNDS]; SUITS];
         let mut pos = 0;
         for (r, &n) in self.cards_per_round.iter().enumerate() {
             for _ in 0..n {
                 let c = cards[pos];
                 pos += 1;
-                per_suit[suit_of(c) as usize][r].push(rank_of(c));
+                masks[suit_of(c) as usize][r] |= 1 << rank_of(c);
             }
         }
 
-        // Per-suit (count vector, rank-pattern index).
-        let mut suits: Vec<(Vec<u8>, u64)> = (0..SUITS)
-            .map(|s| {
-                let vector: Vec<u8> = per_suit[s].iter().map(|rs| rs.len() as u8).collect();
-                (vector, suit_rank_index(&per_suit[s]))
-            })
-            .collect();
+        // Per-suit (packed count vector, rank-pattern index).
+        let mut suits = [(0u32, 0u64); SUITS];
+        for (s, m) in masks.iter().enumerate() {
+            let mut packed = 0u32;
+            for (r, mask) in m.iter().take(self.rounds).enumerate() {
+                packed |= mask.count_ones() << (24 - 8 * r);
+            }
+            suits[s] = (packed, suit_rank_index_masks(m, self.rounds));
+        }
 
         // Canonicalize: suits sorted by count vector (desc), then by pattern
         // index (asc) so each group's indices come out already sorted.
-        suits.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        suits.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
 
-        // Group by vector and form the configuration signature.
-        let mut signature: Vec<(Vec<u8>, usize)> = Vec::new();
-        let mut group_indices: Vec<Vec<u64>> = Vec::new();
-        for (vector, idx) in &suits {
-            if signature.last().map(|(v, _)| v) == Some(vector) {
-                let last = signature.last_mut().unwrap();
-                last.1 += 1;
-                group_indices.last_mut().unwrap().push(*idx);
-            } else {
-                signature.push((vector.clone(), 1));
-                group_indices.push(vec![*idx]);
-            }
-        }
+        // The sorted vectors are the configuration signature.
+        let key = ((suits[0].0 as u128) << 96)
+            | ((suits[1].0 as u128) << 64)
+            | ((suits[2].0 as u128) << 32)
+            | suits[3].0 as u128;
+        let config = &self.configs[self.lookup[&key]];
 
-        let config = &self.configs[self.lookup[&signature]];
+        // Combine each group (a run of suits sharing a vector) as a multiset
+        // rank: for ascending indices x_i, rank = Σ_i C(x_i + i, i + 1).
         let mut within = 0u64;
-        for (group, idxs) in config.groups.iter().zip(&group_indices) {
-            within = within * group.group_size + multiset_rank(idxs);
+        let mut si = 0usize;
+        for group in &config.groups {
+            let mut rank = 0u64;
+            for i in 0..group.mult as u64 {
+                rank += choose(suits[si].1 + i, i + 1);
+                si += 1;
+            }
+            within = within * group.group_size + rank;
         }
         config.offset + within
     }
@@ -273,9 +301,7 @@ impl HandIndexer {
         }
         self.size = offset;
         for (i, cfg) in configs.iter().enumerate() {
-            let sig: Vec<(Vec<u8>, usize)> =
-                cfg.groups.iter().map(|g| (g.vector.clone(), g.mult)).collect();
-            self.lookup.insert(sig, i);
+            self.lookup.insert(packed_signature(&cfg.groups, self.rounds), i);
         }
         self.configs = configs;
     }
@@ -358,26 +384,50 @@ fn build_config(vectors: &[Vec<u8>]) -> Config {
 
 /// Colex index of a suit's rank pattern: combine each round's chosen ranks
 /// (ranked among the ranks still unused by this suit) with mixed radixes.
-fn suit_rank_index(per_round_ranks: &[Vec<u8>]) -> u64 {
-    let mut used = 0u16;
+/// Rounds are `u16` rank bitmasks; iterating set bits low→high yields the colex
+/// positions already sorted, so the rank accumulates without a buffer.
+#[inline]
+fn suit_rank_index_masks(masks: &[u16; MAX_ROUNDS], rounds: usize) -> u64 {
+    let mut used: u16 = 0;
     let mut idx = 0u64;
-    for ranks in per_round_ranks {
+    for &m in masks.iter().take(rounds) {
+        let k = m.count_ones() as u64;
         let avail = RANKS as u64 - used.count_ones() as u64;
-        let mut positions: Vec<u64> = ranks
-            .iter()
-            .map(|&rk| {
-                // Position = number of still-unused ranks strictly below `rk`.
-                let lower = (1u16 << rk) - 1;
-                (!used & lower).count_ones() as u64
-            })
-            .collect();
-        positions.sort_unstable();
-        idx = idx * choose(avail, ranks.len() as u64) + combination_rank(&positions);
-        for &rk in ranks {
-            used |= 1 << rk;
+        let mut rank_acc = 0u64;
+        let mut i = 0u64;
+        let mut bits = m;
+        while bits != 0 {
+            let rk = bits.trailing_zeros();
+            // Position = number of still-unused ranks strictly below `rk`.
+            let below = (!used & ((1u16 << rk) - 1)).count_ones() as u64;
+            rank_acc += choose_small(below, i + 1);
+            i += 1;
+            bits &= bits - 1;
         }
+        idx = idx * choose_small(avail, k) + rank_acc;
+        used |= m;
     }
     idx
+}
+
+/// The configuration-lookup key: the four suits' per-round count vectors in the
+/// group order (descending), each packed into a `u32` with round 0 in the high
+/// byte, concatenated into a `u128`.  Bijective with the group signature, since
+/// groups are exactly the runs of equal vectors.
+fn packed_signature(groups: &[Group], rounds: usize) -> u128 {
+    let mut vs = [0u32; SUITS];
+    let mut si = 0;
+    for g in groups {
+        let mut packed = 0u32;
+        for (r, &c) in g.vector.iter().take(rounds).enumerate() {
+            packed |= (c as u32) << (24 - 8 * r);
+        }
+        for _ in 0..g.mult {
+            vs[si] = packed;
+            si += 1;
+        }
+    }
+    ((vs[0] as u128) << 96) | ((vs[1] as u128) << 64) | ((vs[2] as u128) << 32) | vs[3] as u128
 }
 
 /// Inverse of [`suit_rank_index`]: the per-round rank lists for pattern `idx` of
@@ -460,7 +510,7 @@ mod tests {
         let ix = HandIndexer::new(&[2]);
         assert_eq!(ix.size(), 169);
         // Every 2-card hand maps into 0..169 and the range is dense.
-        let mut seen = vec![false; 169];
+        let mut seen = [false; 169];
         for a in 0..52u8 {
             for b in (a + 1)..52u8 {
                 let i = ix.index(&[a, b]);

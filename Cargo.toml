@@ -4,3 +4,12 @@ members = [
     "crates/poker-ai",
 ]
 resolver = "2"
+
+# CFR training/evaluation is numeric hot-loop code: unoptimized test builds run
+# it 20-50x slower, which made `cargo test` take minutes. Optimize test builds
+# (debug assertions stay on) so the full suite is a routine pre-commit gate.
+[profile.test]
+opt-level = 2
+
+[profile.test.package."*"]
+opt-level = 2

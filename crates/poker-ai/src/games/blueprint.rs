@@ -1,11 +1,9 @@
-//! Sampled, card-abstracted heads-up NLHE — the real blueprint target
-//! (Phase 2 → Phase 3).
+//! Sampled, card-abstracted heads-up NLHE — the real blueprint target.
 //!
 //! The curated-deal bridge ([`super::nlhe`]) proved the wiring by enumerating a
 //! handful of concrete deals.  A blueprint cannot enumerate: the chance space is
 //! every hole-card and board combination, ~10^9 deals before the betting tree
-//! even begins.  This module closes the two gaps the bridge left open, exactly
-//! the pieces the plan reserves for here:
+//! even begins.  This module closes the two gaps the bridge left open:
 //!
 //!  1. **Sampled chance.**  [`Game::sample_chance`] deals a fresh random board
 //!     and both hands by partial Fisher–Yates over a 52-card deck, so the
@@ -146,10 +144,11 @@ impl BlueprintHoldem {
         self
     }
 
-    /// Cap the betting abstraction at `cap` raises per street (the feasibility
-    /// lever in `memory_estimate`: cap 1 ≈ 297 MB / 9.3 M heads-up info sets,
-    /// cap 2 ≈ 53 GB).  `0` is treated as `1` (at least the opening raise must
-    /// stay legal or the tree degenerates to check/call only).
+    /// Cap the betting abstraction at `cap` raises per street — the tree-size
+    /// lever (`memory_estimate` prints the exact footprint per stack × cap;
+    /// heads-up 20 bb cap-2 is ~4.6 M info sets ≈ 0.16 GB on the SoA store).
+    /// `0` is treated as `1` (at least the opening raise must stay legal or the
+    /// tree degenerates to check/call only).
     pub fn with_raise_cap(mut self, cap: u32) -> Self {
         self.raise_cap = cap.max(1);
         self
@@ -786,7 +785,7 @@ mod tests {
             .with_indexing();
 
         let cap = game.info_set_capacity();
-        assert!(cap >= 169 && cap % 169 == 0, "preflop-only capacity is a multiple of 169, got {cap}");
+        assert!(cap >= 169 && cap.is_multiple_of(169), "preflop-only capacity is a multiple of 169, got {cap}");
 
         // The dense index and the HashMap info key must induce the SAME partition,
         // and info_key_at must invert the index back to that key.
@@ -812,6 +811,54 @@ mod tests {
     /// street, that `info_key_at` inverts it, and that the SoA solver trains over
     /// the indexed full game to valid distributions.
     ///   cargo test -p poker-ai --release -- --ignored indexed_blueprint_postflop_and_soa
+    /// Throughput comparison of the three SoA training paths on a realistic
+    /// indexed blueprint tree (20 bb, cap-2) — the parallel-scaling
+    /// deliverable.  Prints nodes/s per configuration; the assertions are a
+    /// loose sanity ordering so a busy machine cannot flake the test.
+    ///   cargo test -p poker-ai --release -- --ignored --nocapture atomic_scaling
+    #[test]
+    #[ignore]
+    fn atomic_scaling_benchmark() {
+        use crate::solver::cfr::Variant;
+        use crate::solver::dcfr::Discount;
+        use crate::solver::mccfr::SoaMccfr;
+        use std::time::Instant;
+
+        let mk = || {
+            BlueprintHoldem::new(40, 2, 1, 0)
+                .with_raise_cap(2)
+                .with_street_bucket(0, BucketMap::full_coverage_mod(&[2, 3], 40))
+                .with_street_bucket(1, BucketMap::full_coverage_mod(&[2, 4], 40))
+                .with_street_bucket(2, BucketMap::full_coverage_mod(&[2, 5], 40))
+                .with_indexing()
+        };
+        let iters = 200_000u64;
+        let mut bench = |name: &str, f: &mut dyn FnMut(&mut SoaMccfr<BlueprintHoldem>)| -> f64 {
+            let mut s =
+                SoaMccfr::with_seed(mk(), Variant::Dcfr(Discount::RECOMMENDED), 1).with_baseline();
+            let t0 = Instant::now();
+            f(&mut s);
+            let secs = t0.elapsed().as_secs_f64();
+            let nps = s.nodes_visited() as f64 / secs;
+            println!("{name:>16}: {secs:6.2}s  {nps:>12.0} nodes/s");
+            nps
+        };
+
+        let serial = bench("serial", &mut |s| s.train(iters));
+        let parallel = bench("parallel(512)", &mut |s| s.train_parallel(iters, 512));
+        let mut atomic_best = 0.0f64;
+        for threads in [1usize, 2, 4, 8] {
+            let name = format!("atomic({threads})");
+            let nps = bench(&name, &mut |s| s.train_atomic(iters, threads));
+            atomic_best = atomic_best.max(nps);
+        }
+        assert!(atomic_best > serial, "atomic best {atomic_best} should beat serial {serial}");
+        assert!(
+            atomic_best > parallel,
+            "atomic best {atomic_best} should beat batched parallel {parallel}"
+        );
+    }
+
     #[test]
     #[ignore]
     fn indexed_blueprint_postflop_and_soa() {

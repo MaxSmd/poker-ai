@@ -87,7 +87,7 @@ fn main() {
     };
     order.sort_by(|&a, &b| mean_eq(&buckets[a]).partial_cmp(&mean_eq(&buckets[b])).unwrap());
 
-    println!("{:>3}  {:>5}  {:>17}   {}", "blt", "n", "equity min/mean/max", "examples (by equity)");
+    println!("{:>3}  {:>5}  {:>17}   examples (by equity)", "blt", "n", "equity min/mean/max");
     for (rank, &b) in order.iter().enumerate() {
         let mut members = buckets[b].clone();
         if members.is_empty() {

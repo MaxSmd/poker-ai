@@ -1,4 +1,4 @@
-//! Canonical equity cache (Phase 2) — a **flat array** over the dense hand
+//! Canonical equity cache — a **flat array** over the dense hand
 //! index.
 //!
 //! Equity-distribution computation over millions of boards is the most

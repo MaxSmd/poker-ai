@@ -1,6 +1,6 @@
 //! Small, exactly-solvable extensive-form games used to validate the solver.
 //!
-//! The plan (Phase 3, validation protocol) is explicit: the blueprint solver
+//! The validation protocol is explicit: the blueprint solver
 //! must be proven correct on games with known equilibria — Kuhn and Leduc —
 //! *before* it is trusted on full No-Limit Hold'em.  A bug in a sampled 6-max
 //! MCCFR loop manifests as "convergence is weird", not a crash, so the only way

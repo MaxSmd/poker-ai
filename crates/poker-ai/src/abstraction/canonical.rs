@@ -150,7 +150,7 @@ mod tests {
     fn preflop_index_is_a_169_class_bijection() {
         // Dense over 0..169, and partitions hands exactly as the indexer does.
         let ix = HandIndexer::new(&[2]);
-        let mut seen = vec![false; 169];
+        let mut seen = [false; 169];
         let mut pairs: Vec<(u16, u64)> = Vec::new();
         for a in 0..52u8 {
             for b in (a + 1)..52u8 {

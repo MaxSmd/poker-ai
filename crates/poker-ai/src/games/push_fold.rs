@@ -17,7 +17,7 @@
 //!
 //! That is ~169 + 169 information sets (one decision per suit-canonical starting
 //! hand per player), it plateaus, and it has a well-known Nash solution to
-//! validate against — exactly the plan's "prove it on a known-solution game
+//! validate against — exactly the "prove it on a known-solution game
 //! first" discipline, now over the real `poker-core` engine: the all-in runout
 //! and showdown come from the real evaluator, and payoffs are real chip deltas.
 //!
@@ -368,6 +368,60 @@ mod tests {
         // budget is about.
         let soa = SoaMccfr::new(PushFoldHoldem::new(40, 2, 1, 0), Variant::Vanilla);
         assert_eq!(soa.bytes_per_info_set(), 24);
+    }
+
+    /// Export a trained SoA solver back to the `HashMap` strategy artifact
+    /// (`preflop_key`-keyed), so the exploitability estimator can score it.
+    fn export_soa(soa: &SoaMccfr<PushFoldHoldem>) -> std::collections::HashMap<u64, Vec<f64>> {
+        let mut out = std::collections::HashMap::new();
+        for a in 0..52u8 {
+            for b in (a + 1)..52u8 {
+                let hole = [a, b];
+                let class = preflop_index(&hole) as usize;
+                for (depth, history) in [(0usize, &[][..]), (1, &[1u8][..])] {
+                    let idx = depth * 169 + class;
+                    if soa.is_visited(idx) {
+                        let key = PushFoldHoldem::preflop_key(depth, &hole, history);
+                        out.entry(key).or_insert_with(|| soa.average_strategy_at(idx));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn atomic_converges_like_the_serial_soa() {
+        // The lock-free atomic trainer must reach a solution as close to Nash
+        // as the serial SoA reference.  It is NOT bit-deterministic (thread
+        // interleaving races float updates — the documented trade), and its
+        // per-iteration RNG streams differ from the serial chain, so per-hand
+        // probabilities are only comparable up to Monte-Carlo noise (~0.05 mean
+        // at this budget even between two SERIAL seeds).  The principled gate
+        // is therefore exploitability: both strategies must be near-Nash, and
+        // the atomic one no worse than the serial one beyond estimator noise.
+        use crate::evaluation::exploitability::push_fold_exploitability;
+        let iters = 1_000_000;
+        let cfg = || PushFoldHoldem::new(40, 2, 1, 0);
+
+        let mut serial = SoaMccfr::with_seed(cfg(), Variant::Dcfr(Discount::RECOMMENDED), 1).with_baseline();
+        serial.train(iters);
+
+        let mut atomic = SoaMccfr::with_seed(cfg(), Variant::Dcfr(Discount::RECOMMENDED), 1).with_baseline();
+        atomic.train_atomic(iters, 4);
+
+        let game = cfg();
+        let expl_serial = push_fold_exploitability(&game, &export_soa(&serial), 200_000, 9);
+        let expl_atomic = push_fold_exploitability(&game, &export_soa(&atomic), 200_000, 9);
+        assert!(expl_atomic < 0.12, "atomic-trained strategy exploitability {expl_atomic} bb too high");
+        assert!(
+            expl_atomic < expl_serial + 0.03,
+            "atomic ({expl_atomic} bb) materially worse than serial ({expl_serial} bb)"
+        );
+
+        let aa = atomic.average_strategy_at(preflop_index(&[make_card(12, 0), make_card(12, 1)]) as usize)[1];
+        let trash = atomic.average_strategy_at(preflop_index(&[make_card(5, 0), make_card(0, 1)]) as usize)[1];
+        assert!(aa > 0.9 && aa > trash, "atomic chart shape: AA {aa} vs 72o {trash}");
     }
 
     #[test]

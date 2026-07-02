@@ -1,464 +1,420 @@
-//! Estimate the blueprint's information-set count and memory footprint for a
-//! given card- and action-abstraction, and compare it against common RAM
-//! budgets.  The plan (Memory Budget — Do This First) is explicit: *run this
-//! before buying RAM or finalizing bucket counts.*
+//! Measure the blueprint's **exact** information-set count and SoA memory
+//! footprint for 2-player and 6-max, over a matrix of (stack depth × raise
+//! cap), with the current card-bucket counts.
 //!
-//! ## What dominates, and how this models it
+//! ## Why this is a measurement, not an estimate
 //!
-//! The footprint is `info_sets × actions_per_set × 3 × 4 bytes`.  The `3` is the
-//! per-(info set, action) accumulator count in v3 — regret, strategy-sum, and
-//! the **baseline** value for VR-MCCFR (v2 had only 2).  The hard part is the
-//! **betting-sequence multiplier**: how many distinct public action histories
-//! reach a decision on each street.  Rather than guess one, this tool
-//! *enumerates the abstract betting tree* with a configurable per-street raise
-//! cap, and — crucially — distinguishes the number of *opening-bet* sizes from
-//! the number of *re-raise* sizes, because giving every re-raise the full size
-//! menu is what makes a naive count explode by orders of magnitude.
+//! An early version of this tool *guessed* the footprint from a generic
+//! betting-tree model and was off by ~400× (it ignored stack depth). The only
+//! honest number comes from enumerating the **actual** abstract betting tree —
+//! the same recursion as `BlueprintHoldem::walk_tree` (same skeleton deal, same
+//! `capped_legal` filter, same `next_raises` bookkeeping), driven by the real
+//! `poker-core` engine.
 //!
-//! ## The dominant lever
+//! Heads-up, `BlueprintHoldem::with_indexing` builds that tree explicitly. For
+//! 6-max no game implementation exists yet, but the tree is still exactly
+//! enumerable: legal actions depend only on the **public** chip state (stacks /
+//! bets / pot / street / masks), never on card identities. Two histories that
+//! reach the same public state therefore root *identical* subtrees, so the
+//! walker memoizes per-street node/slot counts on the public state and folds
+//! the sequence tree into its public-state DAG — exact per-sequence counts at
+//! DAG cost. Info sets = Σ over streets (decision nodes × card buckets).
 //!
-//! The betting tree compounds multiplicatively across the four streets, so the
-//! **raise cap** is the single biggest driver of feasibility.  The report prints
-//! a sensitivity row over caps 1–3 so the explosion is visible, not hidden in a
-//! single number.
+//! **Correctness gate:** the walker must reproduce, to the exact info set, the
+//! number the real `with_indexing` produced on the server (heads-up 20 bb /
+//! cap-2 / 169·500·500·800 buckets = 4,631,870) — asserted in a unit test and
+//! cross-checked at runtime whenever `data/{flop,turn,river}_buckets.bin` are
+//! present.
 //!
-//! ## Modeling caveats (kept honest)
+//! ## Footprints reported
 //!
-//! * Folds are tracked across streets, so active-player subsets and position
-//!   fall out of the enumeration naturally.
-//! * The actor at each node is the next player still owing action in seat
-//!   order; exact blind/rotation detail is simplified — affects ordering, not
-//!   counts materially.
-//! * All-in is one extra aggressive branch under the cap, not exact stack math.
-//! * Card buckets per street and the bet/raise size counts are inputs (the
-//!   plan's targets), not computed.
+//! * **f32 SoA** (the current store): regret + strategy-sum + baseline, one
+//!   `f32` each per (info set, action) slot, plus a 5-byte per-info-set index.
+//! * **lean** (the proposed quantized store for the big 6-max run): `i16`
+//!   regret + `u16` strategy-sum per slot (Linear-MCCFR regime, where integer
+//!   quantization is known to work — DCFR+bf16 was tried and rejected), plus a
+//!   per-info-set `f32` baseline and the same index.
 //!
-//! Treat the output as a well-grounded order-of-magnitude figure for the
-//! *when do I need a server* decision, not a to-the-byte count.
+//! Usage (from the repo root):
+//!   memory_estimate [flop_buckets] [turn_buckets] [river_buckets]
+//! Defaults: 500 500 800 (the current cluster build). Pre-flop is always the
+//! 169 canonical classes. `POKER_AI_ESTIMATE_STATES` caps the memo (default
+//! 15M states ≈ a few GB); a config that exceeds it is reported as truncated.
 
 use std::collections::HashMap;
+use std::path::Path;
+use std::time::Instant;
 
-use poker_core::betting::{FLOP_BET_FRACS, PREFLOP_BET_FRACS, RIVER_BET_FRACS, TURN_BET_FRACS};
+use poker_ai::abstraction::bucket_map::BucketMap;
+use poker_ai::games::blueprint::BlueprintHoldem;
+use poker_ai::games::IndexedGame;
+use poker_core::action::{Action, ActionList};
+use poker_core::legal_actions;
+use poker_core::state::{GameState, MAX_PLAYERS, NO_CARD};
 
-const BYTES_PER_ENTRY: f64 = 3.0 * 4.0; // regret + strategy_sum + baseline, f32 each
-const STREETS: usize = 4;
-const STREET_NAMES: [&str; STREETS] = ["preflop", "flop", "turn", "river"];
+/// Match the trainer's blinds ([`crate::bin::train`]); stack(chips) = bb × BIG_BLIND.
+const BIG_BLIND: u32 = 2;
+const SMALL_BLIND: u32 = 1;
+/// Current store: regret + strategy-sum + baseline, one `f32` each, per slot.
+const BYTES_PER_SLOT: usize = 3 * 4;
+/// Per-info-set index overhead: `offsets` (u32) + `num_actions` (u8).
+const INDEX_BYTES_PER_INFOSET: usize = 4 + 1;
+/// Lean store: `i16` regret + `u16` strategy-sum per slot…
+const LEAN_BYTES_PER_SLOT: usize = 2 + 2;
+/// …plus a per-info-set `f32` baseline on top of the same index.
+const LEAN_BYTES_PER_INFOSET: usize = INDEX_BYTES_PER_INFOSET + 4;
+/// Card-bucket maps loaded at train time, constant across the whole matrix:
+/// flop 1.29M + turn 13.96M + river 123.16M situations × 2 bytes (u16).
+const BUCKET_MAP_BYTES: usize = (1_286_792 + 13_960_050 + 123_156_254) * 2;
 
-/// Abstraction parameters to evaluate.
-#[derive(Clone)]
-struct Config {
-    label: &'static str,
-    players: usize,
-    /// Card buckets per street (preflop, flop, turn, river).
-    buckets: [f64; STREETS],
-    /// Number of abstract *opening-bet* sizes per street.
-    bet_sizes: [usize; STREETS],
-    /// Number of abstract *re-raise* sizes per street (usually fewer).
-    raise_sizes: [usize; STREETS],
-    /// Whether all-in adds an extra aggressive branch.
-    include_allin: bool,
-    /// Maximum number of aggressive actions (bets + raises) **per street** — real
-    /// systems cap raises lower on deeper streets (and lean on search there).
-    max_raises: [u8; STREETS],
-    /// Fraction of the naive (bucket × betting-sequence) cross product that is
-    /// actually *stored*: `1.0` is the upper-bound enumeration; a value below 1
-    /// models that most combinations are unreachable and that imperfect-recall
-    /// abstraction collapses many situations into one — the difference between a
-    /// textbook count and what a system like Pluribus held in RAM.
-    reachable_fraction: f64,
-}
+// ---------------------------------------------------------------------------
+// The abstract betting-tree walker (mirrors BlueprintHoldem::walk_tree).
+// ---------------------------------------------------------------------------
 
-/// Per-street tallies produced by the betting-tree enumeration.
+/// Per-street decision-node and action-slot counts of a (sub)tree, indexed by
+/// street 0..=3 (pre-flop / flop / turn / river).
 #[derive(Clone, Copy, Default)]
-struct StreetTally {
-    decision_nodes: f64,
-    action_slots: f64,
+struct Counts {
+    nodes: [u64; 4],
+    slots: [u64; 4],
 }
 
-/// Key identifying a betting-subtree shape for memoization.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct StateKey {
+impl Counts {
+    fn add(&mut self, o: &Counts) {
+        for s in 0..4 {
+            self.nodes[s] = self.nodes[s].saturating_add(o.nodes[s]);
+            self.slots[s] = self.slots[s].saturating_add(o.slots[s]);
+        }
+    }
+}
+
+/// Everything the engine's legal-action generator and street bookkeeping can
+/// read — card identities excluded (they never affect betting legality). Two
+/// nodes with equal keys root identical subtrees.
+#[derive(Hash, PartialEq, Eq)]
+struct PublicKey {
     street: u8,
-    in_hand: u8,
-    need: u8,
     to_act: u8,
-    raises: u8,
-    has_bet: bool,
+    players_to_act: u8,
+    folded: u8,
+    allin: u8,
+    street_raises: u8,
+    current_bet: u32,
+    min_raise: u32,
+    pot: u32,
+    stacks: [u32; MAX_PLAYERS],
+    street_bets: [u32; MAX_PLAYERS],
 }
 
-struct Enumerator {
-    players: usize,
-    bet_sizes: [usize; STREETS],
-    raise_sizes: [usize; STREETS],
-    include_allin: bool,
-    max_raises: [u8; STREETS],
-    memo: HashMap<StateKey, [StreetTally; STREETS]>,
-}
-
-impl Enumerator {
-    /// Aggressive branches available at a node: opening-bet sizes when there is
-    /// no live bet, re-raise sizes when facing one, plus an optional all-in.
-    fn aggressive_branches(&self, street: usize, has_bet: bool) -> usize {
-        let sizes = if has_bet { self.raise_sizes[street] } else { self.bet_sizes[street] };
-        sizes + if self.include_allin { 1 } else { 0 }
-    }
-
-    /// Next player still owing action, scanning seats in order from `from`.
-    fn next_actor(&self, need: u8, from: u8) -> Option<u8> {
-        for off in 0..self.players as u8 {
-            let p = (from + off) % self.players as u8;
-            if need & (1 << p) != 0 {
-                return Some(p);
-            }
-        }
-        None
-    }
-
-    /// Enumerate the subtree from a fresh betting round on `street`.
-    fn round(&mut self, street: usize, in_hand: u8) -> [StreetTally; STREETS] {
-        let need = in_hand;
-        let to_act = self.next_actor(need, 0).unwrap_or(0);
-        self.node(StateKey { street: street as u8, in_hand, need, to_act, raises: 0, has_bet: false })
-    }
-
-    /// Enumerate the subtree rooted at one decision node.
-    fn node(&mut self, key: StateKey) -> [StreetTally; STREETS] {
-        if let Some(&cached) = self.memo.get(&key) {
-            return cached;
-        }
-        let street = key.street as usize;
-        let mut tally = [StreetTally::default(); STREETS];
-        let mut actions = 0.0;
-        let actor_bit = 1u8 << key.to_act;
-        let others = key.in_hand & !actor_bit;
-
-        // Fold (only when facing a bet).
-        if key.has_bet {
-            actions += 1.0;
-            if others.count_ones() >= 2 {
-                let need = key.need & !actor_bit;
-                add(&mut tally, self.after(street, others, need, key.to_act, key.raises, key.has_bet));
-            }
-        }
-
-        // Check or call (always legal).
-        actions += 1.0;
-        {
-            let need = key.need & !actor_bit;
-            add(&mut tally, self.after(street, key.in_hand, need, key.to_act, key.raises, key.has_bet));
-        }
-
-        // Bet or raise (under this street's cap).
-        if (key.raises as usize) < self.max_raises[street] as usize {
-            for _ in 0..self.aggressive_branches(street, key.has_bet) {
-                actions += 1.0;
-                let need = key.in_hand & !actor_bit;
-                add(&mut tally, self.after(street, key.in_hand, need, key.to_act, key.raises + 1, true));
-            }
-        }
-
-        tally[street].decision_nodes += 1.0;
-        tally[street].action_slots += actions;
-        self.memo.insert(key, tally);
-        tally
-    }
-
-    /// Advance after an action: continue the round, close the street, or end.
-    fn after(
-        &mut self,
-        street: usize,
-        in_hand: u8,
-        need: u8,
-        last_actor: u8,
-        raises: u8,
-        has_bet: bool,
-    ) -> [StreetTally; STREETS] {
-        if let Some(next) = self.next_actor(need, (last_actor + 1) % self.players as u8) {
-            self.node(StateKey { street: street as u8, in_hand, need, to_act: next, raises, has_bet })
-        } else if street + 1 < STREETS {
-            self.round(street + 1, in_hand)
-        } else {
-            [StreetTally::default(); STREETS]
+impl PublicKey {
+    fn of(gs: &GameState, street_raises: u8) -> Self {
+        Self {
+            street: gs.street,
+            to_act: gs.to_act,
+            players_to_act: gs.players_to_act,
+            folded: gs.folded,
+            allin: gs.allin,
+            street_raises,
+            current_bet: gs.current_bet,
+            min_raise: gs.min_raise,
+            pot: gs.pot,
+            stacks: gs.stacks,
+            street_bets: gs.street_bets,
         }
     }
 }
 
-fn add(dst: &mut [StreetTally; STREETS], src: [StreetTally; STREETS]) {
-    for s in 0..STREETS {
-        dst[s].decision_nodes += src[s].decision_nodes;
-        dst[s].action_slots += src[s].action_slots;
+/// Mirror of `BlueprintHoldem::capped_legal` (private there; the HU data-point
+/// test gates the two staying in lock-step): at/over the cap drop all `Raise`s
+/// and any *voluntary* `AllIn`, but keep a forced all-in call.
+fn capped_legal(gs: &GameState, street_raises: u8, raise_cap: u32) -> ActionList {
+    let full = legal_actions(gs);
+    if (street_raises as u32) < raise_cap {
+        return full;
+    }
+    let has_passive = full.iter().any(|a| matches!(a, Action::Check | Action::Call));
+    let mut buf = [Action::Fold; 8];
+    let mut n = 0;
+    for &a in full.iter() {
+        let drop = matches!(a, Action::Raise(_)) || (matches!(a, Action::AllIn) && has_passive);
+        if !drop {
+            buf[n] = a;
+            n += 1;
+        }
+    }
+    ActionList::from_actions(&buf[..n])
+}
+
+/// Mirror of `BlueprintHoldem::next_raises`: reset on a street change, +1 when
+/// the bet level rose, unchanged otherwise.
+fn next_raises(prev: u8, old_street: u8, old_bet: u32, gs: &GameState) -> u8 {
+    if gs.street != old_street {
+        0
+    } else if gs.current_bet > old_bet {
+        prev.saturating_add(1)
+    } else {
+        prev
     }
 }
 
-fn enumerate(cfg: &Config, max_raises: [u8; STREETS]) -> [StreetTally; STREETS] {
-    let mut e = Enumerator {
-        players: cfg.players,
-        bet_sizes: cfg.bet_sizes,
-        raise_sizes: cfg.raise_sizes,
-        include_allin: cfg.include_allin,
-        max_raises,
-        memo: HashMap::new(),
-    };
-    let all_in = (1u8 << cfg.players) - 1;
-    e.round(0, all_in)
+struct Walker {
+    raise_cap: u32,
+    memo: HashMap<PublicKey, Counts>,
+    limit: usize,
+    truncated: bool,
 }
 
-/// Total footprint in bytes for a given enumeration, after applying the
-/// reachability / imperfect-recall collapse factor.
-fn footprint(cfg: &Config, tally: &[StreetTally; STREETS]) -> (f64, f64) {
-    let mut info_sets = 0.0;
-    let mut bytes = 0.0;
-    for s in 0..STREETS {
-        info_sets += tally[s].decision_nodes * cfg.buckets[s];
-        bytes += cfg.buckets[s] * tally[s].action_slots * BYTES_PER_ENTRY;
-    }
-    (info_sets * cfg.reachable_fraction, bytes * cfg.reachable_fraction)
-}
-
-fn report(cfg: &Config) {
-    println!("\n══════════════════════════════════════════════════════════════");
-    println!(" {}  ({} players, all-in {})", cfg.label, cfg.players, if cfg.include_allin { "on" } else { "off" });
-    println!("══════════════════════════════════════════════════════════════");
-
-    // Per-street detail at the configured per-street caps.
-    let tally = enumerate(cfg, cfg.max_raises);
-    println!(
-        "Per-street raise caps {:?}, bet sizes {:?}, reraises {:?}, store fraction {}:",
-        cfg.max_raises, cfg.bet_sizes, cfg.raise_sizes, cfg.reachable_fraction
-    );
-    println!("{:<8}  {:>14}  {:>8}  {:>16}", "street", "betting seqs", "buckets", "info sets");
-    for s in 0..STREETS {
-        println!(
-            "{:<8}  {:>14}  {:>8}  {:>16}",
-            STREET_NAMES[s],
-            fmt_count(tally[s].decision_nodes),
-            cfg.buckets[s] as u64,
-            fmt_count(tally[s].decision_nodes * cfg.buckets[s] * cfg.reachable_fraction),
-        );
-    }
-    let (info_sets, bytes) = footprint(cfg, &tally);
-    println!("total info sets : {}", fmt_count(info_sets));
-    println!(
-        "total memory    : {}   8GB:{:<4} 64GB:{:<4} 128GB:{:<4} 512GB:{}",
-        fmt_bytes(bytes),
-        fits(bytes, 8.0 * 0.5),
-        fits(bytes, 64.0 * 0.8),
-        fits(bytes, 128.0 * 0.8),
-        fits(bytes, 512.0 * 0.8),
-    );
-
-    // Sensitivity over a uniform raise cap — the dominant feasibility lever.
-    println!("\nSensitivity to a uniform raise cap (total memory):");
-    for cap in 1..=3u8 {
-        let t = enumerate(cfg, [cap; STREETS]);
-        let (is, b) = footprint(cfg, &t);
-        println!(
-            "  cap {cap}: {:>12}   info sets {:>10}   8GB:{:<4} 64GB:{:<4} 128GB:{:<4} 512GB:{}",
-            fmt_bytes(b),
-            fmt_count(is),
-            fits(b, 8.0 * 0.5),
-            fits(b, 64.0 * 0.8),
-            fits(b, 128.0 * 0.8),
-            fits(b, 512.0 * 0.8),
-        );
+impl Walker {
+    /// Exact per-sequence counts of the subtree at `gs`, folded over the
+    /// public-state DAG. Walks with the engine's own apply/undo (zero clones).
+    fn count(&mut self, gs: &mut GameState, street_raises: u8) -> Counts {
+        if gs.is_terminal() {
+            return Counts::default();
+        }
+        let key = PublicKey::of(gs, street_raises);
+        if let Some(c) = self.memo.get(&key) {
+            return *c;
+        }
+        if self.truncated || self.memo.len() >= self.limit {
+            self.truncated = true;
+            return Counts::default();
+        }
+        let acts = capped_legal(gs, street_raises, self.raise_cap);
+        let s = gs.street as usize;
+        let mut c = Counts::default();
+        c.nodes[s] = 1;
+        c.slots[s] = acts.len() as u64;
+        for i in 0..acts.len() {
+            let (old_street, old_bet) = (gs.street, gs.current_bet);
+            gs.apply_action(acts[i]);
+            let sr = next_raises(street_raises, old_street, old_bet, gs);
+            let child = self.count(gs, sr);
+            gs.undo_action();
+            c.add(&child);
+        }
+        // A truncated expansion holds partial counts — don't poison the memo.
+        if !self.truncated {
+            self.memo.insert(key, c);
+        }
+        c
     }
 }
 
-fn fits(bytes: f64, usable_gb: f64) -> &'static str {
-    if bytes <= usable_gb * 1e9 { "yes" } else { "NO" }
+/// Skeleton deal: any distinct real cards drive the public tree (identities are
+/// irrelevant to betting legality) — same trick as `BlueprintHoldem`.
+fn skeleton(num_players: u8, stack: u32) -> GameState {
+    let n = num_players as usize;
+    let mut holes = [[NO_CARD; 2]; MAX_PLAYERS];
+    for (p, h) in holes.iter_mut().take(n).enumerate() {
+        *h = [(2 * p) as u8, (2 * p + 1) as u8];
+    }
+    let board: [u8; 5] = std::array::from_fn(|i| (2 * n + i) as u8);
+    let mut stacks = [0u32; MAX_PLAYERS];
+    stacks[..n].fill(stack);
+    GameState::new(num_players, BIG_BLIND, SMALL_BLIND, stacks, holes, board, 0)
 }
 
-fn fmt_count(x: f64) -> String {
+struct Measurement {
+    counts: Counts,
+    states: usize,
+    truncated: bool,
+    secs: f64,
+}
+
+fn enumerate_tree(num_players: u8, stack_bb: u32, cap: u32, limit: usize) -> Measurement {
+    let mut gs = skeleton(num_players, stack_bb * BIG_BLIND);
+    let mut w = Walker { raise_cap: cap.max(1), memo: HashMap::new(), limit, truncated: false };
+    let t = Instant::now();
+    let counts = w.count(&mut gs, 0);
+    Measurement { counts, states: w.memo.len(), truncated: w.truncated, secs: t.elapsed().as_secs_f64() }
+}
+
+/// `(info sets, action slots)` for per-street betting counts × card buckets.
+fn table_size(counts: &Counts, buckets: [u64; 4]) -> (u64, u64) {
+    let info_sets = (0..4).map(|s| counts.nodes[s] * buckets[s]).sum();
+    let slots = (0..4).map(|s| counts.slots[s] * buckets[s]).sum();
+    (info_sets, slots)
+}
+
+fn f32_bytes(info_sets: u64, slots: u64) -> u64 {
+    slots * BYTES_PER_SLOT as u64 + info_sets * INDEX_BYTES_PER_INFOSET as u64
+}
+
+fn lean_bytes(info_sets: u64, slots: u64) -> u64 {
+    slots * LEAN_BYTES_PER_SLOT as u64 + info_sets * LEAN_BYTES_PER_INFOSET as u64
+}
+
+// ---------------------------------------------------------------------------
+// Formatting
+// ---------------------------------------------------------------------------
+
+fn fmt_count(x: u64) -> String {
+    let x = x as f64;
     if x < 1e3 {
-        format!("{:.0}", x)
+        format!("{x:.0}")
     } else if x < 1e6 {
         format!("{:.1}K", x / 1e3)
     } else if x < 1e9 {
-        format!("{:.1}M", x / 1e6)
+        format!("{:.2}M", x / 1e6)
     } else if x < 1e12 {
-        format!("{:.1}B", x / 1e9)
+        format!("{:.2}B", x / 1e9)
     } else {
-        format!("{:.1}T", x / 1e12)
+        format!("{:.2}T", x / 1e12)
     }
 }
 
-fn fmt_bytes(b: f64) -> String {
+fn fmt_bytes(b: u64) -> String {
+    let b = b as f64;
     if b < 1e9 {
-        format!("{:.1} MB", b / 1e6)
+        format!("{:.0} MB", b / 1e6)
     } else if b < 1e12 {
         format!("{:.2} GB", b / 1e9)
     } else {
-        format!("{:.1} TB", b / 1e12)
+        format!("{:.2} TB", b / 1e12)
     }
 }
 
-fn main() {
-    println!("Memory estimate — betting-tree enumeration over the action abstraction.");
-    println!(
-        "Opening-bet sizes from poker_core::betting: preflop={}, flop={}, turn={}, river={}.",
-        PREFLOP_BET_FRACS.len(),
-        FLOP_BET_FRACS.len(),
-        TURN_BET_FRACS.len(),
-        RIVER_BET_FRACS.len()
-    );
-    if TURN_BET_FRACS.len() != 2 {
+// ---------------------------------------------------------------------------
+// Optional runtime cross-check against the real dense index (needs full maps).
+// ---------------------------------------------------------------------------
+
+const STREETS: [(usize, &str); 3] = [(0, "flop"), (1, "turn"), (2, "river")];
+
+fn cross_check_hu(dir: &Path, limit: usize) {
+    if !STREETS.iter().all(|(_, name)| dir.join(format!("{name}_buckets.bin")).exists()) {
         println!(
-            "NOTE: v3 calls for 2 turn bet sizes (0.5, 1.0); betting.rs defines {}. The turn \
-             multiplies through turn+river, so trimming it is the cheapest memory win.",
-            TURN_BET_FRACS.len()
+            "(cross-check vs the real BlueprintHoldem index skipped — \
+             data/*_buckets.bin incomplete on this machine; the unit-test gate \
+             against the recorded server measurement still applies)\n"
         );
+        return;
     }
+    let mut buckets = [169u64, 0, 0, 0];
+    let mut game = BlueprintHoldem::new(20 * BIG_BLIND, BIG_BLIND, SMALL_BLIND, 0).with_raise_cap(2);
+    for (street, name) in STREETS {
+        let map = BucketMap::load(dir.join(format!("{name}_buckets.bin")))
+            .unwrap_or_else(|e| panic!("load {name}_buckets.bin: {e}"));
+        buckets[street + 1] = map.num_buckets() as u64;
+        game = game.with_street_bucket(street, map);
+    }
+    let game = game.with_indexing();
+    let real = game.info_set_capacity() as u64;
+    let (walked, _) = table_size(&enumerate_tree(2, 20, 2, limit).counts, buckets);
+    assert_eq!(walked, real, "walker disagrees with the real dense index — investigate before trusting the matrix");
+    println!("Cross-check vs the real BlueprintHoldem dense index (HU 20bb cap-2): {} info sets — exact match.\n", fmt_count(real));
+}
+
+fn main() {
+    let args: Vec<u64> = std::env::args().skip(1).filter_map(|a| a.parse().ok()).collect();
+    let buckets = [
+        169u64,
+        args.first().copied().unwrap_or(500),
+        args.get(1).copied().unwrap_or(500),
+        args.get(2).copied().unwrap_or(800),
+    ];
+    let limit: usize = std::env::var("POKER_AI_ESTIMATE_STATES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(15_000_000);
+
+    println!("Blueprint memory — EXACT abstract betting-tree enumeration (real poker-core engine).");
     println!(
-        "Re-raise size counts are modeled separately (betting.rs only defines opening sizes); \
-         the plan lists raises as ~2 sizes per street."
+        "Card buckets: preflop=169 flop={} turn={} river={}  |  memo limit {} public states",
+        buckets[1], buckets[2], buckets[3], fmt_count(limit as u64)
+    );
+    println!(
+        "Stores: f32 SoA = {BYTES_PER_SLOT} B/slot + {INDEX_BYTES_PER_INFOSET} B/info-set; \
+         lean = {LEAN_BYTES_PER_SLOT} B/slot + {LEAN_BYTES_PER_INFOSET} B/info-set \
+         (i16 regret + u16 strat-sum + f32 baseline/info-set, Linear-MCCFR regime).\n\
+         Train RAM ≈ table + {} bucket maps. Resident RAM is lower still: untouched\n\
+         slots (unreached sequence×bucket combos) never commit a page.\n",
+        fmt_bytes(BUCKET_MAP_BYTES as u64)
     );
 
-    let bet_sizes = [
-        PREFLOP_BET_FRACS.len(),
-        FLOP_BET_FRACS.len(),
-        TURN_BET_FRACS.len(),
-        RIVER_BET_FRACS.len(),
-    ];
-    // Per the plan's table, re-raises carry ~2 sizes on every street.
-    let raise_sizes = [2usize; STREETS];
+    cross_check_hu(Path::new("data"), limit);
 
-    report(&Config {
-        label: "Heads-up NLHE blueprint",
-        players: 2,
-        buckets: [169.0, 600.0, 600.0, 1000.0],
-        bet_sizes,
-        raise_sizes,
-        include_allin: true,
-        max_raises: [3; STREETS],
-        reachable_fraction: 1.0,
-    });
-
-    report(&Config {
-        label: "6-max NLHE blueprint (naive full-granularity upper bound)",
-        players: 6,
-        buckets: [169.0 * 6.0, 600.0, 600.0, 1000.0],
-        bet_sizes,
-        raise_sizes,
-        include_allin: true,
-        max_raises: [3; STREETS],
-        reachable_fraction: 1.0,
-    });
-
-    // The same 6-max game, modeled the way a search-based system like Pluribus
-    // actually shrinks it: the blueprint stays *coarse on deep streets* (fewer
-    // bet sizes and fewer raises on turn/river, because real-time search refills
-    // the detail at play time), and only the reachable, imperfect-recall-
-    // collapsed fraction of the cross product is stored.  This is what closes the
-    // gap between the textbook enumeration and the ~512 GB Pluribus held in RAM.
-    report(&Config {
-        label: "6-max NLHE (Pluribus-style: coarse deep streets + search + IR collapse)",
-        players: 6,
-        buckets: [169.0 * 6.0, 600.0, 600.0, 1000.0],
-        // Rich early where decisions matter; thin deep where search takes over.
-        bet_sizes: [3, 2, 1, 1],
-        raise_sizes: [2, 1, 1, 1],
-        include_allin: true,
-        // Raises capped low everywhere (Pluribus kept the blueprint shallow and
-        // let search add depth); just one raise on the deep streets.
-        max_raises: [2, 1, 1, 1],
-        // Imperfect recall + unreachable-combo pruning collapses ~10× of the
-        // naive cross product (illustrative, defensible order of magnitude).
-        reachable_fraction: 0.1,
-    });
-
-    // The "can I actually do this on one machine" 6-max config: same coarsening,
-    // but with *very* coarse postflop buckets (the river dominates the footprint,
-    // so shrinking it is the biggest lever).  This is a weak-but-real 6-max
-    // blueprint — not Pluribus-grade, but it FITS, which is the question.
-    report(&Config {
-        label: "6-max NLHE (shoestring: very coarse buckets — fits one box)",
-        players: 6,
-        buckets: [169.0 * 6.0, 100.0, 100.0, 100.0],
-        bet_sizes: [3, 2, 1, 1],
-        raise_sizes: [2, 1, 1, 1],
-        include_allin: true,
-        max_raises: [2, 1, 1, 1],
-        reachable_fraction: 0.1,
-    });
+    for &players in &[2u8, 6] {
+        println!("── {players}-player ─────────────────────────────────────────────────────────────────────────");
+        println!(
+            "{:>7} {:>4}  {:>26}  {:>10}  {:>10}  {:>10}  {:>10}  {:>8}  {:>7}",
+            "stack", "cap", "betting nodes pf/f/t/r", "info sets", "slots", "f32 RAM", "lean RAM", "DAG", "walk"
+        );
+        for &stack_bb in &[20u32, 50, 100] {
+            for cap in 1..=3u32 {
+                let m = enumerate_tree(players, stack_bb, cap, limit);
+                if m.truncated {
+                    println!(
+                        "{:>5}bb {:>4}  aborted: > {} public states (raise POKER_AI_ESTIMATE_STATES)",
+                        stack_bb,
+                        cap,
+                        fmt_count(limit as u64)
+                    );
+                    continue;
+                }
+                let (info_sets, slots) = table_size(&m.counts, buckets);
+                let nodes = m
+                    .counts
+                    .nodes
+                    .iter()
+                    .map(|&n| fmt_count(n))
+                    .collect::<Vec<_>>()
+                    .join("/");
+                println!(
+                    "{:>5}bb {:>4}  {:>26}  {:>10}  {:>10}  {:>10}  {:>10}  {:>8}  {:>6.1}s",
+                    stack_bb,
+                    cap,
+                    nodes,
+                    fmt_count(info_sets),
+                    fmt_count(slots),
+                    fmt_bytes(f32_bytes(info_sets, slots)),
+                    fmt_bytes(lean_bytes(info_sets, slots)),
+                    fmt_count(m.states as u64),
+                    m.secs,
+                );
+            }
+        }
+        println!();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn cfg(players: usize, bet_sizes: [usize; STREETS], raise_sizes: [usize; STREETS]) -> Config {
-        Config {
-            label: "t",
-            players,
-            buckets: [1.0; STREETS],
-            bet_sizes,
-            raise_sizes,
-            include_allin: false,
-            max_raises: [2; STREETS],
-            reachable_fraction: 1.0,
-        }
+    /// THE gate: the walker must reproduce, exactly, the info-set count the
+    /// real `BlueprintHoldem::with_indexing` reported on the server run
+    /// (heads-up, 20 bb, cap-2, buckets 169/500/500/800 → 4,631,870).
+    #[test]
+    fn walker_reproduces_the_measured_hu_blueprint() {
+        let m = enumerate_tree(2, 20, 2, usize::MAX);
+        assert!(!m.truncated);
+        let (info_sets, slots) = table_size(&m.counts, [169, 500, 500, 800]);
+        assert_eq!(info_sets, 4_631_870);
+        // The recorded "0.13 GB / 24 B per info set" assumed ~2 actions per
+        // info set; the walker counts slots exactly (avg ≈ 2.5) → ~160 MB.
+        let bytes = f32_bytes(info_sets, slots) as f64;
+        assert!((0.14e9..0.18e9).contains(&bytes), "got {}", fmt_bytes(bytes as u64));
+    }
+
+    /// 6-max plumbing smoke test: micro stacks collapse the tree to a
+    /// shove-fest that must terminate quickly with a non-empty pre-flop street.
+    #[test]
+    fn six_max_walker_terminates_on_micro_stacks() {
+        let m = enumerate_tree(6, 2, 1, usize::MAX);
+        assert!(!m.truncated);
+        assert!(m.counts.nodes[0] > 0);
     }
 
     #[test]
-    fn check_only_tree_has_two_checks_per_street() {
-        let c = cfg(2, [0; STREETS], [0; STREETS]);
-        let tally = enumerate(&c, [0; STREETS]);
-        for s in 0..STREETS {
-            assert_eq!(tally[s].decision_nodes, 2.0, "two checks on {}", STREET_NAMES[s]);
-        }
+    fn truncation_is_flagged_not_silent() {
+        let m = enumerate_tree(2, 20, 2, 10);
+        assert!(m.truncated);
     }
 
     #[test]
-    fn more_bet_sizes_means_more_sequences() {
-        let base: f64 = enumerate(&cfg(2, [1; STREETS], [1; STREETS]), [2; STREETS])
-            .iter()
-            .map(|t| t.decision_nodes)
-            .sum();
-        let wide: f64 = enumerate(&cfg(2, [3; STREETS], [2; STREETS]), [2; STREETS])
-            .iter()
-            .map(|t| t.decision_nodes)
-            .sum();
-        assert!(wide > base);
-    }
-
-    #[test]
-    fn raise_cap_drives_size() {
-        let c = cfg(2, [3; STREETS], [2; STREETS]);
-        let cap1: f64 = enumerate(&c, [1; STREETS]).iter().map(|t| t.decision_nodes).sum();
-        let cap3: f64 = enumerate(&c, [3; STREETS]).iter().map(|t| t.decision_nodes).sum();
-        assert!(cap3 > cap1 * 2.0, "raise cap should sharply grow the tree");
-    }
-
-    #[test]
-    fn deeper_street_cap_shrinks_the_tree() {
-        // Capping raises lower on deep streets must reduce the count — the lever
-        // the Pluribus-style config uses.
-        let c = cfg(2, [3; STREETS], [2; STREETS]);
-        let uniform: f64 = enumerate(&c, [3; STREETS]).iter().map(|t| t.decision_nodes).sum();
-        let coarse_deep: f64 = enumerate(&c, [3, 2, 1, 1]).iter().map(|t| t.decision_nodes).sum();
-        assert!(coarse_deep < uniform, "lower deep-street caps shrink the tree");
-    }
-
-    #[test]
-    fn reachable_fraction_scales_footprint_linearly() {
-        let mut c = cfg(2, [3; STREETS], [2; STREETS]);
-        c.buckets = [10.0; STREETS];
-        let full = footprint(&c, &enumerate(&c, [2; STREETS]));
-        c.reachable_fraction = 0.1;
-        let collapsed = footprint(&c, &enumerate(&c, [2; STREETS]));
-        assert!((collapsed.1 - full.1 * 0.1).abs() < 1.0, "store fraction scales bytes");
-    }
-
-    #[test]
-    fn six_max_is_larger_than_heads_up() {
-        let hu: f64 = enumerate(&cfg(2, [3, 3, 2, 4], [2; STREETS]), [3; STREETS])
-            .iter()
-            .map(|t| t.decision_nodes)
-            .sum();
-        let six: f64 = enumerate(&cfg(6, [3, 3, 2, 4], [2; STREETS]), [3; STREETS])
-            .iter()
-            .map(|t| t.decision_nodes)
-            .sum();
-        assert!(six > hu);
+    fn fmt_helpers() {
+        assert_eq!(fmt_count(4_631_870), "4.63M");
+        assert_eq!(fmt_bytes(130_000_000), "130 MB");
+        assert_eq!(fmt_bytes(53_000_000_000), "53.00 GB");
     }
 }

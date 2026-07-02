@@ -1,7 +1,7 @@
 //! Discounted Counterfactual Regret Minimization (DCFR) discount schedule.
 //!
-//! Brown & Sandholm, AAAI 2019.  The plan mandates the full three-parameter
-//! form `(α, β, γ) = (1.5, 0, 2)`, not the α-only discount from v2:
+//! Brown & Sandholm, AAAI 2019.  We use the full three-parameter
+//! form `(α, β, γ) = (1.5, 0, 2)`, not an α-only discount:
 //!
 //! * `α = 1.5` — discounts accumulated **positive** regret, suppressing the
 //!   noise of early iterations.
@@ -26,7 +26,7 @@ pub struct Discount {
 }
 
 impl Discount {
-    /// The plan's recommended `(α, β, γ) = (1.5, 0, 2)`.
+    /// The recommended `(α, β, γ) = (1.5, 0, 2)`.
     pub const RECOMMENDED: Discount = Discount { alpha: 1.5, beta: 0.0, gamma: 2.0 };
 
     /// Multiplicative factor applied to accumulated **positive** regret at the

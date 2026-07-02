@@ -1,7 +1,7 @@
 //! Structure-of-Arrays regret storage for the blueprint solver.
 //!
 //! The `HashMap<u64, Node>` store carries five heap `Vec`s of `f64`/`u32` per
-//! information set — ~10× the plan's budget of 3 `f32` accumulators per
+//! information set — ~10× the budget of 3 `f32` accumulators per
 //! (info set, action).  When the info-set space is known up front (an
 //! [`IndexedGame`](crate::games::IndexedGame): street × bucket × betting
 //! sequence → a computed dense index), regrets can live in **flat `f32` arrays**
@@ -128,6 +128,22 @@ impl RegretTable {
         &mut self.baseline[span]
     }
 
+    /// Raw pointers to the three accumulator arrays plus the (immutable) layout,
+    /// for the lock-free atomic trainer (`SoaMccfr::train_atomic`), which must
+    /// update the table concurrently through shared references.  Soundness
+    /// contract: the caller keeps the exclusive borrow of `self` alive for the
+    /// whole training run and performs **every** access to these arrays through
+    /// atomics, so no non-atomic aliases exist while threads race.
+    pub(crate) fn atomic_parts(&mut self) -> (*mut f32, *mut f32, *mut f32, &[u32], &[u8]) {
+        (
+            self.regret.as_mut_ptr(),
+            self.strategy_sum.as_mut_ptr(),
+            self.baseline.as_mut_ptr(),
+            &self.offsets,
+            &self.num_actions,
+        )
+    }
+
     /// Optimistic momentum accumulator (only present when enabled).
     pub fn prev_inst_mut(&mut self, info_set: usize) -> Option<&mut [f32]> {
         if self.prev_inst.is_empty() {
@@ -156,7 +172,7 @@ impl RegretTable {
         if total > 0.0 {
             out.extend(regret.iter().map(|&r| (r as f64).max(0.0) / total));
         } else {
-            out.extend(std::iter::repeat(1.0 / n as f64).take(n));
+            out.extend(std::iter::repeat_n(1.0 / n as f64, n));
         }
     }
 
@@ -169,7 +185,7 @@ impl RegretTable {
         if total > 0.0 {
             out.extend(s.iter().map(|&x| x as f64 / total));
         } else {
-            out.extend(std::iter::repeat(1.0 / n as f64).take(n));
+            out.extend(std::iter::repeat_n(1.0 / n as f64, n));
         }
     }
 

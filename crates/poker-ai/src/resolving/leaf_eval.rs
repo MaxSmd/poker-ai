@@ -109,9 +109,9 @@ impl LeafEvaluator for CheckdownLeafEval {
         let board: Vec<u8> = state.board.iter().copied().filter(|&c| c != NO_CARD).collect();
 
         // Folded players simply lose what they put in.
-        for i in 0..n {
+        for (i, v) in value.iter_mut().enumerate() {
             if state.folded & (1 << i) != 0 {
-                value[i] = -(state.total_committed[i] as f64);
+                *v = -(state.total_committed[i] as f64);
             }
         }
 
@@ -202,9 +202,9 @@ impl MultiContinuationLeaf {
         let pot = state.pot as f64;
         let mut value = vec![0.0; n];
         let active: Vec<usize> = (0..n).filter(|&i| state.folded & (1 << i) == 0).collect();
-        for i in 0..n {
+        for (i, v) in value.iter_mut().enumerate() {
             if state.folded & (1 << i) != 0 {
-                value[i] = -(state.total_committed[i] as f64);
+                *v = -(state.total_committed[i] as f64);
             }
         }
         match active.as_slice() {
@@ -238,7 +238,7 @@ impl LeafEvaluator for MultiContinuationLeaf {
     }
 }
 
-/// Leaf evaluator backed by **blueprint table lookups** — the plan's default
+/// Leaf evaluator backed by **blueprint table lookups** — the default
 /// resolving leaf evaluator.
 ///
 /// At a subgame boundary the most accurate leaf value is the blueprint's own
@@ -247,7 +247,7 @@ impl LeafEvaluator for MultiContinuationLeaf {
 /// caller-supplied function of the leaf state (typically `(hand bucket, board)`,
 /// matching how the blueprint was trained) and returns them directly.
 ///
-/// Crucially, the **fallback is wired in** (the plan is explicit about this): a
+/// Crucially, the **fallback is wired in**: a
 /// leaf the blueprint never stored a value for — an off-tree board, a bucket the
 /// blueprint skipped — is scored by an inner evaluator (default
 /// [`CheckdownLeafEval`]) instead of failing.  So the resolver degrades to the

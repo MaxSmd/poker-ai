@@ -118,8 +118,8 @@ impl GameState {
         assert!({
             let mut seen = [false; 52];
             let mut ok = true;
-            for i in 0..n {
-                for &card in &hole_cards[i] {
+            for cards in &hole_cards[..n] {
+                for &card in cards {
                     if card == NO_CARD {
                         continue;
                     }

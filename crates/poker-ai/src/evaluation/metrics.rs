@@ -7,6 +7,12 @@ pub struct NpsCounter {
     nodes: u64,
 }
 
+impl Default for NpsCounter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NpsCounter {
     pub fn new() -> Self {
         Self { start: Instant::now(), nodes: 0 }

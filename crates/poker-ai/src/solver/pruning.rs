@@ -6,8 +6,8 @@
 //! contributes nothing but compute.  RBP **stops traversing** such branches and
 //! spends the saved iterations on the parts of the tree that still matter.
 //!
-//! The policy is governed by two parameters the plan asks to keep configurable
-//! and sweep on Leduc:
+//! The policy is governed by two parameters kept configurable so they can be
+//! swept on Leduc:
 //!
 //! * **θ (`theta`)** — the regret threshold.  An action counts as "below
 //!   threshold" on an iteration when its cumulative regret is `< θ` (θ is
@@ -15,10 +15,10 @@
 //! * **K (`k`)** — an action is pruned only after it has been below θ for `k`
 //!   *consecutive* iterations, so a single noisy dip does not freeze a branch.
 //!
-//! Pruning is enabled only after `start_fraction` of training (the plan's "first
-//! 20%"), giving regrets time to settle before any branch is frozen.
+//! Pruning is enabled only after `start_fraction` of training (the first 20%),
+//! giving regrets time to settle before any branch is frozen.
 //!
-//! ## Interaction safeguards (the plan's three-way warning)
+//! ## Interaction safeguards
 //!
 //! Pruning interacts with both optimistic updates and the VR-MCCFR baseline: a
 //! frozen branch stops receiving the optimistic correction *and* stops updating
@@ -68,7 +68,7 @@ impl PruningConfig {
     /// every branch is re-touched).  Always true on iteration 0 of a cycle.
     #[inline]
     pub fn is_refresh_iteration(&self, iteration: u64) -> bool {
-        self.refresh_interval != 0 && iteration % self.refresh_interval == 0
+        self.refresh_interval != 0 && iteration.is_multiple_of(self.refresh_interval)
     }
 }
 

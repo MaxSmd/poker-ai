@@ -118,9 +118,9 @@ impl<'a, G: Game> BestResponse<'a, G> {
         } else {
             let key = self.game.info_key(state);
             let strat = self.opp_strategy(key, num_actions);
-            for a in 0..num_actions {
+            for (a, &p) in strat.iter().enumerate() {
                 let child = self.game.apply(state, a);
-                self.collect_members(&child, reach * strat[a]);
+                self.collect_members(&child, reach * p);
             }
         }
     }
@@ -148,9 +148,9 @@ impl<'a, G: Game> BestResponse<'a, G> {
         } else {
             let strat = self.opp_strategy(key, num_actions);
             let mut value = 0.0;
-            for a in 0..num_actions {
+            for (a, &p) in strat.iter().enumerate() {
                 let child = self.game.apply(state, a);
-                value += strat[a] * self.value_below(&child);
+                value += p * self.value_below(&child);
             }
             value
         }
@@ -172,9 +172,9 @@ impl<'a, G: Game> BestResponse<'a, G> {
             .unwrap_or(0);
         let mut action_value = vec![0.0; num_actions];
         for (state, reach) in &members {
-            for a in 0..num_actions {
+            for (a, av) in action_value.iter_mut().enumerate() {
                 let child = self.game.apply(state, a);
-                action_value[a] += reach * self.value_below(&child);
+                *av += reach * self.value_below(&child);
             }
         }
         let best = (0..num_actions)

@@ -158,8 +158,8 @@ mod tests {
     fn make_game(num_players: u8) -> GameState {
         let stacks = [1000u32; MAX_PLAYERS];
         let mut holes = [[NO_CARD; 2]; MAX_PLAYERS];
-        for i in 0..num_players as usize {
-            holes[i] = [make_card(i as u8, 0), make_card(i as u8, 1)];
+        for (i, h) in holes.iter_mut().take(num_players as usize).enumerate() {
+            *h = [make_card(i as u8, 0), make_card(i as u8, 1)];
         }
         let board = [
             make_card(8, 2),

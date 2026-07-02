@@ -362,7 +362,7 @@ mod tests {
         let mut gs = GameState::new(2, 2, 1, [stack; MAX_PLAYERS], holes, board, 0);
         while gs.street < target_street && !gs.is_terminal() {
             let acts = legal_actions(&gs);
-            let act = if acts.iter().any(|&a| a == Action::Check) { Action::Check } else { Action::Call };
+            let act = if acts.contains(&Action::Check) { Action::Check } else { Action::Call };
             gs.apply_action(act);
         }
         gs
