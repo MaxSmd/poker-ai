@@ -329,8 +329,8 @@ impl<G: IndexedGame> SoaMccfr<G, RegretTable> {
         }
         for (key, s) in delta.strat {
             let ss = self.table.strategy_sum_mut(key as usize);
-            for (s32, &v) in ss.iter_mut().zip(&s) {
-                *s32 = (*s32 as f64 + v) as f32;
+            for (sum, &v) in ss.iter_mut().zip(&s) {
+                *sum += v;
             }
         }
         if self.use_baseline {

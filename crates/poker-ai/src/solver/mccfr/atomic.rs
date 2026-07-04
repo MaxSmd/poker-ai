@@ -50,7 +50,7 @@ pub(super) const MAX_ACTIONS: usize = 8;
 /// `AtomicU32` (f32 bit-cast) operations.
 struct AtomicTable<'a> {
     regret: *mut f32,
-    strategy_sum: *mut f32,
+    strategy_sum: *mut f64,
     baseline: *mut f32,
     offsets: &'a [u32],
     num_actions: &'a [u8],
@@ -80,6 +80,26 @@ fn rmw(ptr: *mut f32, slot: usize, f: impl Fn(f32) -> f32) {
     let mut cur = a.load(Ordering::Relaxed);
     loop {
         let new = f(f32::from_bits(cur)).to_bits();
+        match a.compare_exchange_weak(cur, new, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(seen) => cur = seen,
+        }
+    }
+}
+
+#[inline]
+fn atomic64_at(ptr: *mut f64, slot: usize) -> &'static AtomicU64 {
+    // Safety: same contract as `atomic_at`, for the f64 strategy-sum array.
+    unsafe { AtomicU64::from_ptr(ptr.add(slot).cast()) }
+}
+
+/// f64 counterpart of [`rmw`] for the strategy-sum array.
+#[inline]
+fn rmw64(ptr: *mut f64, slot: usize, f: impl Fn(f64) -> f64) {
+    let a = atomic64_at(ptr, slot);
+    let mut cur = a.load(Ordering::Relaxed);
+    loop {
+        let new = f(f64::from_bits(cur)).to_bits();
         match a.compare_exchange_weak(cur, new, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => return,
             Err(seen) => cur = seen,
@@ -132,12 +152,13 @@ impl AtomicTable<'_> {
         }
     }
 
-    /// The opponent's average-strategy accumulation (`weight · σ(a)` per slot).
+    /// The opponent's average-strategy accumulation (`weight · σ(a)` per slot,
+    /// into the exact `f64` sum).
     #[inline]
     fn add_strategy(&self, index: usize, weight: f64, strategy: &[f64], n: usize) {
         let (base, _) = self.span(index);
         for (a, &p) in strategy.iter().enumerate().take(n) {
-            rmw(self.strategy_sum, base + a, |s| (s as f64 + weight * p) as f32);
+            rmw64(self.strategy_sum, base + a, |s| s + weight * p);
         }
     }
 

@@ -171,13 +171,7 @@ impl RegretStore for LeanTable {
 
     fn add_strategy(&mut self, info_set: usize, strategy: &[f64], t: u64, variant: Variant, rng: &mut u64) {
         // Running-discount γ-averaging (see module doc), applied lazily on visit.
-        let factor = match variant {
-            Variant::Vanilla => 1.0,
-            Variant::Dcfr(d) => {
-                let g = t as f64 / (t as f64 + 1.0);
-                g.powf(d.gamma)
-            }
-        };
+        let factor = super::regret_table::strategy_discount(t, variant);
         let span = self.span(info_set);
         let sums = &mut self.strategy_sum[span];
 

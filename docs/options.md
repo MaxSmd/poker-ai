@@ -18,8 +18,8 @@ blueprint; switch to the lean store only when RAM is the binding constraint.**
 |---|---|---|---|
 | `solver::cfr::Cfr` (full traversal) | Toy/validation games with enumerable chance (Kuhn, Leduc, curated-deal NLHE) | Exact, zero variance — the correctness oracle every sampled result is validated against | Visits the whole tree every iteration; intractable beyond toy games |
 | `solver::mccfr::Mccfr` (external-sampling, HashMap store) | Sampled games without a dense index: uncapped betting trees, partial-coverage abstractions, quick experiments | No precomputed layout needed (mints keys on first visit); carries every refinement (baseline / optimistic / RBP) | ~350 B per info set (5 heap `Vec`s per node) — ~15× the SoA store; HashMap lookups on the hot path |
-| `solver::mccfr::SoaMccfr` (flat f32 store) | Production blueprint training on an `IndexedGame` (finite raise cap + full-coverage bucket maps) | 24 B/info set for 2 actions; array indexing instead of hashing; checkpoint = contiguous arrays; the only path with atomic training | Requires the dense index up front (full-coverage abstraction); no optimistic/RBP (inert on the games it targets) |
-| `solver::mccfr::LeanMccfr` (quantized store) | RAM-bound runs only (deep-stack 6-max, very fine abstractions) | **Half the accumulator bytes** (12 vs 24 B/info set for 2 actions) at equal wall time and equal convergence **[measured: push/fold 1M iters — lean −0.006 bb vs f32 0.051 bb exploitability]** | Must pair with `Discount::LINEAR` (see §2); serial-only so far (no parallel/atomic path); fixed-point ranges sized for bb-scale utilities |
+| `solver::mccfr::SoaMccfr` (flat store) | Production blueprint training on an `IndexedGame` (finite raise cap + full-coverage bucket maps) | 32 B/info set for 2 actions (f32 regrets/baselines, **f64 strategy sums** — exact averaging past 10^15 visits); array indexing instead of hashing; checkpoint = contiguous arrays; the only path with atomic training | Requires the dense index up front (full-coverage abstraction); no optimistic/RBP (inert on the games it targets) |
+| `solver::mccfr::LeanMccfr` (quantized store) | RAM-bound runs only (deep-stack 6-max, very fine abstractions) | **2.7× fewer accumulator bytes** (12 vs 32 B/info set for 2 actions) at equal wall time and equal convergence **[measured: push/fold 1M iters — lean −0.006 bb vs f32 0.051 bb exploitability]** | Must pair with `Discount::LINEAR` (see §2); serial-only so far (no parallel/atomic path); fixed-point ranges sized for bb-scale utilities |
 | `solver::predictive::PredictiveSolver` (CFR+) | Subgame re-solving under a per-decision time budget | Strong **last-iterate** (the deployable output in a 2–5 s resolve) **[measured: Leduc 2k iters — CFR+ last-iterate 0.007 beats vanilla average 0.011; subgame @2k: 0.0055 vs DCFR 0.0294 bb]** | Full-traversal only (subgames are small enough); alternating updates required — simultaneous RM+ converges far worse |
 | `solver::best_response` | Measuring, not training | Exact exploitability (NashConv/2) on enumerable games | Enumerable chance only; use `evaluation::local_br` otherwise |
 
@@ -104,13 +104,15 @@ before you commit a server to it.
 | Store | B/info set (2 actions) | Use when | Notes |
 |---|---|---|---|
 | HashMap `Node` (f64) | ~350 | Toy games, non-indexed games | Correctness-first; carries all refinements |
-| `RegretTable` (f32 SoA) — **default** | 24 + 5 index | All current blueprint training | f64 math, f32 store; only store with parallel/atomic/checkpoint paths |
+| `RegretTable` (SoA) — **default** | 32 + 5 index | All current blueprint training | f64 math; f32 regrets/baselines, f64 strategy sums; only store with parallel/atomic/checkpoint paths |
 | `LeanTable` (i16/u16 quantized) | 12 + 5 index | RAM-bound only | Requires LCFR; RTN regrets + stochastic-rounded strategy sums + quantized-EMA baselines; saturation halves an info set (strategy-preserving). Rejected sibling: bf16+SR under DCFR (~4× convergence regression — do not revisit without re-reading `lean_table.rs`'s doc) |
 
-Known f32 caveat: absolute `t^γ` strategy weights lose f32 precision past
-~30–100M iterations (increments fall below half an ulp and the average
-freezes). The lean store's running-discount form avoids this; porting it to
-the f32 path is an open follow-up.
+Long-run averaging: float sums (of any width) lose sub-ulp increments once the
+accumulated total dwarfs the per-visit contribution — in f32 the deployed
+average silently froze after ~25M visits per info set. Fixed by storing the
+strategy sum in **f64** (exact past 10^15 visits; +4 B/slot). The lean store is
+naturally immune: integer sums never drop an increment, and saturation halving
+resets the magnitude.
 
 ## 9. Re-solving (play-time) options
 

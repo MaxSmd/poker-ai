@@ -28,8 +28,8 @@
 //!
 //! ## Footprints reported
 //!
-//! * **f32 SoA** (the current store): regret + strategy-sum + baseline, one
-//!   `f32` each per (info set, action) slot, plus a 5-byte per-info-set index.
+//! * **f32 SoA** (the current store): f32 regret + f64 strategy-sum + f32
+//!   baseline per (info set, action) slot, plus a 5-byte per-info-set index.
 //! * **lean** (the quantized `LeanTable` store, validated on push/fold): `i16`
 //!   regret + `u16` strategy-sum + `i16` baseline per slot, paired with Linear
 //!   CFR — the regime where integer quantization works (DCFR+bf16 was tried
@@ -56,8 +56,9 @@ use poker_core::state::{GameState, MAX_PLAYERS, NO_CARD};
 /// Match the trainer's blinds ([`crate::bin::train`]); stack(chips) = bb × BIG_BLIND.
 const BIG_BLIND: u32 = 2;
 const SMALL_BLIND: u32 = 1;
-/// Current store: regret + strategy-sum + baseline, one `f32` each, per slot.
-const BYTES_PER_SLOT: usize = 3 * 4;
+/// Current store: f32 regret + f64 strategy-sum + f32 baseline per slot
+/// (the sum is f64 so long-run averaging cannot freeze below f32 precision).
+const BYTES_PER_SLOT: usize = 4 + 8 + 4;
 /// Per-info-set index overhead: `offsets` (u32) + `num_actions` (u8).
 const INDEX_BYTES_PER_INFOSET: usize = 4 + 1;
 /// Lean store (`LeanTable`, validated): `i16` regret + `u16` strategy-sum +
@@ -319,6 +320,16 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(15_000_000);
+    let env_list = |name: &str, default: Vec<u32>| -> Vec<u32> {
+        std::env::var(name)
+            .ok()
+            .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+            .filter(|l: &Vec<u32>| !l.is_empty())
+            .unwrap_or(default)
+    };
+    // Comma lists, e.g. POKER_AI_ESTIMATE_STACKS=20,100,200 POKER_AI_ESTIMATE_PLAYERS=2
+    let stacks = env_list("POKER_AI_ESTIMATE_STACKS", vec![20, 50, 100]);
+    let players_list = env_list("POKER_AI_ESTIMATE_PLAYERS", vec![2, 6]);
 
     println!("Blueprint memory — EXACT abstract betting-tree enumeration (real poker-core engine).");
     println!(
@@ -336,13 +347,14 @@ fn main() {
 
     cross_check_hu(Path::new("data"), limit);
 
-    for &players in &[2u8, 6] {
+    for &players in &players_list {
+        let players = players as u8;
         println!("── {players}-player ─────────────────────────────────────────────────────────────────────────");
         println!(
             "{:>7} {:>4}  {:>26}  {:>10}  {:>10}  {:>10}  {:>10}  {:>8}  {:>7}",
             "stack", "cap", "betting nodes pf/f/t/r", "info sets", "slots", "f32 RAM", "lean RAM", "DAG", "walk"
         );
-        for &stack_bb in &[20u32, 50, 100] {
+        for &stack_bb in &stacks {
             for cap in 1..=3u32 {
                 let m = enumerate_tree(players, stack_bb, cap, limit);
                 if m.truncated {
@@ -393,10 +405,10 @@ mod tests {
         assert!(!m.truncated);
         let (info_sets, slots) = table_size(&m.counts, [169, 500, 500, 800]);
         assert_eq!(info_sets, 4_631_870);
-        // The recorded "0.13 GB / 24 B per info set" assumed ~2 actions per
-        // info set; the walker counts slots exactly (avg ≈ 2.5) → ~160 MB.
+        // ~2.5 slots/info set exactly counted; 16 B/slot (f64 strategy sums)
+        // + 5 B index ≈ 0.21 GB.
         let bytes = f32_bytes(info_sets, slots) as f64;
-        assert!((0.14e9..0.18e9).contains(&bytes), "got {}", fmt_bytes(bytes as u64));
+        assert!((0.19e9..0.23e9).contains(&bytes), "got {}", fmt_bytes(bytes as u64));
     }
 
     /// 6-max plumbing smoke test: micro stacks collapse the tree to a

@@ -364,11 +364,12 @@ mod tests {
 
     #[test]
     fn soa_table_footprint_is_tiny() {
-        // The flat store holds 3 f32 accumulators × 2 actions = 24 bytes/info set,
-        // versus the HashMap Node's five heap vecs (~350 B) — the ~10× the memory
-        // budget is about.
+        // The flat store holds (f32 regret + f64 strategy-sum + f32 baseline)
+        // × 2 actions = 32 bytes/info set, versus the HashMap Node's five heap
+        // vecs (~350 B) — the ~10× the memory budget is about.  (The sum is
+        // f64 so long-run averaging cannot freeze below f32 precision.)
         let soa: SoaMccfr<PushFoldHoldem> = SoaMccfr::new(PushFoldHoldem::new(40, 2, 1, 0), Variant::Vanilla);
-        assert_eq!(soa.bytes_per_info_set(), 24);
+        assert_eq!(soa.bytes_per_info_set(), 32);
     }
 
     /// Export a trained SoA solver back to the `HashMap` strategy artifact
@@ -426,7 +427,9 @@ mod tests {
             f32s.bytes_per_info_set(),
             lean.bytes_per_info_set(),
         );
-        assert_eq!(lean.bytes_per_info_set() * 2, f32s.bytes_per_info_set(), "half the accumulator bytes");
+        // 12 vs 32 B/info set (the f32 store carries f64 strategy sums).
+        assert_eq!(lean.bytes_per_info_set(), 12);
+        assert_eq!(f32s.bytes_per_info_set(), 32);
         assert!(expl_lean < 0.12, "lean-trained strategy exploitability {expl_lean} bb too high");
         assert!(
             expl_lean < expl_f32 + 0.04,

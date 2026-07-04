@@ -146,7 +146,7 @@ impl BlueprintHoldem {
 
     /// Cap the betting abstraction at `cap` raises per street — the tree-size
     /// lever (`memory_estimate` prints the exact footprint per stack × cap;
-    /// heads-up 20 bb cap-2 is ~4.6 M info sets ≈ 0.16 GB on the SoA store).
+    /// heads-up 20 bb cap-2 is ~4.6 M info sets ≈ 0.21 GB on the SoA store).
     /// `0` is treated as `1` (at least the opening raise must stay legal or the
     /// tree degenerates to check/call only).
     pub fn with_raise_cap(mut self, cap: u32) -> Self {

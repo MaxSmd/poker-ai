@@ -76,22 +76,22 @@ cargo run --release --bin memory_estimate            # current bucket counts
 cargo run --release --bin memory_estimate -- 200 200 200   # what-if buckets
 ```
 
-Reference points: heads-up 20 bb cap-2 ≈ 4.6M info sets ≈ 0.16 GB (trivial);
+Reference points: heads-up 200 bb cap-3 ≈ 299M info sets ≈ 14.5 GB;
 6-max 20 bb cap-2 ≈ 6.8B info sets ≈ 204 GB — see the tool's output for the
 full matrix before launching anything big.
 
 ### 3. Train the blueprint (`train blueprint`)
 
 ```bash
-# The headline run (production server config):
-cargo run --release --bin train -- blueprint 300000000 20 1 \
-    --cap=2 --soa --atomic --resume --expl --expl-iters=200000
+# The headline run (production server config — Slumbot-depth 200bb stacks):
+cargo run --release --bin train -- blueprint 2000000000 200 1 \
+    --cap=3 --soa --atomic --resume --expl --expl-iters=500000
 ```
 
 - `--cap=N` — betting abstraction: max raises per street (the tree-size lever)
-- `--soa` — flat structure-of-arrays regret store (24 B/info set vs ~350 B on
-  the HashMap path; required scale for cap≥2). Needs the full-coverage
-  abstraction from step 1.
+- `--soa` — flat structure-of-arrays regret store (32 B/info set vs ~350 B on
+  the HashMap path; f64 strategy sums so long-run averaging stays exact).
+  Needs the full-coverage abstraction from step 1.
 - `--atomic[=THREADS]` — lock-free atomic training (Pluribus-style in-place
   CAS updates; defaults to all cores). Near-linear scaling — measured 4.5×
   over the batched path on 4 performance cores — at the cost of
@@ -114,8 +114,8 @@ to the HashMap path, which is what the resolver loads.
 Wrap any training command with the W&B logger (`pip install wandb`):
 
 ```bash
-python scripts/train_wandb.py --name hu-cap2 -- \
-    blueprint 300000000 20 1 --cap=2 --soa --parallel=512 --resume --expl
+python scripts/train_wandb.py --name hu-200bb-cap3 -- \
+    blueprint 2000000000 200 1 --cap=3 --soa --atomic --resume --expl
 ```
 
 Metrics (iteration, info sets, nodes/s, exploitability) are parsed from the

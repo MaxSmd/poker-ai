@@ -8,8 +8,10 @@
 //! addressed by that index: no hashing, no per-node allocation, and a checkpoint
 //! that is a handful of contiguous arrays rather than a serde-heavy map.
 //!
-//! Arithmetic is done in `f64` and stored as `f32` (standard for production CFR;
-//! the strategy is a ratio of regrets, robust to the reduced mantissa).  The
+//! Arithmetic is done in `f64`; regrets and baselines are stored `f32`
+//! (standard for production CFR; the strategy is a ratio of regrets, robust to
+//! the reduced mantissa) while the strategy sum is stored `f64` — see its
+//! field doc for why `f32` averaging silently freezes in long runs.  The
 //! optimistic (`prev_inst`) and pruning (`consec_below`) accumulators are
 //! **optional** arrays — empty unless those features are enabled — so you only
 //! pay their memory when you use them.
@@ -29,6 +31,17 @@ use super::cfr::Variant;
 
 /// EMA learning rate for the VR-MCCFR baseline (mirrors `mccfr::BASELINE_RATE`).
 const BASELINE_RATE: f64 = 0.1;
+
+/// The running-discount factor for iteration `t`'s strategy-sum update:
+/// `(t/(t+1))^γ` (1 for vanilla).  Used by the quantized store, whose 16-bit
+/// sums cannot hold absolute `t^γ` weights; the f32 store keeps absolute
+/// weights in an `f64` sum instead (exact past 10^15 visits).
+pub(crate) fn strategy_discount(t: u64, variant: Variant) -> f64 {
+    match variant {
+        Variant::Vanilla => 1.0,
+        Variant::Dcfr(d) => (t as f64 / (t as f64 + 1.0)).powf(d.gamma),
+    }
+}
 
 /// Storage backend for the serial SoA blueprint solver
 /// ([`SoaMccfr`](crate::solver::mccfr::SoaMccfr)): the flat per-(info set,
@@ -67,8 +80,13 @@ pub trait RegretStore: Serialize + Sized {
 pub struct RegretTable {
     /// Cumulative counterfactual regret per (info set, action).
     regret: Vec<f32>,
-    /// Average-strategy numerator per (info set, action).
-    strategy_sum: Vec<f32>,
+    /// Average-strategy numerator per (info set, action).  `f64`, unlike the
+    /// other arrays: the γ-weighted sum's increments shrink relative to the
+    /// accumulated total as training proceeds, and in `f32` they fall below
+    /// half an ulp after ~25M visits — the deployed average silently freezes.
+    /// `f64` is exact past 10^15 visits.  Regrets/baselines stay `f32` (regret
+    /// matching is a ratio, robust to the short mantissa).
+    strategy_sum: Vec<f64>,
     /// VR-MCCFR baseline value per (info set, action), player-0 perspective.
     baseline: Vec<f32>,
     /// Previous instantaneous regret (optimistic updates) — empty unless enabled.
@@ -103,7 +121,7 @@ impl RegretTable {
         let total = total as usize;
         Self {
             regret: vec![0.0; total],
-            strategy_sum: vec![0.0; total],
+            strategy_sum: vec![0.0f64; total],
             baseline: vec![0.0; total],
             prev_inst: if optimistic { vec![0.0; total] } else { Vec::new() },
             consec_below: if pruning { vec![0; total] } else { Vec::new() },
@@ -124,9 +142,12 @@ impl RegretTable {
 
     /// Per-info-set memory footprint in bytes (the accumulators actually held).
     pub fn bytes_per_info_set(&self) -> usize {
-        let arrays = 3 + usize::from(!self.prev_inst.is_empty()); // regret+strat+baseline (+prev_inst)
+        // regret f32 + strategy-sum f64 + baseline f32, plus optional arrays.
+        let per_slot = 4 + 8 + 4
+            + if self.prev_inst.is_empty() { 0 } else { 4 }
+            + if self.consec_below.is_empty() { 0 } else { 4 };
         let avg_actions = if self.capacity() == 0 { 0 } else { self.total_slots() / self.capacity() };
-        arrays * 4 * avg_actions + if self.consec_below.is_empty() { 0 } else { 4 * avg_actions }
+        per_slot * avg_actions
     }
 
     fn span(&self, info_set: usize) -> Range<usize> {
@@ -150,7 +171,7 @@ impl RegretTable {
         &mut self.regret[span]
     }
 
-    pub fn strategy_sum_mut(&mut self, info_set: usize) -> &mut [f32] {
+    pub fn strategy_sum_mut(&mut self, info_set: usize) -> &mut [f64] {
         let span = self.span(info_set);
         &mut self.strategy_sum[span]
     }
@@ -170,7 +191,7 @@ impl RegretTable {
     /// contract: the caller keeps the exclusive borrow of `self` alive for the
     /// whole training run and performs **every** access to these arrays through
     /// atomics, so no non-atomic aliases exist while threads race.
-    pub(crate) fn atomic_parts(&mut self) -> (*mut f32, *mut f32, *mut f32, &[u32], &[u8]) {
+    pub(crate) fn atomic_parts(&mut self) -> (*mut f32, *mut f64, *mut f32, &[u32], &[u8]) {
         (
             self.regret.as_mut_ptr(),
             self.strategy_sum.as_mut_ptr(),
@@ -217,9 +238,9 @@ impl RegretTable {
         let s = &self.strategy_sum[self.span(info_set)];
         let n = s.len();
         out.clear();
-        let total: f64 = s.iter().map(|&x| x as f64).sum();
+        let total: f64 = s.iter().sum();
         if total > 0.0 {
-            out.extend(s.iter().map(|&x| x as f64 / total));
+            out.extend(s.iter().map(|&x| x / total));
         } else {
             out.extend(std::iter::repeat_n(1.0 / n as f64, n));
         }
@@ -296,8 +317,8 @@ impl RegretStore for RegretTable {
             Variant::Dcfr(d) => d.strategy_weight(t),
         };
         let s = self.strategy_sum_mut(info_set);
-        for (s32, &p) in s.iter_mut().zip(strategy) {
-            *s32 = (*s32 as f64 + weight * p) as f32;
+        for (sum, &p) in s.iter_mut().zip(strategy) {
+            *sum += weight * p;
         }
     }
 
@@ -349,9 +370,9 @@ mod tests {
         let full = RegretTable::with_layout(10, |_| 2, true, true);
         assert!(plain.prev_inst.is_empty());
         assert!(!full.prev_inst.is_empty() && !full.consec_below.is_empty());
-        // 3 f32 accumulators × 2 actions = 24 bytes/info set, vs the HashMap
-        // Node's five heap vecs (~350 B).
-        assert_eq!(plain.bytes_per_info_set(), 24);
+        // (f32 regret + f64 strategy-sum + f32 baseline) × 2 actions = 32
+        // bytes/info set, vs the HashMap Node's five heap vecs (~350 B).
+        assert_eq!(plain.bytes_per_info_set(), 32);
     }
 
     #[test]
