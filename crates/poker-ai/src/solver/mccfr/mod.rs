@@ -178,10 +178,14 @@ impl<G: Game> Mccfr<G> {
             iterations: self.iterations,
             nodes_visited: self.nodes_visited,
         };
-        let bytes = bincode::serialize(&view).map_err(io::Error::other)?;
+        // Stream to the temp file — buffering the serialized state first
+        // transiently doubles the memory-bound store (see the SoA twin).
         let path = path.as_ref();
         let tmp = path.with_extension("ckpt.tmp");
-        std::fs::write(&tmp, bytes)?;
+        let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+        bincode::serialize_into(&mut w, &view).map_err(io::Error::other)?;
+        std::io::Write::flush(&mut w)?;
+        drop(w);
         std::fs::rename(&tmp, path)
     }
 
@@ -190,8 +194,8 @@ impl<G: Game> Mccfr<G> {
     /// configuration (variant, baseline/optimistic flags, pruning schedule) is
     /// restored from the checkpoint so resumed training behaves identically.
     pub fn load_checkpoint(path: impl AsRef<Path>, game: G) -> io::Result<Self> {
-        let bytes = std::fs::read(path)?;
-        let cp: CheckpointOwned = bincode::deserialize(&bytes).map_err(io::Error::other)?;
+        let r = std::io::BufReader::new(std::fs::File::open(path)?);
+        let cp: CheckpointOwned = bincode::deserialize_from(r).map_err(io::Error::other)?;
         Ok(Self {
             game,
             variant: cp.variant,

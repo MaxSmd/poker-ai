@@ -357,17 +357,25 @@ impl<G: IndexedGame> SoaMccfr<G, RegretTable> {
             iterations: self.iterations,
             nodes_visited: self.nodes_visited,
         };
-        let bytes = bincode::serialize(&view).map_err(io::Error::other)?;
+        // Stream straight to the temp file: buffering the serialized table in
+        // RAM first would transiently double the footprint (a 15 GB table cost
+        // ~30 GB extra at 200 bb — observed on the first server run).  The
+        // byte format is identical to the buffered form, so checkpoints stay
+        // interchangeable across versions.
         let path = path.as_ref();
         let tmp = path.with_extension("ckpt.tmp");
-        std::fs::write(&tmp, bytes)?;
+        let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+        bincode::serialize_into(&mut w, &view).map_err(io::Error::other)?;
+        std::io::Write::flush(&mut w)?;
+        drop(w);
         std::fs::rename(&tmp, path)
     }
 
-    /// Restore from a checkpoint, re-supplying the game.
+    /// Restore from a checkpoint, re-supplying the game.  Streams from disk
+    /// (no whole-file byte buffer — same rationale as the save path).
     pub fn load_checkpoint(path: impl AsRef<Path>, game: G) -> io::Result<Self> {
-        let bytes = std::fs::read(path)?;
-        let cp: SoaCheckpointOwned = bincode::deserialize(&bytes).map_err(io::Error::other)?;
+        let r = std::io::BufReader::new(std::fs::File::open(path)?);
+        let cp: SoaCheckpointOwned = bincode::deserialize_from(r).map_err(io::Error::other)?;
         Ok(Self {
             game,
             variant: cp.variant,
