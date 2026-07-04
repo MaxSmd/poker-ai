@@ -30,10 +30,11 @@
 //!
 //! * **f32 SoA** (the current store): regret + strategy-sum + baseline, one
 //!   `f32` each per (info set, action) slot, plus a 5-byte per-info-set index.
-//! * **lean** (the proposed quantized store for the big 6-max run): `i16`
-//!   regret + `u16` strategy-sum per slot (Linear-MCCFR regime, where integer
-//!   quantization is known to work — DCFR+bf16 was tried and rejected), plus a
-//!   per-info-set `f32` baseline and the same index.
+//! * **lean** (the quantized `LeanTable` store, validated on push/fold): `i16`
+//!   regret + `u16` strategy-sum + `i16` baseline per slot, paired with Linear
+//!   CFR — the regime where integer quantization works (DCFR+bf16 was tried
+//!   and rejected; see `lean_table.rs`).  Half the accumulator bytes at equal
+//!   measured convergence.
 //!
 //! Usage (from the repo root):
 //!   memory_estimate [flop_buckets] [turn_buckets] [river_buckets]
@@ -59,10 +60,12 @@ const SMALL_BLIND: u32 = 1;
 const BYTES_PER_SLOT: usize = 3 * 4;
 /// Per-info-set index overhead: `offsets` (u32) + `num_actions` (u8).
 const INDEX_BYTES_PER_INFOSET: usize = 4 + 1;
-/// Lean store: `i16` regret + `u16` strategy-sum per slot…
-const LEAN_BYTES_PER_SLOT: usize = 2 + 2;
-/// …plus a per-info-set `f32` baseline on top of the same index.
-const LEAN_BYTES_PER_INFOSET: usize = INDEX_BYTES_PER_INFOSET + 4;
+/// Lean store (`LeanTable`, validated): `i16` regret + `u16` strategy-sum +
+/// `i16` baseline per slot (a per-info-set scalar baseline was considered and
+/// is unsound — a constant control variate cancels out of the correction)…
+const LEAN_BYTES_PER_SLOT: usize = 3 * 2;
+/// …plus the same per-info-set index as the f32 store.
+const LEAN_BYTES_PER_INFOSET: usize = INDEX_BYTES_PER_INFOSET;
 /// Card-bucket maps loaded at train time, constant across the whole matrix:
 /// flop 1.29M + turn 13.96M + river 123.16M situations × 2 bytes (u16).
 const BUCKET_MAP_BYTES: usize = (1_286_792 + 13_960_050 + 123_156_254) * 2;

@@ -12,7 +12,8 @@ use super::parallel::{record_baseline, record_strategy_delta, record_traverser_d
 use super::BASELINE_RATE;
 use crate::games::{CursorGame, IndexedGame};
 use crate::solver::cfr::Variant;
-use crate::solver::regret_table::RegretTable;
+use crate::solver::lean_table::LeanTable;
+use crate::solver::regret_table::{RegretStore, RegretTable};
 use crate::util::rng::{sample_index, xorshift_next_unit};
 
 // ── SoA (flat) blueprint solver ──────────────────────────────────────────────
@@ -27,17 +28,23 @@ use crate::util::rng::{sample_index, xorshift_next_unit};
 // here (inert on push/fold; the full blueprint can add the optional table arrays
 // later).  The transient per-iteration delta reuses [`Delta`] keyed by the
 // info-set index cast to `u64`.
-pub struct SoaMccfr<G: IndexedGame> {
+pub struct SoaMccfr<G: IndexedGame, S: RegretStore = RegretTable> {
     game: G,
     variant: Variant,
     use_baseline: bool,
-    table: RegretTable,
+    table: S,
     rng: u64,
     iterations: u64,
     nodes_visited: u64,
 }
 
-impl<G: IndexedGame> SoaMccfr<G> {
+/// The quantized-store solver: the same serial algorithm over a [`LeanTable`]
+/// (i16/u16 accumulators, half the RAM).  Pair it with
+/// [`Discount::LINEAR`](crate::solver::dcfr::Discount::LINEAR) — quantized
+/// regrets need Linear CFR's growing magnitudes (see `lean_table.rs`).
+pub type LeanMccfr<G> = SoaMccfr<G, LeanTable>;
+
+impl<G: IndexedGame, S: RegretStore> SoaMccfr<G, S> {
     /// Create a solver with a fixed default seed.
     pub fn new(game: G, variant: Variant) -> Self {
         Self::with_seed(game, variant, 0x2545_F491_4F6C_DD1D)
@@ -47,7 +54,7 @@ impl<G: IndexedGame> SoaMccfr<G> {
     /// the game's known info-set capacity.
     pub fn with_seed(game: G, variant: Variant, seed: u64) -> Self {
         let capacity = game.info_set_capacity();
-        let table = RegretTable::with_layout(capacity, |i| game.actions_at(i), false, false);
+        let table = S::build(capacity, &|i| game.actions_at(i));
         Self { game, variant, use_baseline: false, table, rng: seed | 1, iterations: 0, nodes_visited: 0 }
     }
 
@@ -136,17 +143,16 @@ impl<G: IndexedGame> SoaMccfr<G> {
                 CursorGame::undo(&self.game, cursor);
                 node_value += strategy[a] * util[a];
             }
-            self.update_regret(index, t, &util, node_value);
+            self.table.add_regret(index, &util, node_value, t, self.variant);
             if self.use_baseline {
                 let sgn = Self::sign(traverser);
-                let b = self.table.baseline_mut(index);
-                for a in 0..num_actions {
-                    b[a] = (b[a] as f64 + BASELINE_RATE * (sgn * util[a] - b[a] as f64)) as f32;
+                for (a, &u) in util.iter().enumerate() {
+                    self.table.baseline_ema(index, a, sgn * u);
                 }
             }
             node_value
         } else {
-            self.update_strategy(index, t, &strategy);
+            self.table.add_strategy(index, &strategy, t, self.variant, &mut self.rng);
             let a = self.sample(&strategy);
             CursorGame::apply(&self.game, cursor, a, acts[a]);
             let v_child = self.traverse(cursor, traverser, t);
@@ -156,13 +162,9 @@ impl<G: IndexedGame> SoaMccfr<G> {
             }
             let sgn = Self::sign(traverser);
             let v0 = sgn * v_child;
-            let (baseline_exp, baseline_a) = {
-                let b = self.table.baseline(index);
-                ((0..num_actions).map(|i| strategy[i] * b[i] as f64).sum::<f64>(), b[a] as f64)
-            };
+            let (baseline_exp, baseline_a) = self.table.baseline_pair(index, &strategy, a);
             let corrected0 = baseline_exp + (v0 - baseline_a);
-            let b = self.table.baseline_mut(index);
-            b[a] = (b[a] as f64 + BASELINE_RATE * (v0 - b[a] as f64)) as f32;
+            self.table.baseline_ema(index, a, v0);
             sgn * corrected0
         }
     }
@@ -175,34 +177,14 @@ impl<G: IndexedGame> SoaMccfr<G> {
         }
     }
 
-    fn update_regret(&mut self, index: usize, t: u64, util: &[f64], node_value: f64) {
-        let (pos, neg) = match self.variant {
-            Variant::Vanilla => (1.0, 1.0),
-            Variant::Dcfr(d) => (d.positive_factor(t), d.negative_factor(t)),
-        };
-        let discount = matches!(self.variant, Variant::Dcfr(_));
-        let regret = self.table.regret_mut(index);
-        for (r32, &u) in regret.iter_mut().zip(util) {
-            let mut r = *r32 as f64;
-            if discount {
-                r *= if r > 0.0 { pos } else { neg };
-            }
-            r += u - node_value;
-            *r32 = r as f32;
-        }
-    }
+}
 
-    fn update_strategy(&mut self, index: usize, t: u64, strategy: &[f64]) {
-        let weight = match self.variant {
-            Variant::Vanilla => 1.0,
-            Variant::Dcfr(d) => d.strategy_weight(t),
-        };
-        let s = self.table.strategy_sum_mut(index);
-        for (s32, &p) in s.iter_mut().zip(strategy) {
-            *s32 = (*s32 as f64 + weight * p) as f32;
-        }
-    }
-
+// ── f32-store-only paths ─────────────────────────────────────────────────────
+//
+// The mini-batch parallel merge, the lock-free atomic trainer, and the
+// checkpoint format all operate on the concrete f32 arrays; the quantized
+// store is serial-only until it earns those (benchmark first).
+impl<G: IndexedGame> SoaMccfr<G, RegretTable> {
     /// Lock-free atomic training over `threads` OS threads — the many-core
     /// path (see [`super::atomic`] for the design and what it trades away).
     /// Workers claim iteration numbers from a shared counter and CAS directly
@@ -219,12 +201,14 @@ impl<G: IndexedGame> SoaMccfr<G> {
         self.nodes_visited += super::atomic::run_atomic(
             &self.game,
             &mut self.table,
-            self.variant,
-            self.use_baseline,
-            self.rng,
-            self.iterations,
-            iters,
-            threads,
+            super::atomic::AtomicRun {
+                variant: self.variant,
+                use_baseline: self.use_baseline,
+                seed: self.rng,
+                base_iter: self.iterations,
+                iters,
+                threads,
+            },
         );
         self.iterations += iters;
     }

@@ -525,7 +525,7 @@ mod cursor;
 mod parallel;
 mod soa;
 
-pub use soa::SoaMccfr;
+pub use soa::{LeanMccfr, SoaMccfr};
 
 #[cfg(test)]
 mod tests;

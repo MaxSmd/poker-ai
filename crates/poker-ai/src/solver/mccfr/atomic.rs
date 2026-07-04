@@ -242,21 +242,29 @@ fn traverse<G: IndexedGame>(
     }
 }
 
-/// Run `iters` lock-free iterations over `threads` OS threads, mutating
-/// `table` in place.  Returns the total node visits.  Iteration numbers start
-/// at `base_iter + 1` (so discounting/averaging weights continue a resumed
-/// run), and each iteration's RNG stream is `splitmix(seed, t)` — the same
-/// scheme as the deterministic parallel path.
+/// Scalar parameters of one atomic training run (bundled so the entry point
+/// stays readable).
+pub(super) struct AtomicRun {
+    pub variant: Variant,
+    pub use_baseline: bool,
+    pub seed: u64,
+    /// Iterations already completed; numbering continues at `base_iter + 1` so
+    /// discounting/averaging weights resume correctly.
+    pub base_iter: u64,
+    pub iters: u64,
+    pub threads: usize,
+}
+
+/// Run `run.iters` lock-free iterations over `run.threads` OS threads,
+/// mutating `table` in place.  Returns the total node visits.  Each
+/// iteration's RNG stream is `splitmix(seed, t)` — the same scheme as the
+/// deterministic parallel path.
 pub(super) fn run_atomic<G: IndexedGame + Sync>(
     game: &G,
     table: &mut RegretTable,
-    variant: Variant,
-    use_baseline: bool,
-    seed: u64,
-    base_iter: u64,
-    iters: u64,
-    threads: usize,
+    run: AtomicRun,
 ) -> u64 {
+    let AtomicRun { variant, use_baseline, seed, base_iter, iters, threads } = run;
     let threads = threads.max(1);
     let (regret, strategy_sum, baseline, offsets, num_actions) = table.atomic_parts();
     assert!(

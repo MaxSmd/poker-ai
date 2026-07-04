@@ -29,6 +29,17 @@ impl Discount {
     /// The recommended `(α, β, γ) = (1.5, 0, 2)`.
     pub const RECOMMENDED: Discount = Discount { alpha: 1.5, beta: 0.0, gamma: 2.0 };
 
+    /// Linear CFR (Brown & Sandholm 2019): `(α, β, γ) = (1, 1, 1)` — iteration
+    /// `t` weighted by `t` everywhere.  Converges somewhat slower than
+    /// [`RECOMMENDED`](Self::RECOMMENDED) per iteration, but regret magnitudes
+    /// **grow** with `t` instead of staying bounded (β=1 discounts negatives the
+    /// same way as positives), which is the regime where low-precision integer
+    /// regret storage works ([`LeanTable`](crate::solver::lean_table::LeanTable)
+    /// — and the reason Pluribus stored its blueprint as ints).  The bounded
+    /// regrets of `RECOMMENDED` + quantized storage was tried and measurably
+    /// broke convergence (see the note atop `regret_table.rs`).
+    pub const LINEAR: Discount = Discount { alpha: 1.0, beta: 1.0, gamma: 1.0 };
+
     /// Multiplicative factor applied to accumulated **positive** regret at the
     /// start of iteration `t`.
     pub fn positive_factor(&self, t: u64) -> f64 {

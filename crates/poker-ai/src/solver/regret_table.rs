@@ -25,6 +25,42 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use super::cfr::Variant;
+
+/// EMA learning rate for the VR-MCCFR baseline (mirrors `mccfr::BASELINE_RATE`).
+const BASELINE_RATE: f64 = 0.1;
+
+/// Storage backend for the serial SoA blueprint solver
+/// ([`SoaMccfr`](crate::solver::mccfr::SoaMccfr)): the flat per-(info set,
+/// action) accumulators *plus the update arithmetic*, which is
+/// precision-specific (the f32 store adds directly; the quantized
+/// [`LeanTable`](crate::solver::lean_table::LeanTable) rounds, saturates, and
+/// rescales).  The parallel and atomic training paths are f32-only and keep
+/// using [`RegretTable`]'s concrete accessors.
+pub trait RegretStore: Serialize + Sized {
+    /// Lay out the arrays for `capacity` info sets with `actions(i)` slots each.
+    fn build(capacity: usize, actions: &dyn Fn(usize) -> usize) -> Self;
+    fn capacity(&self) -> usize;
+    fn num_actions(&self, info_set: usize) -> usize;
+    /// Ever updated (any strategy mass) — gates export of unreached slots.
+    fn is_visited(&self, info_set: usize) -> bool;
+    fn bytes_per_info_set(&self) -> usize;
+    /// Regret-matching current strategy, written into `out`.
+    fn strategy_into(&self, info_set: usize, out: &mut Vec<f64>);
+    /// Average (deployable) strategy, written into `out`.
+    fn average_into(&self, info_set: usize, out: &mut Vec<f64>);
+    /// The traverser's regret update at iteration `t`: per-action lazy discount
+    /// (per `variant`) then add of the instantaneous regret `util[a] − node_value`.
+    fn add_regret(&mut self, info_set: usize, util: &[f64], node_value: f64, t: u64, variant: Variant);
+    /// The opponent's average-strategy accumulation at iteration `t`.  `rng` is
+    /// for stores that round stochastically (the f32 store ignores it).
+    fn add_strategy(&mut self, info_set: usize, strategy: &[f64], t: u64, variant: Variant, rng: &mut u64);
+    /// `(Σ_a σ(a)·b(a), b(chosen))` — the opponent-node control-variate reads.
+    fn baseline_pair(&self, info_set: usize, strategy: &[f64], chosen: usize) -> (f64, f64);
+    /// One EMA step of baseline slot `a` toward `target` (player-0 perspective).
+    fn baseline_ema(&mut self, info_set: usize, a: usize, target: f64);
+}
+
 /// Flat `f32` regret / strategy-sum / baseline arrays indexed by a dense info-set
 /// id, with per-info-set offsets and action counts.
 #[derive(Serialize, Deserialize)]
@@ -202,6 +238,78 @@ impl RegretTable {
     pub fn load(path: impl AsRef<Path>) -> io::Result<Self> {
         let bytes = std::fs::read(path)?;
         bincode::deserialize(&bytes).map_err(io::Error::other)
+    }
+}
+
+// The f32 store's update arithmetic: f64 math, f32 store — moved here verbatim
+// from the solver's former inline updates (the bit-identical solver gates cover
+// the move).
+impl RegretStore for RegretTable {
+    fn build(capacity: usize, actions: &dyn Fn(usize) -> usize) -> Self {
+        Self::with_layout(capacity, actions, false, false)
+    }
+
+    fn capacity(&self) -> usize {
+        RegretTable::capacity(self)
+    }
+
+    fn num_actions(&self, info_set: usize) -> usize {
+        RegretTable::num_actions(self, info_set)
+    }
+
+    fn is_visited(&self, info_set: usize) -> bool {
+        RegretTable::is_visited(self, info_set)
+    }
+
+    fn bytes_per_info_set(&self) -> usize {
+        RegretTable::bytes_per_info_set(self)
+    }
+
+    fn strategy_into(&self, info_set: usize, out: &mut Vec<f64>) {
+        RegretTable::strategy_into(self, info_set, out)
+    }
+
+    fn average_into(&self, info_set: usize, out: &mut Vec<f64>) {
+        RegretTable::average_into(self, info_set, out)
+    }
+
+    fn add_regret(&mut self, info_set: usize, util: &[f64], node_value: f64, t: u64, variant: Variant) {
+        let (pos, neg) = match variant {
+            Variant::Vanilla => (1.0, 1.0),
+            Variant::Dcfr(d) => (d.positive_factor(t), d.negative_factor(t)),
+        };
+        let discount = matches!(variant, Variant::Dcfr(_));
+        let regret = self.regret_mut(info_set);
+        for (r32, &u) in regret.iter_mut().zip(util) {
+            let mut r = *r32 as f64;
+            if discount {
+                r *= if r > 0.0 { pos } else { neg };
+            }
+            r += u - node_value;
+            *r32 = r as f32;
+        }
+    }
+
+    fn add_strategy(&mut self, info_set: usize, strategy: &[f64], t: u64, variant: Variant, _rng: &mut u64) {
+        let weight = match variant {
+            Variant::Vanilla => 1.0,
+            Variant::Dcfr(d) => d.strategy_weight(t),
+        };
+        let s = self.strategy_sum_mut(info_set);
+        for (s32, &p) in s.iter_mut().zip(strategy) {
+            *s32 = (*s32 as f64 + weight * p) as f32;
+        }
+    }
+
+    fn baseline_pair(&self, info_set: usize, strategy: &[f64], chosen: usize) -> (f64, f64) {
+        let b = self.baseline(info_set);
+        let exp = strategy.iter().zip(b).map(|(&p, &v)| p * v as f64).sum();
+        (exp, b[chosen] as f64)
+    }
+
+    fn baseline_ema(&mut self, info_set: usize, a: usize, target: f64) {
+        let b = self.baseline_mut(info_set);
+        b[a] = (b[a] as f64 + BASELINE_RATE * (target - b[a] as f64)) as f32;
     }
 }
 

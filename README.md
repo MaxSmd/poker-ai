@@ -10,8 +10,11 @@ re-solving** with CFV-gadget safety.
 - **poker-ai** — everything on top: information abstraction, solvers
   (DCFR / MCCFR / CFR+), subgame re-solving, evaluation (`crates/poker-ai`)
 
-See [docs/architecture.md](docs/architecture.md) for the system design and
-[docs/](docs/) for deep dives (abstraction, CFR notes, memory budget).
+See [docs/architecture.md](docs/architecture.md) for the system design,
+**[docs/options.md](docs/options.md) for every implemented option (solvers,
+discount schedules, stores, training paths, abstraction, resolving) with use
+cases, measured benefits, and drawbacks**, and [docs/](docs/) for deep dives
+(abstraction, CFR notes, memory budget).
 
 ## Build & test
 

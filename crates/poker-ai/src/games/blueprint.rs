@@ -833,7 +833,7 @@ mod tests {
                 .with_indexing()
         };
         let iters = 200_000u64;
-        let mut bench = |name: &str, f: &mut dyn FnMut(&mut SoaMccfr<BlueprintHoldem>)| -> f64 {
+        let bench = |name: &str, f: &mut dyn FnMut(&mut SoaMccfr<BlueprintHoldem>)| -> f64 {
             let mut s =
                 SoaMccfr::with_seed(mk(), Variant::Dcfr(Discount::RECOMMENDED), 1).with_baseline();
             let t0 = Instant::now();
@@ -906,7 +906,8 @@ mod tests {
 
         // The SoA solver trains over the indexed full game and yields valid
         // probability distributions at every visited info set.
-        let mut soa = SoaMccfr::with_seed(mk(), Variant::Dcfr(Discount::RECOMMENDED), 1).with_baseline();
+        let mut soa: SoaMccfr<BlueprintHoldem> =
+            SoaMccfr::with_seed(mk(), Variant::Dcfr(Discount::RECOMMENDED), 1).with_baseline();
         soa.train(20_000);
         let mut visited = 0;
         for i in 0..soa.capacity() {

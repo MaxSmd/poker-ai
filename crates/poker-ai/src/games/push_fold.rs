@@ -295,7 +295,8 @@ mod tests {
     use crate::abstraction::canonical::preflop_index;
     use crate::solver::cfr::Variant;
     use crate::solver::dcfr::Discount;
-    use crate::solver::mccfr::{Mccfr, SoaMccfr};
+    use crate::solver::mccfr::{LeanMccfr, Mccfr, SoaMccfr};
+    use crate::solver::regret_table::RegretStore;
     use poker_core::make_card;
     use std::collections::HashMap;
 
@@ -366,13 +367,15 @@ mod tests {
         // The flat store holds 3 f32 accumulators × 2 actions = 24 bytes/info set,
         // versus the HashMap Node's five heap vecs (~350 B) — the ~10× the memory
         // budget is about.
-        let soa = SoaMccfr::new(PushFoldHoldem::new(40, 2, 1, 0), Variant::Vanilla);
+        let soa: SoaMccfr<PushFoldHoldem> = SoaMccfr::new(PushFoldHoldem::new(40, 2, 1, 0), Variant::Vanilla);
         assert_eq!(soa.bytes_per_info_set(), 24);
     }
 
     /// Export a trained SoA solver back to the `HashMap` strategy artifact
     /// (`preflop_key`-keyed), so the exploitability estimator can score it.
-    fn export_soa(soa: &SoaMccfr<PushFoldHoldem>) -> std::collections::HashMap<u64, Vec<f64>> {
+    fn export_soa<S: RegretStore>(
+        soa: &SoaMccfr<PushFoldHoldem, S>,
+    ) -> std::collections::HashMap<u64, Vec<f64>> {
         let mut out = std::collections::HashMap::new();
         for a in 0..52u8 {
             for b in (a + 1)..52u8 {
@@ -390,6 +393,51 @@ mod tests {
         out
     }
 
+    /// The lean-store experiment's verdict gate: the i16/u16 quantized table
+    /// under Linear CFR must train to a solution as close to Nash as the f32
+    /// table under DCFR, at half the accumulator bytes.  Exploitability-gated
+    /// for the same reason as the atomic test below (independent runs differ
+    /// per-hand by Monte-Carlo noise).
+    #[test]
+    fn lean_lcfr_store_converges_like_the_f32_dcfr_store() {
+        use crate::evaluation::exploitability::push_fold_exploitability;
+        use std::time::Instant;
+        let iters = 1_000_000;
+        let cfg = || PushFoldHoldem::new(40, 2, 1, 0);
+
+        let t0 = Instant::now();
+        let mut f32s: SoaMccfr<PushFoldHoldem> =
+            SoaMccfr::with_seed(cfg(), Variant::Dcfr(Discount::RECOMMENDED), 1).with_baseline();
+        f32s.train(iters);
+        let f32_secs = t0.elapsed().as_secs_f64();
+
+        let t0 = Instant::now();
+        let mut lean: LeanMccfr<PushFoldHoldem> =
+            LeanMccfr::with_seed(cfg(), Variant::Dcfr(Discount::LINEAR), 1).with_baseline();
+        lean.train(iters);
+        let lean_secs = t0.elapsed().as_secs_f64();
+
+        let game = cfg();
+        let expl_f32 = push_fold_exploitability(&game, &export_soa(&f32s), 200_000, 9);
+        let expl_lean = push_fold_exploitability(&game, &export_soa(&lean), 200_000, 9);
+        println!(
+            "f32+DCFR: {} B/infoset, {f32_secs:.2}s, expl {expl_f32:.4} bb | \
+             lean+LCFR: {} B/infoset, {lean_secs:.2}s, expl {expl_lean:.4} bb",
+            f32s.bytes_per_info_set(),
+            lean.bytes_per_info_set(),
+        );
+        assert_eq!(lean.bytes_per_info_set() * 2, f32s.bytes_per_info_set(), "half the accumulator bytes");
+        assert!(expl_lean < 0.12, "lean-trained strategy exploitability {expl_lean} bb too high");
+        assert!(
+            expl_lean < expl_f32 + 0.04,
+            "lean+LCFR ({expl_lean} bb) materially worse than f32+DCFR ({expl_f32} bb)"
+        );
+
+        let aa = lean.average_strategy_at(preflop_index(&[make_card(12, 0), make_card(12, 1)]) as usize)[1];
+        let trash = lean.average_strategy_at(preflop_index(&[make_card(5, 0), make_card(0, 1)]) as usize)[1];
+        assert!(aa > 0.9 && aa > trash, "lean chart shape: AA {aa} vs 72o {trash}");
+    }
+
     #[test]
     fn atomic_converges_like_the_serial_soa() {
         // The lock-free atomic trainer must reach a solution as close to Nash
@@ -404,7 +452,8 @@ mod tests {
         let iters = 1_000_000;
         let cfg = || PushFoldHoldem::new(40, 2, 1, 0);
 
-        let mut serial = SoaMccfr::with_seed(cfg(), Variant::Dcfr(Discount::RECOMMENDED), 1).with_baseline();
+        let mut serial: SoaMccfr<PushFoldHoldem> =
+            SoaMccfr::with_seed(cfg(), Variant::Dcfr(Discount::RECOMMENDED), 1).with_baseline();
         serial.train(iters);
 
         let mut atomic = SoaMccfr::with_seed(cfg(), Variant::Dcfr(Discount::RECOMMENDED), 1).with_baseline();
@@ -436,7 +485,8 @@ mod tests {
         hash.train_fast(iters);
         let havg = hash.average_strategy();
 
-        let mut soa = SoaMccfr::with_seed(cfg(), Variant::Dcfr(Discount::RECOMMENDED), 1).with_baseline();
+        let mut soa: SoaMccfr<PushFoldHoldem> =
+            SoaMccfr::with_seed(cfg(), Variant::Dcfr(Discount::RECOMMENDED), 1).with_baseline();
         soa.train(iters);
 
         // Compare the SB opening shove probability for every starting hand.
@@ -466,7 +516,8 @@ mod tests {
         // A flat-table checkpoint resumes bit-identically (f32 arrays + RNG +
         // counters round-trip exactly through bincode).
         let cfg = || PushFoldHoldem::new(40, 2, 1, 0);
-        let mut whole = SoaMccfr::with_seed(cfg(), Variant::Dcfr(Discount::RECOMMENDED), 11).with_baseline();
+        let mut whole: SoaMccfr<PushFoldHoldem> =
+            SoaMccfr::with_seed(cfg(), Variant::Dcfr(Discount::RECOMMENDED), 11).with_baseline();
         whole.train(40_000);
 
         let mut part = SoaMccfr::with_seed(cfg(), Variant::Dcfr(Discount::RECOMMENDED), 11).with_baseline();
