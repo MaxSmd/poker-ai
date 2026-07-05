@@ -126,6 +126,17 @@ resets the magnitude.
 | `resolving::gadget` + `continual` (CFV re-solving) | Multi-street play | Provable safety (opponent held to carried CFVs); warm re-entry **[measured: ~2× fewer iters from a coarse carry, up to ~1000× on re-entry]** | Explicit-deal enumeration — fine for narrowed ranges |
 | `resolving::vector_cfr` | Full-range (1326×1326) river resolves | Public-tree vectorization **[measured: ~1.1M-deal equivalent in ~1.3 s; agrees with the explicit oracle to 0.0001 bb]** | Complete-board subgames only; depth-limit leaves panic rather than mis-score |
 
+## 9b. Live play (`play slumbot`, `src/play/`)
+
+| Option | Use when | Benefits | Drawbacks |
+|---|---|---|---|
+| River re-solve (**default**) | Every river decision | Full-range vectorized CFR⁺ from the *real* public state — real pot/stacks, so bet-translation error vanishes on the deepest street; ~1–2 s/decision | River only (turn/flop resolving needs the blueprint leaf-value table) |
+| `--no-resolve` (blueprint throughout) | Debugging; latency-sensitive runs | Instant decisions, pure blueprint quality | Off-tree river bets only handled by translation, not by solving |
+| Pseudo-harmonic bet mapping (always on) | Opponent uses off-tree sizes | Randomized, boundary-indifferent mapping — much harder to exploit than nearest-size | Bets are never mapped to passive actions (desync-safe), so a min-bet reads as the smallest abstract size |
+| `--purify=X` (default 0.1) | Live play | Drops low-probability noise actions (trembling-hand cleanup) | Slightly narrows the mixed strategy; `0` to sample raw |
+| `--river-cap=N` / `--iters=N` | Tuning resolve depth vs latency | Bounds the resolve tree at deep stacks | Cap too low misses raise wars; iters too low leaves the resolve unconverged |
+| Bayes range tracking (always on) | Feeds the river resolve | `P(action｜hand)` blueprint updates + card removal each decision | Ranges are blueprint-consistent, not opponent-adaptive |
+
 ## 10. Evaluation toolkit
 
 | Tool | Use when | Caveat |
@@ -154,6 +165,9 @@ cluster [cap] [seed]                       card abstraction build
       POKER_AI_RIVER_OCHS=1                OCHS river feature
 memory_estimate [flop turn river]          exact footprint matrix (2p + 6-max)
       POKER_AI_ESTIMATE_STATES=N           betting-tree memo cap
+play slumbot [hands]                       live match vs slumbot.com (bb/100 ± CI)
+      --no-resolve --iters=N --river-cap=N --purify=X --seed=N
+      --token=T | --username=U --password=P
 scripts/train_wandb.py -- <train args>     W&B tracking wrapper
 POKER_AI_METRICS=1                         emit @wandb metric lines (no-op otherwise)
 ```

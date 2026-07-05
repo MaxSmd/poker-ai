@@ -83,9 +83,10 @@ full matrix before launching anything big.
 ### 3. Train the blueprint (`train blueprint`)
 
 ```bash
-# The headline run (production server config — Slumbot-depth 200bb stacks):
+# The headline run (production server config — Slumbot-depth 200bb stacks;
+# measured: 8.2 h / ~16 GB RSS on 32 cores, 2B iterations, 2.0T nodes):
 cargo run --release --bin train -- blueprint 2000000000 200 1 \
-    --cap=3 --soa --atomic --resume --expl --expl-iters=500000
+    --cap=3 --soa --atomic --resume
 ```
 
 - `--cap=N` — betting abstraction: max raises per street (the tree-size lever)
@@ -101,8 +102,11 @@ cargo run --release --bin train -- blueprint 2000000000 200 1 \
   (bit-reproducible per seed+batch, but merge-bound: ~7 effective cores)
 - `--resume` — continue from `data/blueprint_holdem_soa.ckpt` (checkpoints are
   atomic and written every `--chunk`; an interruption costs at most one chunk)
-- `--expl` / `--expl-iters=N` — periodic sampled best-response exploitability
-  (a lower bound; needs large N to be meaningful)
+- `--expl` / `--expl-iters=N` — periodic sampled best-response exploitability.
+  Fine for push/fold-sized games; at blueprint scale (hundreds of millions of
+  info sets) the sampled bound is meaningless at any affordable N and the
+  single-threaded pass costs ~25 min per report — leave it off and evaluate
+  offline instead
 - `--chunk=N`, `--expl-every=N` — progress/checkpoint cadence (default: line
   every 1%, exploitability every 10 chunks)
 
@@ -115,23 +119,50 @@ Wrap any training command with the W&B logger (`pip install wandb`):
 
 ```bash
 python scripts/train_wandb.py --name hu-200bb-cap3 -- \
-    blueprint 2000000000 200 1 --cap=3 --soa --atomic --resume --expl
+    blueprint 2000000000 200 1 --cap=3 --soa --atomic --resume
 ```
 
 Metrics (iteration, info sets, nodes/s, exploitability) are parsed from the
 trainer's `@wandb` lines and stepped by iteration, so runs of different length
 line up. Without the wrapper the trainer's output is unchanged.
 
-## Play-time re-solving
+## Playing against Slumbot
 
-The blueprint is deliberately coarse; quality at the table comes from the
-resolving stack (`crates/poker-ai/src/resolving/`): belief-state tracking,
-subgame construction rooted at the actual public state (off-tree bets
-included), CFR+ with blueprint warm-starting, multi-valued leaf continuations
-(the depth-limited-solving fix), CFV-gadget continual re-solving for safety,
-and a vectorized 1326-combo public-tree solver for full-range river resolves.
-`bin/play.rs` (the interactive bot wiring blueprint + resolver) is the next
-milestone.
+`bin/play.rs` wires the trained blueprint into a live agent for
+[Slumbot](https://www.slumbot.com) (heads-up NLHE, 200 bb, blinds 50/100 — the
+standard public benchmark bot):
+
+```bash
+# Needs data/blueprint_holdem.bin + the bucket maps from the SAME training run.
+cargo run --release --bin play -- slumbot 10000
+```
+
+Architecture (`crates/poker-ai/src/play/`):
+
+- **Dual-state tracking** — the real hand is mirrored inside the abstract
+  blueprint game; off-tree opponent bets are translated by **randomized
+  pseudo-harmonic mapping** (Ganzfried & Sandholm 2013) in pot-fraction space,
+  and our abstract raises translate back at the same pot fraction.
+- **Bayes range tracking** — both players' ranges are updated at every
+  decision with the blueprint's action likelihoods per hand, plus card removal.
+- **River re-solving** — each river decision is re-solved from the *actual*
+  public state (real pot/stacks, so translation error vanishes where the money
+  is deepest) with the vectorized full-range public-tree CFR⁺ solver
+  (`resolving/vector_cfr.rs`, ~1–2 s per decision). `--no-resolve` plays the
+  blueprint throughout instead.
+- The runner prints a running **bb/100 ± 95% CI**, emits `@wandb` metric lines
+  (wrap with `scripts/train_wandb.py` to chart a long match), persists the
+  session token, and logs every hand to `data/slumbot_results.csv`.
+
+Flags: `--iters=N` (resolve iterations), `--river-cap=N`, `--purify=X`
+(drop sub-X action probabilities), `--seed=N`, `--no-resolve`,
+`--token=`/`--username=`/`--password=` — see the header of `src/bin/play.rs`.
+
+The rest of the resolving stack (`crates/poker-ai/src/resolving/`) — CFV-gadget
+continual re-solving, blueprint warm-starting, multi-valued leaf continuations
+— is implemented and tested; extending play-time resolving from the river to
+turn/flop (which needs those depth-limited pieces plus a blueprint-derived
+leaf-value table) is the next quality lever.
 
 ## Evaluation toolkit
 

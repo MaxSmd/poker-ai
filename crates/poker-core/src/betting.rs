@@ -96,6 +96,31 @@ pub fn abstract_bet_size(pot: u32, current_bet: u32, raw_bet: u32, min_raise: u3
     best
 }
 
+/// Randomized **pseudo-harmonic** bet mapping (Ganzfried & Sandholm 2013): the
+/// probability that an off-tree bet `x` maps to the *smaller* of its two
+/// neighbouring abstraction sizes `lo < x < hi` (all three expressed as
+/// fractions of the pot):
+///
+/// ```text
+/// f(x) = (hi − x)(1 + lo) / ((hi − lo)(1 + x))
+/// ```
+///
+/// This is the unique mapping under which the caller of a half-street game is
+/// indifferent at the boundary sizes, and it is far harder to exploit than
+/// deterministic nearest-size mapping (which an opponent games by betting just
+/// past the midpoint).  `f(lo) = 1`, `f(hi) = 0`, monotone in between; `x`
+/// outside `[lo, hi]` clamps to the nearer endpoint.
+pub fn pseudo_harmonic_weight(lo: f64, hi: f64, x: f64) -> f64 {
+    debug_assert!(lo <= hi, "lo ({lo}) must not exceed hi ({hi})");
+    if hi - lo < 1e-12 || x <= lo {
+        return 1.0;
+    }
+    if x >= hi {
+        return 0.0;
+    }
+    ((hi - x) * (1.0 + lo)) / ((hi - lo) * (1.0 + x))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,6 +161,33 @@ mod tests {
         assert!(n > 0);
         for &a in &amounts[..n] {
             assert!(a >= 40, "raise total {a} must be >= current_bet(20) + min_raise(20)");
+        }
+    }
+
+    #[test]
+    fn pseudo_harmonic_endpoints_and_known_values() {
+        // Exact at the abstraction sizes themselves.
+        assert_eq!(pseudo_harmonic_weight(0.5, 1.0, 0.5), 1.0);
+        assert_eq!(pseudo_harmonic_weight(0.5, 1.0, 1.0), 0.0);
+        // Clamping outside the bracket.
+        assert_eq!(pseudo_harmonic_weight(0.5, 1.0, 0.3), 1.0);
+        assert_eq!(pseudo_harmonic_weight(0.5, 1.0, 1.7), 0.0);
+        // Ganzfried & Sandholm's worked example: f_{0,1}(0.25) = 0.6.
+        let f = pseudo_harmonic_weight(0.0, 1.0, 0.25);
+        assert!((f - 0.6).abs() < 1e-12, "f_(0,1)(0.25) = 0.6, got {f}");
+        // Degenerate bracket (identical sizes) is a certain map, not a NaN.
+        assert_eq!(pseudo_harmonic_weight(0.75, 0.75, 0.75), 1.0);
+    }
+
+    #[test]
+    fn pseudo_harmonic_is_monotone_decreasing_in_x() {
+        let mut prev = 1.0;
+        for i in 0..=20 {
+            let x = 0.5 + 0.5 * i as f64 / 20.0;
+            let f = pseudo_harmonic_weight(0.5, 1.0, x);
+            assert!(f <= prev + 1e-12, "weight must fall as the bet grows");
+            assert!((0.0..=1.0).contains(&f), "a probability, got {f}");
+            prev = f;
         }
     }
 

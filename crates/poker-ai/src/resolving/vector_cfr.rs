@@ -135,6 +135,10 @@ pub struct VectorCfr {
     reach1: [f64; NUM_COMBOS],
     board: [u8; 5],
     big_blind: f64,
+    /// Maximum raises in the subgame (`u32::MAX` = the engine's unbounded
+    /// re-raising).  Deep-stacked resolving needs a finite cap for the same
+    /// reason the blueprint does: geometric raise chains blow the tree up.
+    raise_cap: u32,
     t: u64,
 }
 
@@ -142,6 +146,14 @@ impl VectorCfr {
     /// Build the public tree rooted at `root` (a complete-board public state)
     /// over the two belief ranges.  Solved with CFR⁺ (RM⁺ + linear averaging).
     pub fn new(root: &GameState, beliefs: &[BeliefState]) -> Self {
+        Self::new_capped(root, beliefs, u32::MAX)
+    }
+
+    /// [`new`](Self::new) with the subgame's aggression bounded at `raise_cap`
+    /// raises: past the cap voluntary aggression (raise / voluntary all-in) is
+    /// pruned, exactly mirroring the blueprint's betting abstraction
+    /// (`BlueprintHoldem::capped_legal`) — a forced all-in call always stays.
+    pub fn new_capped(root: &GameState, beliefs: &[BeliefState], raise_cap: u32) -> Self {
         assert_eq!(beliefs.len(), 2, "heads-up vectorized resolving needs two ranges");
         let board = root.board;
         let big_blind = root.big_blind as f64;
@@ -178,13 +190,30 @@ impl VectorCfr {
             reach1,
             board,
             big_blind,
+            raise_cap,
             t: 0,
         };
-        me.root = me.build(root.clone(), Vec::new());
+        me.root = me.build(root.clone(), Vec::new(), 0);
         me
     }
 
-    fn build(&mut self, gs: GameState, history: Vec<u8>) -> usize {
+    /// The subgame's legal actions under the raise cap: past `raises` ≥ cap,
+    /// drop every `Raise` and any *voluntary* `AllIn` (one where a passive
+    /// action exists) — the same filter as `BlueprintHoldem::capped_legal`.
+    fn capped_legal(&self, gs: &GameState, raises: u32) -> Vec<poker_core::action::Action> {
+        use poker_core::action::Action;
+        let full = legal_actions(gs);
+        if raises < self.raise_cap {
+            return full.to_vec();
+        }
+        let has_passive = full.iter().any(|a| matches!(a, Action::Check | Action::Call));
+        full.iter()
+            .copied()
+            .filter(|a| !(matches!(a, Action::Raise(_)) || (matches!(a, Action::AllIn) && has_passive)))
+            .collect()
+    }
+
+    fn build(&mut self, gs: GameState, history: Vec<u8>, raises: u32) -> usize {
         if gs.is_terminal() {
             let active = (0..gs.num_players as usize).filter(|&i| gs.folded & (1 << i) == 0).count();
             let id = self.kinds.len();
@@ -207,14 +236,16 @@ impl VectorCfr {
         );
 
         let player = gs.current_player();
-        let acts = legal_actions(&gs);
+        let acts = self.capped_legal(&gs, raises);
         let mut children = Vec::with_capacity(acts.len());
         for (i, &act) in acts.iter().enumerate() {
+            let old_bet = gs.current_bet;
             let mut next = gs.clone();
             next.apply_action(act);
+            let r = if next.current_bet > old_bet { raises + 1 } else { raises };
             let mut h = history.clone();
             h.push(i as u8);
-            children.push(self.build(next, h));
+            children.push(self.build(next, h, r));
         }
         let store = self.stores.len();
         self.stores.push(NodeStore::new(acts.len()));
@@ -337,6 +368,20 @@ pub fn solve_vectorized(root: &GameState, beliefs: &[BeliefState], iters: u64) -
     solver.into_resolved()
 }
 
+/// [`solve_vectorized`] with the subgame's aggression bounded at `raise_cap`
+/// raises — required for deep-stacked play-time resolving, where the unbounded
+/// re-raise chain makes the public tree explode (see [`VectorCfr::new_capped`]).
+pub fn solve_vectorized_capped(
+    root: &GameState,
+    beliefs: &[BeliefState],
+    iters: u64,
+    raise_cap: u32,
+) -> VectorResolved {
+    let mut solver = VectorCfr::new_capped(root, beliefs, raise_cap);
+    solver.run(iters);
+    solver.into_resolved()
+}
+
 /// Blocker-corrected opponent reach per hero hand: `total − card[a] − card[b] +
 /// reach[h]`, zero for hero hands using a board card.  This is the reach mass of
 /// opponents that do **not** share a card with the hero (or the board).
@@ -370,6 +415,31 @@ fn valid_reach(board: &[u8; 5], reach: &[f64; NUM_COMBOS]) -> [f64; NUM_COMBOS] 
         *slot = total - card[a as usize] - card[b as usize] + reach[i];
     }
     out
+}
+
+/// The action menu at the **root** of a capped vectorized subgame —
+/// index-aligned with the per-hand distributions [`solve_vectorized_capped`]
+/// emits at the root key (empty history).  Play-time resolving samples an
+/// index from the resolved distribution and looks the concrete action up here.
+pub fn capped_root_actions(root: &GameState, raise_cap: u32) -> Vec<poker_core::action::Action> {
+    use poker_core::action::Action;
+    let full = legal_actions(root);
+    if raise_cap > 0 {
+        return full.to_vec();
+    }
+    let has_passive = full.iter().any(|a| matches!(a, Action::Check | Action::Call));
+    full.iter()
+        .copied()
+        .filter(|a| !(matches!(a, Action::Raise(_)) || (matches!(a, Action::AllIn) && has_passive)))
+        .collect()
+}
+
+/// The key under which [`VectorResolved::strategy`] stores a hand's
+/// distribution (the explicit `Subgame::info_key`).  `hole` must be sorted
+/// ascending; `history` is the action-index path from the resolve root
+/// (empty at the root itself).
+pub fn subgame_info_key(player: usize, hole: [u8; 2], board: &[u8; 5], history: &[u8]) -> u64 {
+    info_key(player, hole, board, history)
 }
 
 /// Reproduce [`Subgame::info_key`](crate::resolving::subgame): FNV-1a of
@@ -495,6 +565,46 @@ mod tests {
         // Tiny public tree, but thousands of per-hand info sets emitted.
         assert!(resolved.public_nodes < 100, "betting tree is small regardless of range breadth");
         assert!(resolved.info_sets > 1000, "full ranges yield many per-hand info sets");
+    }
+
+    #[test]
+    fn raise_cap_bounds_the_public_tree() {
+        // Deep-ish stacks with a small pot: the raise chain is what the cap
+        // prunes.  The capped tree must be strictly smaller, still solve to
+        // valid distributions, and a generous cap must reproduce the uncapped
+        // tree exactly.
+        let beliefs = duel_ranges();
+        let root = public_root(river_board(), 200);
+        let capped = {
+            let mut s = VectorCfr::new_capped(&root, &beliefs, 1);
+            s.run(200);
+            s.into_resolved()
+        };
+        let uncapped = solve_vectorized(&root, &beliefs, 200);
+        assert!(
+            capped.public_nodes < uncapped.public_nodes,
+            "cap-1 tree ({}) must be smaller than uncapped ({})",
+            capped.public_nodes,
+            uncapped.public_nodes
+        );
+        for probs in capped.strategy.values() {
+            let sum: f64 = probs.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-9);
+        }
+        let generous = VectorCfr::new_capped(&root, &beliefs, 1_000);
+        assert_eq!(
+            generous.kinds.len(),
+            VectorCfr::new(&root, &beliefs).kinds.len(),
+            "a cap the tree never reaches changes nothing"
+        );
+        // The root menu helper is index-aligned with the built tree's root.
+        let acts = capped_root_actions(&root, 1);
+        let NodeKind::Decision { children, .. } = &VectorCfr::new_capped(&root, &beliefs, 1).kinds
+            [VectorCfr::new_capped(&root, &beliefs, 1).root]
+        else {
+            panic!("root is a decision node");
+        };
+        assert_eq!(acts.len(), children.len(), "root menu width matches the tree");
     }
 
     #[test]

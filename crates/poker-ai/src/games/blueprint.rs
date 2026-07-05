@@ -395,18 +395,70 @@ impl BlueprintHoldem {
     /// so neither the clone-based nor the cursor-based path allocates a `Vec`.
     fn info_key_for(&self, gs: &GameState, history: &[u8]) -> u64 {
         let player = gs.current_player();
-        let mut hole = gs.hole_cards[player];
-        hole.sort_unstable();
+        let hole = gs.hole_cards[player];
         let visible = gs.board_cards_count();
-        let bucket = self.situation_bucket(&hole, &gs.board[..visible]);
+        self.key_for_cards(player, hole, &gs.board[..visible], history)
+    }
+
+    /// The information key `player` would have holding `hole` at the public
+    /// situation `(board, history)` — the shared kernel of [`Game::info_key`]
+    /// and the play-time belief updates (which ask "what key — and hence what
+    /// blueprint strategy — would the opponent have with *this* hand?").
+    fn key_for_cards(&self, player: usize, mut hole: [u8; 2], board: &[u8], history: &[u8]) -> u64 {
+        hole.sort_unstable();
+        let bucket = self.situation_bucket(&hole, board);
 
         let mut h = Fnv1a::new();
         h.write(player as u8);
-        h.write(visible as u8);
+        h.write(board.len() as u8);
         h.write_all(&bucket.to_le_bytes());
         h.write(0xFF); // separator so bucket bytes / history can't blur
         h.write_all(history);
         h.finish()
+    }
+
+    // ------------------------------------------------------------------
+    // Play-time API (`crate::play`): track a real hand through the abstract
+    // game and read blueprint keys for arbitrary hypothetical holdings.
+    // ------------------------------------------------------------------
+
+    /// Construct a play node from concrete cards: both hole pairs plus the
+    /// board known so far (`NO_CARD` for unrevealed cards), with no action
+    /// history.  The entry point for play-time tracking of a real hand; advance
+    /// it with [`Game::apply`] using indices into [`actions`](Self::actions).
+    pub fn play_state(&self, holes: [[u8; 2]; 2], board: [u8; 5]) -> BlueprintState {
+        let mut all = [[NO_CARD; 2]; MAX_PLAYERS];
+        all[0] = holes[0];
+        all[1] = holes[1];
+        let gs =
+            GameState::new(2, self.big_blind, self.small_blind, self.stacks, all, board, self.button);
+        BlueprintState { gs: Some(gs), history: Vec::new(), street_raises: 0 }
+    }
+
+    /// The capped legal actions at a play node — the very list whose indices
+    /// [`Game::apply`] takes and the info-key history records.
+    pub fn actions(&self, state: &BlueprintState) -> ActionList {
+        let gs = state.gs.as_ref().expect("actions at a play node");
+        self.capped_legal(gs, state.street_raises)
+    }
+
+    /// The wrapped engine state of a play node (pot, bets, street — read-only).
+    pub fn game_state<'s>(&self, state: &'s BlueprintState) -> &'s GameState {
+        state.gs.as_ref().expect("game_state at a play node")
+    }
+
+    /// The information key the acting player at `state` would have if it held
+    /// `hole` instead of its dealt cards — the belief-update primitive
+    /// (likelihood of an observed action given each opponent hand).
+    pub fn info_key_with_hole(&self, state: &BlueprintState, hole: [u8; 2]) -> u64 {
+        let gs = state.gs.as_ref().expect("info_key_with_hole at a play node");
+        let visible = gs.board_cards_count();
+        self.key_for_cards(gs.current_player(), hole, &gs.board[..visible], &state.history)
+    }
+
+    /// The big blind in the game's chip units (play-time chip↔bb conversion).
+    pub fn big_blind_chips(&self) -> u32 {
+        self.big_blind
     }
 }
 
