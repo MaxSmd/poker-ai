@@ -95,12 +95,22 @@ impl Bot {
     /// Begin a hand as `client_pos` (Slumbot convention) holding `hole`.
     pub fn start_hand(&mut self, client_pos: u8, hole: [u8; 2]) -> HandState {
         let my_seat = 1 - client_pos as usize;
+        let mut ranges = [BeliefState::uniform(), BeliefState::uniform()];
+        // The opponent can never hold our cards — filter them out up front.
+        let mut mask = vec![1.0; NUM_COMBOS];
+        for (i, m) in mask.iter_mut().enumerate() {
+            let [a, b] = combo_cards(i);
+            if a == hole[0] || a == hole[1] || b == hole[0] || b == hole[1] {
+                *m = 0.0;
+            }
+        }
+        ranges[1 - my_seat].update(&mask);
         HandState {
             my_pos: client_pos,
             my_seat,
             my_hole: hole,
             hand: AbstractHand::new(&self.game, my_seat, hole),
-            ranges: [BeliefState::uniform(), BeliefState::uniform()],
+            ranges,
             processed: 0,
             board_seen: 0,
             pending_self: None,
@@ -136,6 +146,13 @@ impl Bot {
         if board.len() != hs.board_seen {
             hs.hand.set_board(&self.game, board, hs.my_seat);
             hs.board_seen = board.len();
+            // Card removal: hands overlapping the revealed board are dead.
+            // Doing this at every reveal (not just at the river resolve) is
+            // load-bearing — the likelihood loop must never compute a key for
+            // a combo that shares a card with the board.
+            for r in &mut hs.ranges {
+                r.remove_board(board);
+            }
         }
         let events: Vec<Event> = parsed.events[hs.processed..].to_vec();
         for ev in events {
@@ -189,12 +206,26 @@ impl Bot {
     /// by the blueprint's likelihood of the action with that hand.
     fn update_range(&self, hs: &mut HandState, seat: usize, action_index: u8) {
         let n = hs.hand.actions(&self.game).len();
+        // Combos sharing a card with the visible board must never reach the
+        // hand indexer (a duplicated card yields a garbage canonical index).
+        // They carry zero range mass after card removal; this mask is the
+        // defensive second line.
+        let gs = hs.hand.gs(&self.game);
+        let mut board_mask = 0u64;
+        for &c in &gs.board[..gs.board_cards_count()] {
+            board_mask |= 1 << c;
+        }
         let mut likelihood = vec![1.0; NUM_COMBOS];
         for (i, l) in likelihood.iter_mut().enumerate() {
             if hs.ranges[seat].probs[i] <= 0.0 {
                 continue; // dead hand: skip the (costly) key computation
             }
-            let key = hs.hand.key_with_hole(&self.game, combo_cards(i));
+            let [a, b] = combo_cards(i);
+            if board_mask & (1 << a) != 0 || board_mask & (1 << b) != 0 {
+                *l = 0.0;
+                continue;
+            }
+            let key = hs.hand.key_with_hole(&self.game, [a, b]);
             *l = self.policy.probs_or_uniform(key, n)[action_index as usize];
         }
         hs.ranges[seat].update(&likelihood);
@@ -512,6 +543,47 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn bucketed_flop_updates_never_index_out_of_bounds() {
+        // Regression: with a real (bounds-checked) bucket map loaded, the
+        // belief-update loop used to feed board-overlapping combos into the
+        // hand indexer — a duplicated card yields an index past the canonical
+        // table and panicked in BucketMap::bucket (seen live on the first
+        // flop decision against Slumbot).  Card removal at board reveal plus
+        // the defensive mask must keep every queried combo valid.
+        use crate::abstraction::bucket_map::BucketMap;
+        let game = BlueprintHoldem::new(400, 2, 1, 0)
+            .with_raise_cap(3)
+            .with_street_bucket(0, BucketMap::full_coverage_mod(&[2, 3], 40));
+        let policy = CompactPolicy::from_entries(vec![]);
+        let mut b = Bot::new(
+            game,
+            policy,
+            BotConfig { resolve_river: false, river_iters: 0, river_cap: 2, purify: 0.0, seed: 7 },
+        );
+        // We are the BB (first to act postflop): SB opens, we call, flop comes,
+        // our decision triggers a bucketed range update over the full board.
+        let hole = [parse_card("Ac").unwrap(), parse_card("Kd").unwrap()];
+        let mut hs = b.start_hand(0, hole);
+        let board = cards(&["Qs", "4s", "3h"]);
+        let incr = b.act(&mut hs, "b300c/", &board).expect("flop decision with bucket map");
+        assert!(parse_action(&format!("b300c/{incr}")).is_ok(), "legal move, got {incr:?}");
+
+        // Board-overlapping combos carry zero mass in both ranges.
+        for r in &hs.ranges {
+            for (i, &p) in r.probs.iter().enumerate() {
+                let [a, c] = combo_cards(i);
+                if board.contains(&a) || board.contains(&c) {
+                    assert_eq!(p, 0.0, "board-overlap combo must be dead");
+                }
+            }
+            assert!((r.probs.iter().sum::<f64>() - 1.0).abs() < 1e-9);
+        }
+        // And the opponent can never hold our exact cards.
+        let opp = &hs.ranges[1 - hs.my_seat];
+        assert_eq!(opp.prob(hole[0], hole[1]), 0.0);
     }
 
     #[test]
