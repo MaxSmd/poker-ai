@@ -100,8 +100,10 @@ def main():
     for k in sorted(st):
         line(names.get(k, str(k)), st[k], total_net)
 
-    print("\nShowdown vs not (showdown = bot cards revealed):")
-    sd = bucketize(rows, lambda r: "showdown" if r.get("bot_hole") else "no showdown")
+    # Showdown = the hand ended with no fold (all checks/calls to a decision).
+    # Slumbot returns its hole cards every hand, so bot_hole is NOT the signal.
+    print("\nShowdown vs not (showdown = no fold in the action):")
+    sd = bucketize(rows, lambda r: "no showdown" if "f" in r.get("action", "") else "showdown")
     for k in ("showdown", "no showdown"):
         line(k, sd.get(k, []), total_net)
 
