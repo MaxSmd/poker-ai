@@ -26,12 +26,18 @@ BIG_BLIND = 100
 
 
 def load(path):
-    rows = []
+    rows, bad = [], 0
     with open(path) as f:
         for line in f:
             line = line.strip()
-            if line:
+            if not line:
+                continue
+            try:
                 rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                bad += 1
+    if bad:
+        print(f"(skipped {bad} malformed line(s))")
     return rows
 
 

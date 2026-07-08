@@ -214,26 +214,24 @@ struct HandRecord {
 }
 
 impl HandRecord {
-    /// One JSONL line. `client_pos` follows Slumbot (0 = BB, 1 = SB); `action`
-    /// is the full final action string; `reached_street` is derived so the
-    /// analyzer needn't re-parse (0=preflop … 3=river; how far the hand got).
+    /// One JSONL line, built with `serde_json` so every field is escaped
+    /// correctly (hand-rolled JSON is how subtle quoting bugs sneak in).
+    /// `client_pos` follows Slumbot (0 = BB, 1 = SB); `action` is the full
+    /// final action string; `reached_street` is derived so the analyzer needn't
+    /// re-parse (0=preflop … 3=river; how far the hand got).
     fn to_json(&self, index: u64) -> String {
         let reached = parse_action(&self.action).map(|p| p.street).unwrap_or(0);
-        let arr = |v: &[String]| {
-            let inner: Vec<String> = v.iter().map(|s| format!("\"{s}\"")).collect();
-            format!("[{}]", inner.join(","))
-        };
-        format!(
-            "{{\"i\":{},\"pos\":{},\"winnings\":{},\"reached_street\":{},\"hole\":{},\"bot_hole\":{},\"board\":{},\"action\":\"{}\"}}",
-            index,
-            self.client_pos,
-            self.winnings,
-            reached,
-            arr(&self.hole_cards),
-            arr(&self.bot_hole_cards),
-            arr(&self.board),
-            self.action
-        )
+        let obj = serde_json::json!({
+            "i": index,
+            "pos": self.client_pos,
+            "winnings": self.winnings,
+            "reached_street": reached,
+            "hole": self.hole_cards,
+            "bot_hole": self.bot_hole_cards,
+            "board": self.board,
+            "action": self.action,
+        });
+        obj.to_string()
     }
 }
 
