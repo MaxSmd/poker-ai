@@ -14,6 +14,10 @@
 //!     --river-cap=N      raise cap inside a river resolve (default 3)
 //!     --purify=X         drop action probabilities below X (default 0.1)
 //!     --seed=N           sampling seed (default 1)
+//!     --log-hands        append full per-hand histories (final action string,
+//!                        both hands, position, board, winnings) as JSONL to
+//!                        DATA/slumbot_hands.jsonl — the post-mortem feed for
+//!                        scripts/analyze_slumbot.py
 //!     --token=T          reuse a session token (also persisted to
 //!                        DATA/slumbot_token.txt automatically)
 //!     --username=U --password=P   log in a registered account instead
@@ -131,6 +135,11 @@ fn run_slumbot(args: &[String]) {
 
     let csv_path = dir.join("slumbot_results.csv");
     let mut csv = std::fs::OpenOptions::new().create(true).append(true).open(&csv_path).ok();
+    let log_hands = args.iter().any(|a| a == "--log-hands");
+    let hands_path = dir.join("slumbot_hands.jsonl");
+    let mut hands_log = log_hands
+        .then(|| std::fs::OpenOptions::new().create(true).append(true).open(&hands_path).ok())
+        .flatten();
 
     let mut played: u64 = 0;
     let mut errors: u64 = 0;
@@ -139,13 +148,17 @@ fn run_slumbot(args: &[String]) {
     println!("Playing {hands} hands against Slumbot ...");
     while played < hands {
         match play_one_hand(&client, &mut bot, &mut token) {
-            Ok(winnings) => {
+            Ok(rec) => {
+                let winnings = rec.winnings;
                 played += 1;
                 let bb = winnings as f64 / BIG_BLIND as f64;
                 net_bb += bb;
                 sumsq_bb += bb * bb;
                 if let Some(f) = csv.as_mut() {
                     let _ = writeln!(f, "{played},{winnings}");
+                }
+                if let Some(f) = hands_log.as_mut() {
+                    let _ = writeln!(f, "{}", rec.to_json(played));
                 }
                 if let Some(t) = &token {
                     let _ = std::fs::write(&token_path, t);
@@ -189,8 +202,47 @@ fn run_slumbot(args: &[String]) {
     println!("Per-hand log: {}", csv_path.display());
 }
 
-/// Play a single hand start to finish; returns our winnings in chips.
-fn play_one_hand(client: &SlumbotClient, bot: &mut Bot, token: &mut Option<String>) -> Result<i64, String> {
+/// The outcome of one played hand — winnings plus the fields a post-mortem
+/// needs (all from the final server response).
+struct HandRecord {
+    winnings: i64,
+    client_pos: u8,
+    hole_cards: Vec<String>,
+    bot_hole_cards: Vec<String>,
+    board: Vec<String>,
+    action: String,
+}
+
+impl HandRecord {
+    /// One JSONL line. `client_pos` follows Slumbot (0 = BB, 1 = SB); `action`
+    /// is the full final action string; `reached_street` is derived so the
+    /// analyzer needn't re-parse (0=preflop … 3=river; how far the hand got).
+    fn to_json(&self, index: u64) -> String {
+        let reached = parse_action(&self.action).map(|p| p.street).unwrap_or(0);
+        let arr = |v: &[String]| {
+            let inner: Vec<String> = v.iter().map(|s| format!("\"{s}\"")).collect();
+            format!("[{}]", inner.join(","))
+        };
+        format!(
+            "{{\"i\":{},\"pos\":{},\"winnings\":{},\"reached_street\":{},\"hole\":{},\"bot_hole\":{},\"board\":{},\"action\":\"{}\"}}",
+            index,
+            self.client_pos,
+            self.winnings,
+            reached,
+            arr(&self.hole_cards),
+            arr(&self.bot_hole_cards),
+            arr(&self.board),
+            self.action
+        )
+    }
+}
+
+/// Play a single hand start to finish; returns the full record for logging.
+fn play_one_hand(
+    client: &SlumbotClient,
+    bot: &mut Bot,
+    token: &mut Option<String>,
+) -> Result<HandRecord, String> {
     let mut r = client.new_hand(token.as_deref())?;
     if let Some(t) = r.token.take() {
         *token = Some(t);
@@ -206,7 +258,14 @@ fn play_one_hand(client: &SlumbotClient, bot: &mut Bot, token: &mut Option<Strin
 
     loop {
         if let Some(w) = r.winnings {
-            return Ok(w);
+            return Ok(HandRecord {
+                winnings: w,
+                client_pos,
+                hole_cards: hole_strs,
+                bot_hole_cards: r.bot_hole_cards.clone().unwrap_or_default(),
+                board: r.board.clone().unwrap_or_default(),
+                action: r.action.clone().unwrap_or_default(),
+            });
         }
         let action = r.action.clone().ok_or("response missing action")?;
         let board = parse_cards(r.board.as_deref().unwrap_or(&[]))?;
