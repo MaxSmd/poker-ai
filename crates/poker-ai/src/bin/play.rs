@@ -31,10 +31,14 @@ use std::path::{Path, PathBuf};
 
 use poker_ai::abstraction::bucket_map::BucketMap;
 use poker_ai::games::blueprint::BlueprintHoldem;
+use poker_ai::games::Game;
 use poker_ai::play::cards::parse_cards;
 use poker_ai::play::protocol::{parse_action, BIG_BLIND};
 use poker_ai::play::slumbot::SlumbotClient;
 use poker_ai::play::{Bot, BotConfig, CompactPolicy};
+use poker_core::action::Action;
+use poker_core::make_card;
+use poker_core::state::NO_CARD;
 
 const ABSTRACT_BB: u32 = 2;
 const ABSTRACT_SB: u32 = 1;
@@ -47,11 +51,167 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("slumbot") => run_slumbot(&args),
+        Some("chart") => run_chart(&args),
         _ => {
-            eprintln!("usage: play slumbot [hands] [flags] — see the header of src/bin/play.rs");
+            eprintln!(
+                "usage: play slumbot [hands] [flags]  |  play chart [flags]\n\
+                 see the header of src/bin/play.rs"
+            );
             std::process::exit(2);
         }
     }
+}
+
+/// Rank letters for the preflop chart, display index 0=A … 12=2.
+const RANK_LETTERS: [char; 13] = ['A', 'K', 'Q', 'J', 'T', '9', '8', '7', '6', '5', '4', '3', '2'];
+
+/// Engine rank for a display index (0=A → 12, 12=2 → 0).
+fn engine_rank(display: usize) -> u8 {
+    (12 - display) as u8
+}
+
+/// Concrete hole cards for chart cell `(row, col)` in the standard layout:
+/// upper triangle (row<col) = suited, lower (row>col) = offsuit, diagonal =
+/// pair.  Rows/cols are display indices (0=A … 12=2).
+fn cell_hole(row: usize, col: usize) -> [u8; 2] {
+    if row == col {
+        let r = engine_rank(row);
+        [make_card(r, 0), make_card(r, 1)]
+    } else if row < col {
+        // suited: high rank = row, low = col, same suit
+        [make_card(engine_rank(row), 0), make_card(engine_rank(col), 0)]
+    } else {
+        // offsuit: high rank = col, low = row, different suits
+        [make_card(engine_rank(col), 0), make_card(engine_rank(row), 1)]
+    }
+}
+
+/// Two filler cards not colliding with `hero` — the opponent's placeholder
+/// (never affects the acting player's own info key).
+fn filler(hero: [u8; 2]) -> [u8; 2] {
+    let mut out = [NO_CARD; 2];
+    let mut n = 0;
+    for c in 0u8..52 {
+        if c != hero[0] && c != hero[1] {
+            out[n] = c;
+            n += 1;
+            if n == 2 {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Aggregate an action distribution into (fold, passive=check/call,
+/// aggressive=raise/all-in) probabilities.
+fn classify(menu: &[Action], probs: &[f64]) -> (f64, f64, f64) {
+    let (mut fold, mut passive, mut aggro) = (0.0, 0.0, 0.0);
+    for (a, &p) in menu.iter().zip(probs) {
+        match a {
+            Action::Fold => fold += p,
+            Action::Check | Action::Call => passive += p,
+            Action::Raise(_) | Action::AllIn => aggro += p,
+        }
+    }
+    (fold, passive, aggro)
+}
+
+/// Print a 13×13 percentage grid (values already in 0..=100), `?` where the
+/// blueprint never stored the info set (uniform fallback).
+fn print_grid(title: &str, vals: &[[f64; 13]; 13], missing: &[[bool; 13]; 13]) {
+    println!("\n{title}  (rows/cols A→2; upper=suited, lower=offsuit, diag=pairs)");
+    print!("     ");
+    for c in RANK_LETTERS {
+        print!("{c:>4}");
+    }
+    println!();
+    for r in 0..13 {
+        print!("  {} ", RANK_LETTERS[r]);
+        for c in 0..13 {
+            if missing[r][c] {
+                print!("   ?");
+            } else {
+                print!("{:>4.0}", vals[r][c]);
+            }
+        }
+        println!();
+    }
+}
+
+/// Dump the blueprint's preflop strategy — the SB open chart and the BB
+/// response to the smallest SB open — so a preflop leak (over-folding the BB,
+/// too-tight opens) is visible at a glance.
+///
+///   play chart [--data=DIR --stack-bb=N --cap=N]
+fn run_chart(args: &[String]) {
+    let dir = PathBuf::from(flag::<String>(args, "data").unwrap_or_else(|| "data".into()));
+    let stack_bb: u32 = flag(args, "stack-bb").unwrap_or(200);
+    let cap: u32 = flag(args, "cap").unwrap_or(3);
+
+    println!("Loading abstraction from {} ({stack_bb}bb, cap-{cap})", dir.display());
+    let game = load_game(&dir, stack_bb, cap);
+    let policy_path = dir.join("blueprint_holdem.bin");
+    println!("Loading blueprint strategy {} ...", policy_path.display());
+    let policy = CompactPolicy::load(&policy_path).unwrap_or_else(|e| {
+        eprintln!("cannot load {}: {e}", policy_path.display());
+        std::process::exit(1);
+    });
+    println!("  {} info sets", policy.len());
+
+    let mut sb_open = [[0.0f64; 13]; 13]; // P(raise/all-in) opening the button
+    let mut sb_fold = [[0.0f64; 13]; 13]; // P(fold) — the SB min-fold
+    let mut bb_fold = [[0.0f64; 13]; 13]; // P(fold) facing the smallest SB open
+    let mut bb_3bet = [[0.0f64; 13]; 13]; // P(raise/all-in) — the BB 3-bet
+    let mut sb_missing = [[false; 13]; 13];
+    let mut bb_missing = [[false; 13]; 13];
+
+    for row in 0..13 {
+        for col in 0..13 {
+            let hero = cell_hole(row, col);
+            let opp = filler(hero);
+
+            // --- SB open: seat 0 (button) to act, empty history. ---
+            let sb_state = game.play_state([hero, opp], [NO_CARD; 5]);
+            let menu = game.actions(&sb_state);
+            let key = game.info_key(&sb_state);
+            sb_missing[row][col] = policy.get(key).is_none();
+            let probs = policy.probs_or_uniform(key, menu.len());
+            let (fold, _passive, aggro) = classify(&menu, &probs);
+            sb_open[row][col] = 100.0 * aggro;
+            sb_fold[row][col] = 100.0 * fold;
+
+            // --- BB defense vs the smallest SB open. ---
+            // Put the hero hand in the BB (seat 1); a filler SB (seat 0) makes
+            // the smallest raise, then the BB is to act.  The BB's key depends
+            // only on its own hand + the action history, so the SB filler cards
+            // are irrelevant.
+            let sb_filler = filler(hero);
+            let opener = game.play_state([sb_filler, hero], [NO_CARD; 5]);
+            let open_menu = game.actions(&opener);
+            if let Some(raise_idx) = open_menu.iter().position(|a| matches!(a, Action::Raise(_))) {
+                let bb_state = game.apply(&opener, raise_idx);
+                let bmenu = game.actions(&bb_state);
+                let bkey = game.info_key(&bb_state);
+                bb_missing[row][col] = policy.get(bkey).is_none();
+                let bprobs = policy.probs_or_uniform(bkey, bmenu.len());
+                let (bfold, _bpassive, baggro) = classify(&bmenu, &bprobs);
+                bb_fold[row][col] = 100.0 * bfold;
+                bb_3bet[row][col] = 100.0 * baggro;
+            } else {
+                bb_missing[row][col] = true;
+            }
+        }
+    }
+
+    print_grid("SB open — P(raise/all-in) %", &sb_open, &sb_missing);
+    print_grid("SB fold % (limp-or-fold: high = over-folding the button)", &sb_fold, &sb_missing);
+    print_grid("BB vs smallest SB open — P(fold) %", &bb_fold, &bb_missing);
+    print_grid("BB vs smallest SB open — P(3-bet) %", &bb_3bet, &bb_missing);
+    println!(
+        "\nSanity: strong hands should show high SB-open / high BB-3bet and low fold; \
+         trash the reverse. `?` = info set the blueprint never visited."
+    );
 }
 
 /// Load the abstract game exactly as it was trained (same stack, cap, and
