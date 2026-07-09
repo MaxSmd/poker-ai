@@ -73,6 +73,52 @@ def bucketize(rows, keyfn):
     return b
 
 
+def preflop_folder(action):
+    """Slumbot pos (0=BB, 1=SB) of whoever folded preflop, or None if the hand
+    reached the flop.  SB (pos 1) acts first preflop; the turn alternates."""
+    pos = 1
+    i, n = 0, len(action)
+    while i < n:
+        c = action[i]
+        if c == "/":
+            return None  # advanced to the flop, no preflop fold
+        if c == "f":
+            return pos
+        if c == "b":
+            i += 1
+            while i < n and action[i].isdigit():
+                i += 1
+            pos ^= 1
+            continue
+        pos ^= 1  # k or c
+        i += 1
+    return None
+
+
+def preflop_breakdown(rows, total_net):
+    """Split preflop-ending hands by who folded and our position — pinpoints
+    whether the preflop bleed is us over-folding the BB, our button opens/limps
+    getting no fold, or us getting 3-bet off."""
+    pf = [r for r in rows if r.get("reached_street", 0) == 0]
+    if not pf:
+        return
+    print(f"\nPreflop-ending hands ({len(pf)}), by who folded (our pos-relative):")
+    buckets = defaultdict(list)
+    for r in pf:
+        folder = preflop_folder(r.get("action", ""))
+        us = r["pos"]  # our Slumbot pos
+        w = r["winnings"] / BIG_BLIND
+        if folder is None:
+            key = "no fold (all-in preflop)"
+        elif folder == us:
+            key = f"WE folded ({'BB' if us == 0 else 'SB'})"
+        else:
+            key = f"THEY folded (we were {'BB' if us == 0 else 'SB'})"
+        buckets[key].append(w)
+    for k in sorted(buckets):
+        line(k, buckets[k], total_net)
+
+
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else "data/slumbot_hands.jsonl"
     rows = load(path)
@@ -129,6 +175,8 @@ def main():
                  if r["pos"] == p and r.get("reached_street", 0) == s]
             if v:
                 line(f"{plab} {names[s]}", v, total_net)
+
+    preflop_breakdown(rows, total_net)
 
     biggest = sorted(rows, key=lambda r: r["winnings"])[:5]
     print("\n5 biggest losses:")
