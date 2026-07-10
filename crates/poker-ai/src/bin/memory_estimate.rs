@@ -128,6 +128,14 @@ impl PublicKey {
     }
 }
 
+/// `POKER_AI_ESTIMATE_ALLIN_AT_CAP=1` sizes the *proposed* tree, in which
+/// `AllIn` stays legal at the cap so a raise war always has a terminating
+/// action.  Under the current rule, aggression past the cap has no abstract
+/// node at all and the agent cannot translate an opponent's shove.
+fn allin_at_cap() -> bool {
+    std::env::var("POKER_AI_ESTIMATE_ALLIN_AT_CAP").is_ok_and(|v| v == "1")
+}
+
 /// Mirror of `BlueprintHoldem::capped_legal` (private there; the HU data-point
 /// test gates the two staying in lock-step): at/over the cap drop all `Raise`s
 /// and any *voluntary* `AllIn`, but keep a forced all-in call.
@@ -136,11 +144,13 @@ fn capped_legal(gs: &GameState, street_raises: u8, raise_cap: u32) -> ActionList
     if (street_raises as u32) < raise_cap {
         return full;
     }
+    let keep_allin = allin_at_cap();
     let has_passive = full.iter().any(|a| matches!(a, Action::Check | Action::Call));
     let mut buf = [Action::Fold; 8];
     let mut n = 0;
     for &a in full.iter() {
-        let drop = matches!(a, Action::Raise(_)) || (matches!(a, Action::AllIn) && has_passive);
+        let drop = matches!(a, Action::Raise(_))
+            || (matches!(a, Action::AllIn) && has_passive && !keep_allin);
         if !drop {
             buf[n] = a;
             n += 1;
