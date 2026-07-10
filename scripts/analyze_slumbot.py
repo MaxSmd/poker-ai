@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Post-mortem for a Slumbot match logged with `play slumbot --log-hands`.
+"""Post-mortem for a Slumbot match logged with `play slumbot --log-hands=PATH`.
 
 Reads data/slumbot_hands.jsonl (one JSON object per hand) and breaks the
 result down along the axes that tell you *where* the money goes, so a raw
@@ -15,7 +15,7 @@ bb/100 becomes a diagnosis:
 All figures are bb/100 (net bb per 100 hands) with a 95% CI, plus the share of
 total loss each bucket carries.  Usage:
 
-    python scripts/analyze_slumbot.py [data/slumbot_hands.jsonl]
+    python scripts/analyze_slumbot.py <hands.jsonl>
 """
 import json
 import math

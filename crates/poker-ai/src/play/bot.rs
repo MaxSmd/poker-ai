@@ -21,6 +21,7 @@ use poker_core::action::Action;
 use poker_core::state::{GameState, MAX_PLAYERS, NO_CARD};
 
 use crate::games::blueprint::BlueprintHoldem;
+use crate::play::equity::equity_vs_range;
 use crate::play::policy::CompactPolicy;
 use crate::play::protocol::{parse_action, Event, EventKind, Parsed, BIG_BLIND, SMALL_BLIND, STACK_SIZE};
 use crate::play::tracker::{AbstractHand, MapOutcome, RealMove};
@@ -134,7 +135,7 @@ impl Bot {
         let mv = if parsed.street == 3 && self.cfg.resolve_river && board.len() == 5 {
             self.decide_river(hs, &parsed, board)
         } else {
-            self.decide_blueprint(hs, &parsed)
+            self.decide_blueprint(hs, &parsed, board)
         };
         Ok(mv.to_incr())
     }
@@ -232,13 +233,11 @@ impl Bot {
     }
 
     /// Blueprint decision (preflop / flop / turn, and the river fallback).
-    fn decide_blueprint(&mut self, hs: &mut HandState, parsed: &Parsed) -> RealMove {
+    fn decide_blueprint(&mut self, hs: &mut HandState, parsed: &Parsed, board: &[u8]) -> RealMove {
         let facing = parsed.last_bet_size > 0;
         if !hs.hand.expects(&self.game, hs.my_seat, parsed.street) {
-            // No abstract node for this spot (post-cap aggression): play the
-            // passive continuation the abstraction was trained with.
             hs.pending_self = Some(None);
-            return if facing { RealMove::Call } else { RealMove::Check };
+            return self.decide_desynced(hs, parsed, board);
         }
 
         let acts = hs.hand.actions(&self.game);
@@ -264,12 +263,46 @@ impl Bot {
         mv
     }
 
+    /// Decision when the abstract game has no node for this spot.
+    ///
+    /// This happens when the opponent raises past the blueprint's cap: the
+    /// abstraction offers no aggressive action, the event cannot be mapped, and
+    /// the tracker stops advancing for the rest of the hand.  The blueprint is
+    /// unusable here, so fall back on the one thing that is still well defined
+    /// — our hand's equity against the opponent's belief range, weighed against
+    /// the price we are being laid.
+    ///
+    /// The range is frozen at the last node we could translate, which is stale
+    /// but blueprint-consistent up to that point; the alternative is no
+    /// information at all.  We never raise from a desynced state.
+    fn decide_desynced(&mut self, hs: &mut HandState, parsed: &Parsed, board: &[u8]) -> RealMove {
+        let me = hs.my_pos as usize;
+        let stack = STACK_SIZE - parsed.total_committed[me];
+        let to_call = (parsed.street_last_bet_to - parsed.street_committed[me]).min(stack);
+        if to_call == 0 {
+            return RealMove::Check;
+        }
+
+        let opp = &hs.ranges[1 - hs.my_seat];
+        let mut rng = self.rng;
+        let equity = equity_vs_range(hs.my_hole, board, opp, &mut rng);
+        self.rng = rng;
+
+        // Price of the call: chips in versus the pot we would be contesting.
+        let odds = to_call as f64 / (parsed.pot() + to_call) as f64;
+        if equity >= odds {
+            RealMove::Call
+        } else {
+            RealMove::Fold
+        }
+    }
+
     /// River decision by full-range vectorized re-solve of the real state.
     fn decide_river(&mut self, hs: &mut HandState, parsed: &Parsed, board: &[u8]) -> RealMove {
         let root = self.river_root(hs, parsed, board);
         let acts = capped_root_actions(&root, self.cfg.river_cap);
         if acts.is_empty() {
-            return self.decide_blueprint(hs, parsed);
+            return self.decide_blueprint(hs, parsed, board);
         }
 
         // Ranges: card removal, opponent additionally filtered by our cards,
@@ -306,7 +339,7 @@ impl Bot {
         let Some(probs) = resolved.strategy.get(&key).cloned() else {
             // Unreached in the resolve (shouldn't happen with the floor):
             // degrade to the blueprint.
-            return self.decide_blueprint(hs, parsed);
+            return self.decide_blueprint(hs, parsed, board);
         };
 
         let idx = self.sample(&probs);
@@ -605,6 +638,32 @@ mod tests {
         }
         // The full string with our move must still parse.
         assert!(parse_action(&format!("{action}{incr}")).is_ok());
+    }
+
+    /// A raise war past the cap leaves the abstract tracker with no node, and
+    /// the agent used to answer every such spot with an unconditional call —
+    /// which is how it called off 200bb with bottom pair against Slumbot.
+    #[test]
+    fn a_desynced_bot_folds_trash_and_calls_the_nuts() {
+        // SB opens 250, BB 3-bets 750, SB 4-bets 1657, BB 5-bets 12000.  That
+        // fifth bet is the fourth raise: past a cap of 3, so it cannot be
+        // translated.  Calling costs 10343 into a 13657 pot -- 0.43 equity.
+        let action = "b250b750b1657b12000";
+        for (hole, expected) in [(["7h", "2c"], "f"), (["Ac", "Ad"], "c")] {
+            let mut b = bot(false);
+            let h = [parse_card(hole[0]).unwrap(), parse_card(hole[1]).unwrap()];
+            let mut hs = b.start_hand(1, h);
+
+            let parsed = parse_action(action).expect("legal action string");
+            b.sync(&mut hs, &parsed, &[]);
+            assert!(
+                !hs.hand.expects(&b.game, hs.my_seat, 0),
+                "the post-cap raise must desync the tracker, else this tests nothing"
+            );
+
+            let incr = b.act(&mut hs, action, &[]).expect("bot acts");
+            assert_eq!(incr, expected, "holding {hole:?} facing a 5-bet");
+        }
     }
 
     #[test]

@@ -4,6 +4,8 @@
 //!
 //! * [`protocol`] — Slumbot's action-string format, parsing, chip accounting
 //! * [`cards`] — card codec between the wire strings and engine encoding
+//! * [`equity`] — all-in equity vs. a belief range, the fallback when the
+//!   opponent raises past the abstraction's cap and no blueprint node exists
 //! * [`policy`] — compact zero-copy view of `data/blueprint_holdem.bin`
 //! * [`tracker`] — dual-state (real ↔ abstract) tracking with pseudo-harmonic
 //!   action translation
@@ -15,6 +17,7 @@
 
 pub mod bot;
 pub mod cards;
+pub mod equity;
 pub mod policy;
 pub mod protocol;
 pub mod slumbot;

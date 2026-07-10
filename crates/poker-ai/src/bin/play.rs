@@ -7,6 +7,9 @@
 //!     --data=DIR         artifact directory (default `data`): needs
 //!                        blueprint_holdem.bin + {flop,turn,river}_buckets.bin
 //!                        from the SAME training run
+//!     --policy=PATH      blueprint strategy file, overriding
+//!                        DATA/blueprint_holdem.bin (the path training writes
+//!                        to, so a preserved run needs this)
 //!     --stack-bb=N       blueprint stack depth in bb (default 200 — Slumbot's)
 //!     --cap=N            blueprint raise cap (default 3 — must match training)
 //!     --no-resolve       blueprint-only river (skip the vectorized re-solve)
@@ -14,9 +17,9 @@
 //!     --river-cap=N      raise cap inside a river resolve (default 3)
 //!     --purify=X         drop action probabilities below X (default 0.1)
 //!     --seed=N           sampling seed (default 1)
-//!     --log-hands        append full per-hand histories (final action string,
-//!                        both hands, position, board, winnings) as JSONL to
-//!                        DATA/slumbot_hands.jsonl — the post-mortem feed for
+//!     --log-hands=PATH   write full per-hand histories (final action string,
+//!                        both hands, position, board, winnings) as JSONL,
+//!                        truncating PATH — the post-mortem feed for
 //!                        scripts/analyze_slumbot.py
 //!     --token=T          reuse a session token (also persisted to
 //!                        DATA/slumbot_token.txt automatically)
@@ -45,6 +48,39 @@ const ABSTRACT_SB: u32 = 1;
 
 fn flag<T: std::str::FromStr>(args: &[String], name: &str) -> Option<T> {
     args.iter().find_map(|a| a.strip_prefix(&format!("--{name}="))).and_then(|v| v.parse().ok())
+}
+
+/// Reject unknown flags and stray positionals.  Every flag here takes its value
+/// with `=`, so a bare `--log-hands out.jsonl` would otherwise drop the path on
+/// the floor and log somewhere else entirely.
+fn validate(args: &[String], allowed: &[&str], positionals: usize) {
+    let mut seen_positional = 0;
+    for a in &args[2..] {
+        let Some(body) = a.strip_prefix("--") else {
+            seen_positional += 1;
+            if seen_positional > positionals {
+                eprintln!("unexpected argument `{a}` (flags take their value as --name=value)");
+                std::process::exit(2);
+            }
+            continue;
+        };
+        let name = body.split('=').next().unwrap_or("");
+        if !allowed.contains(&name) {
+            eprintln!("unknown flag `--{name}`; expected one of: {}", allowed.join(", "));
+            std::process::exit(2);
+        }
+        if name == "log-hands" && !body.contains('=') {
+            eprintln!("--log-hands needs a path: --log-hands=data/hands.jsonl");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Path to the blueprint strategy: `--policy=PATH`, else `DIR/blueprint_holdem.bin`.
+fn policy_path(args: &[String], dir: &Path) -> PathBuf {
+    flag::<String>(args, "policy")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dir.join("blueprint_holdem.bin"))
 }
 
 fn main() {
@@ -145,13 +181,14 @@ fn print_grid(title: &str, vals: &[[f64; 13]; 13], missing: &[[bool; 13]; 13]) {
 ///
 ///   play chart [--data=DIR --stack-bb=N --cap=N]
 fn run_chart(args: &[String]) {
+    validate(args, &["data", "stack-bb", "cap", "policy"], 0);
     let dir = PathBuf::from(flag::<String>(args, "data").unwrap_or_else(|| "data".into()));
     let stack_bb: u32 = flag(args, "stack-bb").unwrap_or(200);
     let cap: u32 = flag(args, "cap").unwrap_or(3);
 
     println!("Loading abstraction from {} ({stack_bb}bb, cap-{cap})", dir.display());
     let game = load_game(&dir, stack_bb, cap);
-    let policy_path = dir.join("blueprint_holdem.bin");
+    let policy_path = policy_path(args, &dir);
     println!("Loading blueprint strategy {} ...", policy_path.display());
     let policy = CompactPolicy::load(&policy_path).unwrap_or_else(|e| {
         eprintln!("cannot load {}: {e}", policy_path.display());
@@ -242,6 +279,14 @@ fn load_game(dir: &Path, stack_bb: u32, cap: u32) -> BlueprintHoldem {
 }
 
 fn run_slumbot(args: &[String]) {
+    validate(
+        args,
+        &[
+            "data", "policy", "stack-bb", "cap", "no-resolve", "iters", "river-cap", "purify",
+            "seed", "log-hands", "token", "username", "password",
+        ],
+        1,
+    );
     let hands: u64 = args
         .get(2)
         .filter(|a| !a.starts_with("--"))
@@ -260,7 +305,7 @@ fn run_slumbot(args: &[String]) {
 
     println!("Loading abstraction from {} ({stack_bb}bb, cap-{cap})", dir.display());
     let game = load_game(&dir, stack_bb, cap);
-    let policy_path = dir.join("blueprint_holdem.bin");
+    let policy_path = policy_path(args, &dir);
     println!("Loading blueprint strategy {} ...", policy_path.display());
     let policy = CompactPolicy::load(&policy_path).unwrap_or_else(|e| {
         eprintln!("cannot load {}: {e}", policy_path.display());
@@ -295,11 +340,14 @@ fn run_slumbot(args: &[String]) {
 
     let csv_path = dir.join("slumbot_results.csv");
     let mut csv = std::fs::OpenOptions::new().create(true).append(true).open(&csv_path).ok();
-    let log_hands = args.iter().any(|a| a == "--log-hands");
-    let hands_path = dir.join("slumbot_hands.jsonl");
-    let mut hands_log = log_hands
-        .then(|| std::fs::OpenOptions::new().create(true).append(true).open(&hands_path).ok())
-        .flatten();
+    // Truncate: appending across runs silently concatenates matches, which has
+    // twice produced a log the analyzer could not attribute to a single run.
+    let mut hands_log = flag::<String>(args, "log-hands").map(|p| {
+        std::fs::File::create(&p).unwrap_or_else(|e| {
+            eprintln!("cannot open {p}: {e}");
+            std::process::exit(1);
+        })
+    });
 
     let mut played: u64 = 0;
     let mut errors: u64 = 0;
