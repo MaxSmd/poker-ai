@@ -305,22 +305,26 @@ impl BlueprintHoldem {
     }
 
     /// Legal actions at `gs` after applying the raise-cap betting abstraction:
-    /// once `street_raises` reaches the cap, voluntary aggression (any `Raise`,
-    /// and a voluntary `AllIn`) is removed, leaving fold / check / call — but a
-    /// *forced* all-in call (when neither check nor call is offered) is kept so
-    /// every node retains a legal action.  Both the clone and cursor paths route
+    /// once `street_raises` reaches the cap, sized `Raise`s are removed, leaving
+    /// fold / check / call / all-in.  Both the clone and cursor paths route
     /// through this, so action indices (and thus info keys) stay identical.
+    ///
+    /// `AllIn` survives the cap deliberately.  It is the only *absorbing*
+    /// aggressive action — once it is called, neither game can raise again — so
+    /// keeping it means a raise war always has a terminating node and every
+    /// real bet, however large and however deep in the war, has somewhere to
+    /// map.  Dropping it (as this once did) left the abstraction not closed
+    /// under opponent aggression: a shove past the cap could not be translated
+    /// at all, and the playing agent was left with no node to act from.
     fn capped_legal(&self, gs: &GameState, street_raises: u8) -> ActionList {
         let full = legal_actions(gs);
         if (street_raises as u32) < self.raise_cap {
             return full;
         }
-        let has_passive = full.iter().any(|a| matches!(a, Action::Check | Action::Call));
         let mut buf = [Action::Fold; 8];
         let mut n = 0;
         for &a in full.iter() {
-            let drop = matches!(a, Action::Raise(_)) || (matches!(a, Action::AllIn) && has_passive);
-            if !drop {
+            if !matches!(a, Action::Raise(_)) {
                 buf[n] = a;
                 n += 1;
             }
@@ -770,7 +774,7 @@ mod tests {
     }
 
     #[test]
-    fn raise_cap_removes_voluntary_aggression_at_the_cap() {
+    fn raise_cap_removes_sized_raises_but_never_the_all_in() {
         let game = BlueprintHoldem::new(200, 2, 1, 0).with_raise_cap(1);
         // Deep-stacked heads-up preflop: SB to act faces a raise/all-in menu.
         let mut h = [[NO_CARD; 2]; MAX_PLAYERS];
@@ -785,12 +789,17 @@ mod tests {
             "opening raise must be legal below the cap, got {under:?}"
         );
 
-        // At the cap (1 raise already made) all voluntary aggression is gone,
-        // but a passive action always remains.
+        // At the cap, sized raises are gone but all-in remains: the abstraction
+        // must stay closed under aggression, so a raise war always has a
+        // terminating action for the tracker to map an opponent's shove onto.
         let at = game.capped_legal(&gs, 1);
         assert!(
-            at.iter().all(|a| !matches!(a, Action::Raise(_) | Action::AllIn)),
-            "no reraise / voluntary all-in at the cap, got {at:?}"
+            at.iter().all(|a| !matches!(a, Action::Raise(_))),
+            "no sized reraise at the cap, got {at:?}"
+        );
+        assert!(
+            at.iter().any(|a| matches!(a, Action::AllIn)),
+            "all-in must survive the cap, got {at:?}"
         );
         assert!(
             at.iter().any(|a| matches!(a, Action::Fold | Action::Call | Action::Check)),
@@ -800,6 +809,27 @@ mod tests {
         // The uncapped default never filters, however many raises have happened.
         let uncapped = BlueprintHoldem::new(200, 2, 1, 0);
         assert!(uncapped.capped_legal(&gs, 9).iter().any(|a| matches!(a, Action::Raise(_))));
+    }
+
+    /// The property the fix exists for: from any node, however many raises have
+    /// already gone in, the acting player can still put the rest of the stack
+    /// in.  Nothing an opponent does can leave the abstraction without an
+    /// aggressive action to translate their bet onto.
+    #[test]
+    fn aggression_always_has_a_landing_spot_at_the_cap() {
+        let game = BlueprintHoldem::new(400, 2, 1, 0).with_raise_cap(3);
+        let mut h = [[NO_CARD; 2]; MAX_PLAYERS];
+        h[0] = [make_card(12, 0), make_card(11, 0)];
+        h[1] = [make_card(5, 1), make_card(5, 2)];
+        let gs = GameState::new(2, 2, 1, game.stacks, h, [NO_CARD; 5], 0);
+
+        for raises in 0..8u8 {
+            let acts = game.capped_legal(&gs, raises);
+            assert!(
+                acts.iter().any(|a| matches!(a, Action::Raise(_) | Action::AllIn)),
+                "no aggressive action after {raises} raises: {acts:?}"
+            );
+        }
     }
 
     #[test]

@@ -128,29 +128,42 @@ impl PublicKey {
     }
 }
 
-/// `POKER_AI_ESTIMATE_ALLIN_AT_CAP=1` sizes the *proposed* tree, in which
-/// `AllIn` stays legal at the cap so a raise war always has a terminating
-/// action.  Under the current rule, aggression past the cap has no abstract
-/// node at all and the agent cannot translate an opponent's shove.
-fn allin_at_cap() -> bool {
-    std::env::var("POKER_AI_ESTIMATE_ALLIN_AT_CAP").is_ok_and(|v| v == "1")
+/// The old tree dropped a voluntary `AllIn` at the cap alongside the sized
+/// raises, leaving the abstraction not closed under opponent aggression: a shove
+/// past the cap had no node to map onto.  `POKER_AI_ESTIMATE_LEGACY_CAP=1`
+/// reproduces it, so the historical blueprint's footprint stays checkable.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CapRule {
+    /// `AllIn` survives the cap (mirrors `BlueprintHoldem::capped_legal`).
+    AllInAtCap,
+    Legacy,
+}
+
+impl CapRule {
+    fn from_env() -> Self {
+        if std::env::var("POKER_AI_ESTIMATE_LEGACY_CAP").is_ok_and(|v| v == "1") {
+            Self::Legacy
+        } else {
+            Self::AllInAtCap
+        }
+    }
 }
 
 /// Mirror of `BlueprintHoldem::capped_legal` (private there; the HU data-point
-/// test gates the two staying in lock-step): at/over the cap drop all `Raise`s
-/// and any *voluntary* `AllIn`, but keep a forced all-in call.
-fn capped_legal(gs: &GameState, street_raises: u8, raise_cap: u32) -> ActionList {
+/// test and the runtime cross-check gate the two staying in lock-step): at/over
+/// the cap drop the sized `Raise`s, but keep `AllIn` — it is absorbing, so it
+/// gives every raise war a terminating node.
+fn capped_legal(gs: &GameState, street_raises: u8, raise_cap: u32, rule: CapRule) -> ActionList {
     let full = legal_actions(gs);
     if (street_raises as u32) < raise_cap {
         return full;
     }
-    let keep_allin = allin_at_cap();
-    let has_passive = full.iter().any(|a| matches!(a, Action::Check | Action::Call));
+    let drop_allin = rule == CapRule::Legacy
+        && full.iter().any(|a| matches!(a, Action::Check | Action::Call));
     let mut buf = [Action::Fold; 8];
     let mut n = 0;
     for &a in full.iter() {
-        let drop = matches!(a, Action::Raise(_))
-            || (matches!(a, Action::AllIn) && has_passive && !keep_allin);
+        let drop = matches!(a, Action::Raise(_)) || (matches!(a, Action::AllIn) && drop_allin);
         if !drop {
             buf[n] = a;
             n += 1;
@@ -173,6 +186,7 @@ fn next_raises(prev: u8, old_street: u8, old_bet: u32, gs: &GameState) -> u8 {
 
 struct Walker {
     raise_cap: u32,
+    rule: CapRule,
     memo: HashMap<PublicKey, Counts>,
     limit: usize,
     truncated: bool,
@@ -193,7 +207,7 @@ impl Walker {
             self.truncated = true;
             return Counts::default();
         }
-        let acts = capped_legal(gs, street_raises, self.raise_cap);
+        let acts = capped_legal(gs, street_raises, self.raise_cap, self.rule);
         let s = gs.street as usize;
         let mut c = Counts::default();
         c.nodes[s] = 1;
@@ -235,9 +249,10 @@ struct Measurement {
     secs: f64,
 }
 
-fn enumerate_tree(num_players: u8, stack_bb: u32, cap: u32, limit: usize) -> Measurement {
+fn enumerate_tree(num_players: u8, stack_bb: u32, cap: u32, limit: usize, rule: CapRule) -> Measurement {
     let mut gs = skeleton(num_players, stack_bb * BIG_BLIND);
-    let mut w = Walker { raise_cap: cap.max(1), memo: HashMap::new(), limit, truncated: false };
+    let mut w =
+        Walker { raise_cap: cap.max(1), rule, memo: HashMap::new(), limit, truncated: false };
     let t = Instant::now();
     let counts = w.count(&mut gs, 0);
     Measurement { counts, states: w.memo.len(), truncated: w.truncated, secs: t.elapsed().as_secs_f64() }
@@ -294,7 +309,7 @@ fn fmt_bytes(b: u64) -> String {
 
 const STREETS: [(usize, &str); 3] = [(0, "flop"), (1, "turn"), (2, "river")];
 
-fn cross_check_hu(dir: &Path, limit: usize) {
+fn cross_check_hu(dir: &Path, limit: usize, rule: CapRule) {
     if !STREETS.iter().all(|(_, name)| dir.join(format!("{name}_buckets.bin")).exists()) {
         println!(
             "(cross-check vs the real BlueprintHoldem index skipped — \
@@ -313,7 +328,7 @@ fn cross_check_hu(dir: &Path, limit: usize) {
     }
     let game = game.with_indexing();
     let real = game.info_set_capacity() as u64;
-    let (walked, _) = table_size(&enumerate_tree(2, 20, 2, limit).counts, buckets);
+    let (walked, _) = table_size(&enumerate_tree(2, 20, 2, limit, rule).counts, buckets);
     assert_eq!(walked, real, "walker disagrees with the real dense index — investigate before trusting the matrix");
     println!("Cross-check vs the real BlueprintHoldem dense index (HU 20bb cap-2): {} info sets — exact match.\n", fmt_count(real));
 }
@@ -326,6 +341,7 @@ fn main() {
         args.get(1).copied().unwrap_or(500),
         args.get(2).copied().unwrap_or(800),
     ];
+    let rule = CapRule::from_env();
     let limit: usize = std::env::var("POKER_AI_ESTIMATE_STATES")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -355,7 +371,7 @@ fn main() {
         fmt_bytes(BUCKET_MAP_BYTES as u64)
     );
 
-    cross_check_hu(Path::new("data"), limit);
+    cross_check_hu(Path::new("data"), limit, rule);
 
     for &players in &players_list {
         let players = players as u8;
@@ -366,7 +382,7 @@ fn main() {
         );
         for &stack_bb in &stacks {
             for cap in 1..=3u32 {
-                let m = enumerate_tree(players, stack_bb, cap, limit);
+                let m = enumerate_tree(players, stack_bb, cap, limit, rule);
                 if m.truncated {
                     println!(
                         "{:>5}bb {:>4}  aborted: > {} public states (raise POKER_AI_ESTIMATE_STATES)",
@@ -411,10 +427,18 @@ mod tests {
     /// (heads-up, 20 bb, cap-2, buckets 169/500/500/800 → 4,631,870).
     #[test]
     fn walker_reproduces_the_measured_hu_blueprint() {
-        let m = enumerate_tree(2, 20, 2, usize::MAX);
+        // The legacy tree is the one the server measured; the walker must still
+        // reproduce it exactly, which pins the shared recursion.
+        let old = enumerate_tree(2, 20, 2, usize::MAX, CapRule::Legacy);
+        assert!(!old.truncated);
+        let (old_info_sets, _) = table_size(&old.counts, [169, 500, 500, 800]);
+        assert_eq!(old_info_sets, 4_631_870);
+
+        let m = enumerate_tree(2, 20, 2, usize::MAX, CapRule::AllInAtCap);
         assert!(!m.truncated);
         let (info_sets, slots) = table_size(&m.counts, [169, 500, 500, 800]);
-        assert_eq!(info_sets, 4_631_870);
+        assert_eq!(info_sets, 5_011_836);
+        assert!(info_sets > old_info_sets, "keeping all-in at the cap adds nodes");
         // ~2.5 slots/info set exactly counted; 16 B/slot (f64 strategy sums)
         // + 5 B index ≈ 0.21 GB.
         let bytes = f32_bytes(info_sets, slots) as f64;
@@ -425,14 +449,14 @@ mod tests {
     /// shove-fest that must terminate quickly with a non-empty pre-flop street.
     #[test]
     fn six_max_walker_terminates_on_micro_stacks() {
-        let m = enumerate_tree(6, 2, 1, usize::MAX);
+        let m = enumerate_tree(6, 2, 1, usize::MAX, CapRule::AllInAtCap);
         assert!(!m.truncated);
         assert!(m.counts.nodes[0] > 0);
     }
 
     #[test]
     fn truncation_is_flagged_not_silent() {
-        let m = enumerate_tree(2, 20, 2, 10);
+        let m = enumerate_tree(2, 20, 2, 10, CapRule::AllInAtCap);
         assert!(m.truncated);
     }
 

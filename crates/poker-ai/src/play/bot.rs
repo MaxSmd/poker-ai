@@ -640,29 +640,47 @@ mod tests {
         assert!(parse_action(&format!("{action}{incr}")).is_ok());
     }
 
-    /// A raise war past the cap leaves the abstract tracker with no node, and
-    /// the agent used to answer every such spot with an unconditional call —
-    /// which is how it called off 200bb with bottom pair against Slumbot.
+    /// A preflop raise war no longer desyncs: `AllIn` survives the cap, so the
+    /// opponent's 5-bet maps onto it and the tracker keeps up.
     #[test]
-    fn a_desynced_bot_folds_trash_and_calls_the_nuts() {
-        // SB opens 250, BB 3-bets 750, SB 4-bets 1657, BB 5-bets 12000.  That
-        // fifth bet is the fourth raise: past a cap of 3, so it cannot be
-        // translated.  Calling costs 10343 into a 13657 pot -- 0.43 equity.
+    fn a_post_cap_five_bet_maps_onto_the_all_in() {
+        let mut b = bot(false);
+        let h = [parse_card("Ac").unwrap(), parse_card("Ad").unwrap()];
+        let mut hs = b.start_hand(1, h);
+
         let action = "b250b750b1657b12000";
-        for (hole, expected) in [(["7h", "2c"], "f"), (["Ac", "Ad"], "c")] {
+        let parsed = parse_action(action).expect("legal action string");
+        b.sync(&mut hs, &parsed, &[]);
+        assert!(
+            hs.hand.expects(&b.game, hs.my_seat, 0),
+            "the 5-bet must translate onto the abstract all-in, not desync"
+        );
+    }
+
+    /// A desync is still reachable: once the abstraction is all-in but the real
+    /// stacks are not, later streets have no node.  The agent used to answer
+    /// every such spot with an unconditional call -- which is how it called off
+    /// 200bb with bottom pair against Slumbot.
+    #[test]
+    fn a_desynced_bot_folds_trash_and_calls_a_monster() {
+        // Preflop war ends with a call; the abstraction is all-in.  On the flop
+        // the opponent shoves 13250 into 26750, so calling needs 0.33 equity.
+        let action = "b250b750b1657b6750c/b13250";
+        let board = cards(&["2c", "7h", "9s"]);
+        for (hole, expected) in [(["3d", "4d"], "f"), (["Ac", "Ad"], "c")] {
             let mut b = bot(false);
             let h = [parse_card(hole[0]).unwrap(), parse_card(hole[1]).unwrap()];
             let mut hs = b.start_hand(1, h);
 
             let parsed = parse_action(action).expect("legal action string");
-            b.sync(&mut hs, &parsed, &[]);
+            b.sync(&mut hs, &parsed, &board);
             assert!(
-                !hs.hand.expects(&b.game, hs.my_seat, 0),
-                "the post-cap raise must desync the tracker, else this tests nothing"
+                !hs.hand.expects(&b.game, hs.my_seat, 1),
+                "an all-in abstraction over live real stacks must desync"
             );
 
-            let incr = b.act(&mut hs, action, &[]).expect("bot acts");
-            assert_eq!(incr, expected, "holding {hole:?} facing a 5-bet");
+            let incr = b.act(&mut hs, action, &board).expect("bot acts");
+            assert_eq!(incr, expected, "holding {hole:?} facing a flop shove");
         }
     }
 
