@@ -1,3 +1,5 @@
 /target
 # Generated abstraction artifacts (the `cluster` binary writes these).
 /data/
+__pycache__/
+*.pyc
