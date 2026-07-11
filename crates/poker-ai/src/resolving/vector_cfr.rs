@@ -18,13 +18,15 @@
 //! [`exploitability`](crate::solver::best_response::exploitability) scores the
 //! vectorized result inside the explicit game and the two must agree.
 //!
-//! **Scope.** This increment solves *complete-board* (river) subgames — exactly
-//! the 1326×1326 blow-up the finding targets — with exact showdown and fold
-//! terminals.  Depth-limit leaves (turn/flop cuts) carry the multi-continuation
-//! leaf values of finding #1 as per-hand vectors; that vectorized leaf (a
-//! `board_cfvs` average over runouts behind the opponent's continuation choice)
-//! is the follow-up and is rejected here with a clear panic rather than scored
-//! wrongly.
+//! **Scope.** This solves *complete-board* (river) subgames — exactly the
+//! 1326×1326 blow-up the finding targets — with exact showdown and fold
+//! terminals, and *turn* subgames with the river depth-cut: any node that
+//! reaches the undealt river (the turn betting closing, or a turn all-in) is a
+//! leaf whose check-down showdown is averaged over the 44 live river runouts
+//! (`board_runout_cfvs`).  That average reproduces the explicit oracle's
+//! `CheckdownLeafEval` value exactly, so the same exploitability cross-check
+//! validates turn and flop resolves.  The K > 1 multi-continuation leaf of
+//! finding #1 is the remaining follow-up.
 
 use std::collections::HashMap;
 
@@ -33,7 +35,7 @@ use poker_core::state::{GameState, NO_CARD};
 
 // `board_cfvs` indexes its reach/output by `features::combo_index`, so the whole
 // solver works in that ordering (NOT `belief_state`'s, a different bijection).
-use crate::abstraction::features::{board_cfvs, combo_cards};
+use crate::abstraction::features::{board_cfvs, combo_cards, PreparedRunout};
 use crate::resolving::belief_state::{BeliefState, NUM_COMBOS};
 use crate::util::hash::fnv1a;
 
@@ -54,18 +56,30 @@ enum NodeKind {
     /// River showdown: each player's value is `board_cfvs` over the opponent's
     /// reach with `half_pot` chips at stake (already in big-blind units).
     Showdown { half_pot: f64 },
+    /// Turn/flop depth-limit or all-in leaf: the board is incomplete, so the
+    /// showdown is the check-down value averaged over the runout
+    /// (`board_runout_cfvs`).  The vectorized analogue of the explicit oracle's
+    /// `CheckdownLeafEval`.
+    RunoutShowdown { half_pot: f64 },
     /// A fold terminal: card-independent per-player net payoff (bb units),
     /// weighted at solve time by the blocker-corrected opponent reach.
     Fold { payoffs: [f64; 2] },
     /// A betting decision for `player`; `children[a]` is the node after legal
     /// action `a`.  `store` indexes the regret/strategy arrays; `board`/`history`
     /// reproduce the explicit info key when emitting the strategy.
+    ///
+    /// When `is_continuation`, this is not a betting node but the opponent's
+    /// depth-limit **continuation choice** (finding #1): `player` is the fixed
+    /// chooser, `children[i]` a `RunoutShowdown` at the `i`-th continuation's
+    /// inflated pot, and the emitted key carries the `0xFE` marker so it matches
+    /// the explicit oracle's continuation info set (and never a betting one).
     Decision {
         player: usize,
         store: usize,
         children: Vec<usize>,
         board: [u8; 5],
         history: Vec<u8>,
+        is_continuation: bool,
     },
 }
 
@@ -134,16 +148,29 @@ pub struct VectorCfr {
     reach0: [f64; NUM_COMBOS],
     reach1: [f64; NUM_COMBOS],
     board: [u8; 5],
+    /// Pre-sorted river runouts for a turn resolve (`None` for a complete-board
+    /// river resolve, which has no `RunoutShowdown` leaves).  Built once and
+    /// shared across every iteration and every turn leaf.
+    runout: Option<PreparedRunout>,
     big_blind: f64,
     /// Maximum raises in the subgame (`u32::MAX` = the engine's unbounded
     /// re-raising).  Deep-stacked resolving needs a finite cap for the same
     /// reason the blueprint does: geometric raise chains blow the tree up.
     raise_cap: u32,
+    /// Rest-of-hand pot scales for the depth-limit continuation choice (finding
+    /// #1); `[0.0]` (length 1) is the plain single check-down (no chooser node).
+    /// `scales[0]` should be `0.0` (the normal continuation).  Mirrors
+    /// [`MultiContinuationLeaf`](crate::resolving::leaf_eval).
+    scales: Vec<f64>,
+    /// The fixed continuation chooser — the opponent of the resolve-root actor,
+    /// whose post-leaf adaptation the resolve must be robust to (only used when
+    /// `scales.len() > 1`).
+    chooser: usize,
     t: u64,
 }
 
 impl VectorCfr {
-    /// Build the public tree rooted at `root` (a complete-board public state)
+    /// Build the public tree rooted at `root` (a river *or* turn public state)
     /// over the two belief ranges.  Solved with CFR⁺ (RM⁺ + linear averaging).
     pub fn new(root: &GameState, beliefs: &[BeliefState]) -> Self {
         Self::new_capped(root, beliefs, u32::MAX)
@@ -154,8 +181,25 @@ impl VectorCfr {
     /// pruned, exactly mirroring the blueprint's betting abstraction
     /// (`BlueprintHoldem::capped_legal`) — a forced all-in call always stays.
     pub fn new_capped(root: &GameState, beliefs: &[BeliefState], raise_cap: u32) -> Self {
+        Self::new_capped_multi(root, beliefs, raise_cap, vec![0.0])
+    }
+
+    /// [`new_capped`](Self::new_capped) with a **multi-valued depth-limit leaf**
+    /// (finding #1): at each turn/flop depth cut the opponent picks among the
+    /// `scales` continuations (rest-of-hand pot inflations), so the resolve is
+    /// robust to the opponent adapting past the leaf rather than overfitting one
+    /// check-down.  `scales[0]` should be `0.0` (the normal check-down); a single
+    /// `[0.0]` reproduces [`new_capped`](Self::new_capped) with no chooser nodes.
+    pub fn new_capped_multi(
+        root: &GameState,
+        beliefs: &[BeliefState],
+        raise_cap: u32,
+        scales: Vec<f64>,
+    ) -> Self {
         assert_eq!(beliefs.len(), 2, "heads-up vectorized resolving needs two ranges");
+        assert!(!scales.is_empty(), "need at least one continuation");
         let board = root.board;
+        let chooser = 1 - root.current_player();
         let big_blind = root.big_blind as f64;
 
         // Initial reaches = belief marginals with board cards removed (the
@@ -182,6 +226,10 @@ impl VectorCfr {
         let reach0 = seed(&beliefs[0]);
         let reach1 = seed(&beliefs[1]);
 
+        // A turn root (river slot undealt) needs the runout table for its leaves;
+        // a complete-board river root has none.
+        let runout = board.contains(&NO_CARD).then(|| PreparedRunout::new(board));
+
         let mut me = Self {
             kinds: Vec::new(),
             stores: Vec::new(),
@@ -189,8 +237,11 @@ impl VectorCfr {
             reach0,
             reach1,
             board,
+            runout,
             big_blind,
             raise_cap,
+            scales,
+            chooser,
             t: 0,
         };
         me.root = me.build(root.clone(), Vec::new(), 0);
@@ -214,26 +265,39 @@ impl VectorCfr {
     }
 
     fn build(&mut self, gs: GameState, history: Vec<u8>, raises: u32) -> usize {
-        if gs.is_terminal() {
+        // A node is a leaf when the hand ends (fold / river showdown) or when the
+        // current street wants a board card the resolve root does not have — the
+        // depth cut of a turn or flop subgame (or an all-in run-out past it).
+        let needs_runout = gs.board[..gs.board_cards_count()].contains(&NO_CARD);
+        if gs.is_terminal() || needs_runout {
             let active = (0..gs.num_players as usize).filter(|&i| gs.folded & (1 << i) == 0).count();
-            let id = self.kinds.len();
+            let real_cards = gs.board.iter().filter(|&&c| c != NO_CARD).count();
+            let half_pot = (gs.pot as f64 / 2.0) / self.big_blind;
             if active <= 1 {
+                // Someone folded: the payoff is board-independent and exact.
                 let p = gs.terminal_payoffs();
+                let id = self.kinds.len();
                 self.kinds.push(NodeKind::Fold {
                     payoffs: [p[0] as f64 / self.big_blind, p[1] as f64 / self.big_blind],
                 });
-            } else {
-                self.kinds.push(NodeKind::Showdown {
-                    half_pot: (gs.pot as f64 / 2.0) / self.big_blind,
-                });
+                return id;
             }
+            if real_cards == 5 {
+                // Complete board: exact river showdown.
+                let id = self.kinds.len();
+                self.kinds.push(NodeKind::Showdown { half_pot });
+                return id;
+            }
+            // Board undealt (depth cut or all-in run-out): check-down showdown
+            // averaged over the runout.  With K > 1 continuations, the opponent
+            // first chooses among them (finding #1); otherwise a plain leaf.
+            if self.scales.len() > 1 {
+                return self.build_continuation_chooser(half_pot, gs.board, history);
+            }
+            let id = self.kinds.len();
+            self.kinds.push(NodeKind::RunoutShowdown { half_pot });
             return id;
         }
-        assert!(
-            !gs.board[..gs.board_cards_count()].contains(&NO_CARD),
-            "vector_cfr currently supports complete-board (river) subgames; \
-             depth-limit-leaf vectorization (finding #1 continuations over runouts) is the follow-up"
-        );
 
         let player = gs.current_player();
         let acts = self.capped_legal(&gs, raises);
@@ -250,7 +314,43 @@ impl VectorCfr {
         let store = self.stores.len();
         self.stores.push(NodeStore::new(acts.len()));
         let id = self.kinds.len();
-        self.kinds.push(NodeKind::Decision { player, store, children, board: gs.board, history });
+        self.kinds.push(NodeKind::Decision {
+            player,
+            store,
+            children,
+            board: gs.board,
+            history,
+            is_continuation: false,
+        });
+        id
+    }
+
+    /// Build the depth-limit **continuation-choice** node (finding #1): a
+    /// decision owned by the fixed [`chooser`](Self::chooser) with one action per
+    /// `scales` entry, whose `i`-th child is a `RunoutShowdown` at the inflated
+    /// pot `half_pot·(1 + scales[i])`.  Inflating a check-down pot by `s` scales
+    /// the (chop-relative) showdown value by exactly `1 + s`, so a scaled
+    /// `RunoutShowdown` reproduces `MultiContinuationLeaf`'s continuation `i`
+    /// without a new node kind.
+    fn build_continuation_chooser(&mut self, half_pot: f64, board: [u8; 5], history: Vec<u8>) -> usize {
+        let mut children = Vec::with_capacity(self.scales.len());
+        for i in 0..self.scales.len() {
+            let s = self.scales[i];
+            let child = self.kinds.len();
+            self.kinds.push(NodeKind::RunoutShowdown { half_pot: half_pot * (1.0 + s) });
+            children.push(child);
+        }
+        let store = self.stores.len();
+        self.stores.push(NodeStore::new(children.len()));
+        let id = self.kinds.len();
+        self.kinds.push(NodeKind::Decision {
+            player: self.chooser,
+            store,
+            children,
+            board,
+            history,
+            is_continuation: true,
+        });
         id
     }
 
@@ -266,7 +366,7 @@ impl VectorCfr {
             let traverser = ((self.t - 1) % 2) as usize;
             let (reach0, reach1) = (self.reach0, self.reach1);
             let (reach_tr, reach_op) = if traverser == 0 { (reach0, reach1) } else { (reach1, reach0) };
-            Self::cfr(&self.kinds, &mut self.stores, self.root, &reach_tr, &reach_op, traverser, self.t, &self.board);
+            Self::cfr(&self.kinds, &mut self.stores, self.root, &reach_tr, &reach_op, traverser, self.t, &self.board, self.runout.as_ref());
         }
     }
 
@@ -283,12 +383,23 @@ impl VectorCfr {
         traverser: usize,
         t: u64,
         board: &[u8; 5],
+        runout: Option<&PreparedRunout>,
     ) -> Vec<f64> {
         match &kinds[id] {
             NodeKind::Showdown { half_pot } => {
                 // Traverser's value = reach-weighted showdown over the opponent.
                 let mut v = [0.0; NUM_COMBOS];
                 board_cfvs(*board, reach_op, *half_pot, &mut v);
+                v.to_vec()
+            }
+            NodeKind::RunoutShowdown { half_pot } => {
+                // Turn leaf: the same reach-weighted showdown, averaged over the
+                // undealt river (check-down continuation), via the pre-sorted
+                // runout table built once for this board.
+                let mut v = [0.0; NUM_COMBOS];
+                runout
+                    .expect("turn resolve must build a runout table for its leaves")
+                    .evaluate(reach_op, *half_pot, &mut v);
                 v.to_vec()
             }
             NodeKind::Fold { payoffs } => {
@@ -309,7 +420,7 @@ impl VectorCfr {
                         for h in 0..NUM_COMBOS {
                             rt[h] *= sigma[h * a + ai];
                         }
-                        let cv = Self::cfr(kinds, stores, child, &rt, reach_op, traverser, t, board);
+                        let cv = Self::cfr(kinds, stores, child, &rt, reach_op, traverser, t, board, runout);
                         for h in 0..NUM_COMBOS {
                             v[h] += sigma[h * a + ai] * cv[h];
                         }
@@ -324,7 +435,7 @@ impl VectorCfr {
                         for h in 0..NUM_COMBOS {
                             ro[h] *= sigma[h * a + ai];
                         }
-                        let cv = Self::cfr(kinds, stores, child, reach_tr, &ro, traverser, t, board);
+                        let cv = Self::cfr(kinds, stores, child, reach_tr, &ro, traverser, t, board, runout);
                         for h in 0..NUM_COMBOS {
                             v[h] += cv[h];
                         }
@@ -340,7 +451,8 @@ impl VectorCfr {
         let mut strategy = HashMap::new();
         let mut public_nodes = 0;
         for kind in &self.kinds {
-            let NodeKind::Decision { player, store, board, history, children } = kind else {
+            let NodeKind::Decision { player, store, board, history, children, is_continuation } = kind
+            else {
                 continue;
             };
             public_nodes += 1;
@@ -352,7 +464,7 @@ impl VectorCfr {
                 if total <= 0.0 {
                     continue; // unreached hand: defaults to uniform in the oracle
                 }
-                let key = info_key(*player, combo_cards(h), board, history);
+                let key = info_key(*player, combo_cards(h), board, history, *is_continuation);
                 strategy.insert(key, row.iter().map(|&x| x / total).collect());
             }
         }
@@ -378,6 +490,22 @@ pub fn solve_vectorized_capped(
     raise_cap: u32,
 ) -> VectorResolved {
     let mut solver = VectorCfr::new_capped(root, beliefs, raise_cap);
+    solver.run(iters);
+    solver.into_resolved()
+}
+
+/// [`solve_vectorized_capped`] with a **multi-valued depth-limit leaf** (finding
+/// #1): the opponent picks among the `scales` continuations at each turn/flop
+/// depth cut, making the resolve robust to post-leaf adaptation.  `scales[0]`
+/// should be `0.0`; `[0.0]` reproduces [`solve_vectorized_capped`].
+pub fn solve_vectorized_multi(
+    root: &GameState,
+    beliefs: &[BeliefState],
+    iters: u64,
+    raise_cap: u32,
+    scales: Vec<f64>,
+) -> VectorResolved {
+    let mut solver = VectorCfr::new_capped_multi(root, beliefs, raise_cap, scales);
     solver.run(iters);
     solver.into_resolved()
 }
@@ -437,15 +565,18 @@ pub fn capped_root_actions(root: &GameState, raise_cap: u32) -> Vec<poker_core::
 /// The key under which [`VectorResolved::strategy`] stores a hand's
 /// distribution (the explicit `Subgame::info_key`).  `hole` must be sorted
 /// ascending; `history` is the action-index path from the resolve root
-/// (empty at the root itself).
+/// (empty at the root itself).  Betting nodes only — continuation-choice nodes
+/// (finding #1) carry an extra marker and are never queried by hole+history.
 pub fn subgame_info_key(player: usize, hole: [u8; 2], board: &[u8; 5], history: &[u8]) -> u64 {
-    info_key(player, hole, board, history)
+    info_key(player, hole, board, history, false)
 }
 
 /// Reproduce [`Subgame::info_key`](crate::resolving::subgame): FNV-1a of
 /// `player`, the (sorted) hole, the visible board, a separator, then the action
 /// history.  `combo_cards` already returns `a < b`, matching the sort there.
-fn info_key(player: usize, hole: [u8; 2], board: &[u8; 5], history: &[u8]) -> u64 {
+/// `is_continuation` appends the `0xFE` marker so a depth-limit continuation
+/// choice can never collide with a betting info set at the same key.
+fn info_key(player: usize, hole: [u8; 2], board: &[u8; 5], history: &[u8], is_continuation: bool) -> u64 {
     let mut bytes = Vec::with_capacity(8 + history.len());
     bytes.push(player as u8);
     bytes.push(hole[0]);
@@ -457,6 +588,9 @@ fn info_key(player: usize, hole: [u8; 2], board: &[u8; 5], history: &[u8]) -> u6
     }
     bytes.push(0xFF);
     bytes.extend_from_slice(history);
+    if is_continuation {
+        bytes.push(0xFE);
+    }
     fnv1a(&bytes)
 }
 
@@ -475,9 +609,19 @@ mod tests {
         [make_card(12, 0), make_card(11, 1), make_card(7, 2), make_card(2, 3), make_card(0, 0)]
     }
 
-    /// A clean heads-up river public root (check/call to the river, no extra
-    /// money), holes are placeholders overwritten per hand.
-    fn public_root(board: [u8; 5], stack: u32) -> GameState {
+    fn turn_board() -> [u8; 5] {
+        // A♣ K♦ 9♥ 4♠ + (river undealt)
+        [make_card(12, 0), make_card(11, 1), make_card(7, 2), make_card(2, 3), NO_CARD]
+    }
+
+    fn flop_board() -> [u8; 5] {
+        // A♣ K♦ 9♥ + (turn, river undealt)
+        [make_card(12, 0), make_card(11, 1), make_card(7, 2), NO_CARD, NO_CARD]
+    }
+
+    /// A clean heads-up public root reached by checking/calling to `target_street`
+    /// (no extra money); holes are placeholders overwritten per hand.
+    fn public_root_at(board: [u8; 5], stack: u32, target_street: u8) -> GameState {
         let mut holes = [[NO_CARD; 2]; MAX_PLAYERS];
         let mut used = 0u64;
         for &c in &board {
@@ -489,12 +633,17 @@ mod tests {
         holes[0] = [spare.next().unwrap(), spare.next().unwrap()];
         holes[1] = [spare.next().unwrap(), spare.next().unwrap()];
         let mut gs = GameState::new(2, 2, 1, [stack; MAX_PLAYERS], holes, board, 0);
-        while gs.street < 3 && !gs.is_terminal() {
+        while gs.street < target_street && !gs.is_terminal() {
             let acts = legal_actions(&gs);
             let act = if acts.contains(&Action::Check) { Action::Check } else { Action::Call };
             gs.apply_action(act);
         }
         gs
+    }
+
+    /// A clean heads-up river public root (check/call to the river).
+    fn public_root(board: [u8; 5], stack: u32) -> GameState {
+        public_root_at(board, stack, 3)
     }
 
     fn duel_ranges() -> [BeliefState; 2] {
@@ -525,6 +674,166 @@ mod tests {
         let expl = exploitability(&oracle, &resolved.strategy);
         println!("vectorized river resolve exploitability (in the explicit oracle): {expl:.5} bb");
         assert!(expl < 0.05, "vectorized resolve should be near-optimal in the oracle game, got {expl}");
+    }
+
+    #[test]
+    fn vectorized_turn_resolve_agrees_with_explicit_oracle() {
+        // Turn resolving: the vectorized public-tree solver cuts at the undealt
+        // river and scores each turn leaf by the runout-averaged check-down
+        // showdown (`RunoutShowdown`).  The explicit-deal `Subgame` with the
+        // `CheckdownLeafEval` cuts the SAME tree at the river with the SAME
+        // check-down value, so the vectorized strategy, scored by exact best
+        // response inside that oracle, must reach the same near-optimal
+        // exploitability — exactly the river cross-check, one street earlier.
+        let beliefs = duel_ranges();
+        let root = public_root_at(turn_board(), 20, 2);
+        assert_eq!(root.street, 2, "root should be on the turn");
+
+        let resolved = solve_vectorized(&root, &beliefs, 1_500);
+        assert!(resolved.info_sets > 0, "must emit strategy");
+
+        let leaf = CheckdownLeafEval::new();
+        let oracle = Subgame::new(public_root_at(turn_board(), 20, 2), &beliefs, &leaf);
+        let expl = exploitability(&oracle, &resolved.strategy);
+        println!("vectorized turn resolve exploitability (in the explicit oracle): {expl:.5} bb");
+        assert!(expl < 0.05, "vectorized turn resolve should be near-optimal in the oracle game, got {expl}");
+    }
+
+    #[test]
+    fn k_continuation_inserts_a_chooser_node_owned_by_the_opponent() {
+        // Fast structural guard for the finding-#1 wiring (the exploitability
+        // cross-check below proves the semantics but is minutes-slow): a K > 1
+        // turn resolve must insert, at its depth-limit leaf, a continuation-choice
+        // Decision owned by the chooser with one `RunoutShowdown` child per scale
+        // at a non-decreasing (inflated) pot — and a K = 1 resolve must not.
+        let beliefs = duel_ranges();
+        let root = public_root_at(turn_board(), 20, 2);
+        let chooser = 1 - root.current_player();
+        let scales = vec![0.0, 0.75, 1.5, 3.0];
+
+        let solver = VectorCfr::new_capped_multi(&root, &beliefs, u32::MAX, scales.clone());
+        let mut choosers = 0;
+        for k in &solver.kinds {
+            let NodeKind::Decision { player, children, is_continuation: true, .. } = k else {
+                continue;
+            };
+            choosers += 1;
+            assert_eq!(*player, chooser, "the opponent chooses the continuation");
+            assert_eq!(children.len(), scales.len(), "one action per continuation");
+            let pots: Vec<f64> = children
+                .iter()
+                .map(|&c| match solver.kinds[c] {
+                    NodeKind::RunoutShowdown { half_pot } => half_pot,
+                    _ => panic!("a continuation child must be a runout showdown"),
+                })
+                .collect();
+            for w in pots.windows(2) {
+                assert!(w[1] > w[0], "each later continuation inflates the pot: {pots:?}");
+            }
+        }
+        assert!(choosers > 0, "a K > 1 turn resolve must contain a continuation-choice node");
+
+        // K = 1 stays a plain leaf — no chooser nodes.
+        let single = VectorCfr::new(&root, &beliefs);
+        assert!(
+            !single.kinds.iter().any(|k| matches!(k, NodeKind::Decision { is_continuation: true, .. })),
+            "a single-continuation resolve must not insert chooser nodes"
+        );
+
+        // The emitted strategy (chooser nodes included) is valid — a handful of
+        // iterations suffices, the strategy-sum normalizes at any count.
+        let resolved = solve_vectorized_multi(&root, &beliefs, 20, u32::MAX, scales);
+        for probs in resolved.strategy.values() {
+            let sum: f64 = probs.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-9, "strategy must be a distribution, got {sum}");
+        }
+    }
+
+    #[test]
+    #[ignore = "K-aware turn resolve + two exact-BR passes over the multi-valued \
+                oracle is minutes-slow; k_continuation_inserts_a_chooser_node guards the wiring"]
+    fn vectorized_multi_continuation_is_more_robust_than_single() {
+        // Finding #1, vectorized: a turn resolve that lets the opponent pick among
+        // K continuations at the depth-limit leaf is less exploitable — measured
+        // IN the explicit K-continuation oracle by exact BR (which may choose
+        // continuations adversarially) — than one resolved assuming a single
+        // check-down.  This is the depth-limited-solving headline, and it also
+        // proves the vectorized chooser nodes key-match the oracle's (else the K=4
+        // resolve's continuation policy would be ignored and buy nothing).
+        use crate::resolving::leaf_eval::MultiContinuationLeaf;
+        let beliefs = duel_ranges();
+        let scales = vec![0.0, 0.75, 1.5, 3.0]; // == MultiContinuationLeaf default
+        let root = || public_root_at(turn_board(), 20, 2);
+
+        // A: resolved aware of the K = 4 choice.  B: resolved assuming one.
+        let a = solve_vectorized_multi(&root(), &beliefs, 2_000, u32::MAX, scales.clone());
+        let b = solve_vectorized(&root(), &beliefs, 2_000);
+
+        // Both scored in the SAME multi-valued oracle (the adapting opponent).
+        let leaf = MultiContinuationLeaf::with_scales(scales);
+        let game = Subgame::new(root(), &beliefs, &leaf);
+        let expl_a = exploitability(&game, &a.strategy);
+        let expl_b = exploitability(&game, &b.strategy);
+        println!(
+            "vectorized multi-valued-leaf robustness — K=4-resolved: {expl_a:.5} bb, single-resolved: {expl_b:.5} bb"
+        );
+        assert!(
+            expl_a < expl_b,
+            "the continuation-aware resolve ({expl_a}) must be less exploitable than the naive one ({expl_b})"
+        );
+    }
+
+    #[test]
+    #[ignore = "flop's two-card runout + exact-BR oracle is minutes-slow; \
+                the 990-divisor is guarded fast by flop_runout_cfvs_matches_hand_vs_hand_equity"]
+    fn vectorized_flop_resolve_agrees_with_explicit_oracle() {
+        // Flop resolving: the vectorized solver cuts at the undealt turn and
+        // scores each flop leaf by the two-card runout average (`RunoutShowdown`
+        // over C(45,2)=990 turn+river completions).  The explicit-deal `Subgame`
+        // with `CheckdownLeafEval` cuts the SAME tree at the turn with the SAME
+        // check-down-over-runout value, so the vectorized strategy scored by exact
+        // best response in that oracle must be near-optimal.  A small stack keeps
+        // the uncapped betting tree (and thus the count of expensive runout
+        // leaves) modest so the two-card runout stays affordable in a unit test.
+        let beliefs = duel_ranges();
+        let root = public_root_at(flop_board(), 6, 1);
+        assert_eq!(root.street, 1, "root should be on the flop");
+
+        let resolved = solve_vectorized(&root, &beliefs, 600);
+        assert!(resolved.info_sets > 0, "must emit strategy");
+
+        let leaf = CheckdownLeafEval::new();
+        let oracle = Subgame::new(public_root_at(flop_board(), 6, 1), &beliefs, &leaf);
+        let expl = exploitability(&oracle, &resolved.strategy);
+        println!("vectorized flop resolve exploitability (in the explicit oracle): {expl:.5} bb");
+        assert!(expl < 0.05, "vectorized flop resolve should be near-optimal in the oracle game, got {expl}");
+    }
+
+    #[test]
+    #[ignore = "throughput demonstration; run with --ignored"]
+    fn turn_full_range_solve_is_fast() {
+        // The runout table is built once and shared, so a full-range turn resolve
+        // (both ranges the whole 1081-combo grid) solves at a play-viable rate —
+        // NOT the per-iteration evaluate+sort the naive runout would cost.
+        use std::time::Instant;
+        let mut b0 = BeliefState::uniform();
+        let mut b1 = BeliefState::uniform();
+        b0.remove_board(&turn_board());
+        b1.remove_board(&turn_board());
+
+        let root = public_root_at(turn_board(), 20, 2);
+        let build = Instant::now();
+        let mut solver = VectorCfr::new(&root, &[b0, b1]);
+        let build_ms = build.elapsed().as_millis();
+        let solve = Instant::now();
+        solver.run(500);
+        let solve_ms = solve.elapsed().as_millis();
+        let resolved = solver.into_resolved();
+        println!(
+            "turn full-range resolve: {} public nodes, {} info sets — build {build_ms} ms, 500 iters {solve_ms} ms",
+            resolved.public_nodes, resolved.info_sets
+        );
+        assert!(resolved.info_sets > 1000, "full ranges yield many per-hand info sets");
     }
 
     #[test]

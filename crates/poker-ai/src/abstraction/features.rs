@@ -332,69 +332,205 @@ pub fn board_ochs(
 /// `board_equities`.  Hero combos that use a board card are left `0.0`.
 pub fn board_cfvs(board: [u8; 5], opp_reach: &[f64; 1326], half_pot: f64, out: &mut [f64; 1326]) {
     out.fill(0.0);
-    let mut used = 0u64;
-    for &c in &board {
-        used |= 1 << c;
-    }
-    let live: Vec<u8> = (0u8..52).filter(|c| used & (1 << c) == 0).collect();
+    PreparedShowdown::new(board).accumulate(opp_reach, half_pot, out);
+}
 
-    // Total opponent reach and per-card reach, for the blocker-corrected
-    // "valid opponents" denominator under each hero hand.
-    let mut total_w = 0.0;
-    let mut card_w = [0.0; 52];
-    let mut combos: Vec<(u32, u8, u8)> = Vec::with_capacity(1081);
-    for i in 0..live.len() {
-        let a = live[i];
-        for &b in &live[i + 1..] {
+/// A complete board with its 1081 hero combos **pre-sorted by 7-card rank**, so
+/// the reach-weighted showdown sweep of [`board_cfvs`] can be repeated over many
+/// different opponent-reach vectors without re-evaluating hands or re-sorting.
+///
+/// The rank order is a function of the board alone (not the reach), so it is the
+/// one reusable part of the sweep.  Runout averaging (finding #1's turn leaf)
+/// applies the *same* board's structure across every CFR iteration and, via
+/// [`PreparedRunout`], across all 44 rivers — turning a per-iteration
+/// `O(runouts · n log n)` evaluate+sort into a one-time sort plus a linear sweep.
+pub struct PreparedShowdown {
+    /// Hero combos `(rank, card a, card b)` sorted ascending by 7-card rank.
+    sorted: Vec<(u32, u8, u8)>,
+}
+
+impl PreparedShowdown {
+    /// Sort a complete `board`'s combos by rank once (the reusable, reach-free
+    /// part of the showdown sweep).
+    pub fn new(board: [u8; 5]) -> Self {
+        let mut used = 0u64;
+        for &c in &board {
+            used |= 1 << c;
+        }
+        let live: Vec<u8> = (0u8..52).filter(|c| used & (1 << c) == 0).collect();
+        let mut sorted: Vec<(u32, u8, u8)> = Vec::with_capacity(1081);
+        for i in 0..live.len() {
+            let a = live[i];
+            for &b in &live[i + 1..] {
+                let rank = evaluate_7_lut(&[a, b, board[0], board[1], board[2], board[3], board[4]]);
+                sorted.push((rank, a, b));
+            }
+        }
+        sorted.sort_unstable_by_key(|&(r, _, _)| r);
+        Self { sorted }
+    }
+
+    /// **Add** `half_pot · (weaker − stronger)` per hero combo into `out` (the
+    /// blocker-corrected, reach-weighted showdown value) — the reach-dependent
+    /// sweep of [`board_cfvs`], accumulating so a runout can sum over rivers.
+    /// The caller zeroes `out` (single board) or accumulates across boards.
+    pub fn accumulate(&self, opp_reach: &[f64; 1326], half_pot: f64, out: &mut [f64; 1326]) {
+        // Total opponent reach and per-card reach, for the blocker-corrected
+        // "valid opponents" denominator under each hero hand.
+        let mut total_w = 0.0;
+        let mut card_w = [0.0; 52];
+        for &(_, a, b) in &self.sorted {
             let r = opp_reach[combo_index(a, b)];
             total_w += r;
             card_w[a as usize] += r;
             card_w[b as usize] += r;
-            let rank = evaluate_7_lut(&[a, b, board[0], board[1], board[2], board[3], board[4]]);
-            combos.push((rank, a, b));
+        }
+
+        let mut g_below = 0.0; // reach of strictly-weaker tiers
+        let mut below = [0.0; 52]; // …holding card c
+        let mut tier_card = [0.0; 52]; // current-tier reach holding card c
+
+        let mut i = 0;
+        while i < self.sorted.len() {
+            let rank = self.sorted[i].0;
+            let mut j = i;
+            let mut tier_w = 0.0;
+            while j < self.sorted.len() && self.sorted[j].0 == rank {
+                let (_, a, b) = self.sorted[j];
+                let r = opp_reach[combo_index(a, b)];
+                tier_card[a as usize] += r;
+                tier_card[b as usize] += r;
+                tier_w += r;
+                j += 1;
+            }
+
+            for &(_, a, b) in &self.sorted[i..j] {
+                let (ua, ub) = (a as usize, b as usize);
+                let rh = opp_reach[combo_index(a, b)];
+                // Weaker / tied / stronger opponent reach, blockers removed.
+                // Re-add the hero's own combo (subtracted twice via a and b).
+                let weaker = g_below - below[ua] - below[ub];
+                let tied = tier_w - tier_card[ua] - tier_card[ub] + rh;
+                let valid = total_w - card_w[ua] - card_w[ub] + rh;
+                let stronger = valid - weaker - tied;
+                out[combo_index(a, b)] += half_pot * (weaker - stronger);
+            }
+
+            g_below += tier_w;
+            for &(_, a, b) in &self.sorted[i..j] {
+                below[a as usize] += opp_reach[combo_index(a, b)];
+                below[b as usize] += opp_reach[combo_index(a, b)];
+                tier_card[a as usize] = 0.0;
+                tier_card[b as usize] = 0.0;
+            }
+            i = j;
         }
     }
-    combos.sort_unstable_by_key(|&(r, _, _)| r);
+}
 
-    let mut g_below = 0.0; // reach of strictly-weaker tiers
-    let mut below = [0.0; 52]; // …holding card c
-    let mut tier_card = [0.0; 52]; // current-tier reach holding card c
+/// Every board completion of a fixed **incomplete** board (turn or flop), each
+/// pre-sorted as a [`PreparedShowdown`] — the reusable structure behind
+/// [`board_runout_cfvs`].
+///
+/// Built once per resolve; a subgame's every depth-cut leaf shares the same
+/// board, so the whole solve reuses this one table across all iterations and all
+/// leaves, replacing an evaluate+sort pass *per completion per leaf per
+/// iteration* with a linear sweep over precomputed ranks.  A turn board (one
+/// missing card) enumerates 48 river completions; a flop board (two missing)
+/// enumerates C(49, 2) = 1176 turn+river completions.
+pub struct PreparedRunout {
+    completions: Vec<PreparedShowdown>,
+    /// Live completions per compatible (hero, opp) pair — `C(48 − real, missing)`
+    /// — the exact normalizing denominator (see [`board_runout_cfvs`]).
+    live_per_pair: f64,
+}
 
-    let mut i = 0;
-    while i < combos.len() {
-        let rank = combos[i].0;
-        let mut j = i;
-        let mut tier_w = 0.0;
-        while j < combos.len() && combos[j].0 == rank {
-            let (_, a, b) = combos[j];
-            let r = opp_reach[combo_index(a, b)];
-            tier_card[a as usize] += r;
-            tier_card[b as usize] += r;
-            tier_w += r;
-            j += 1;
+impl PreparedRunout {
+    /// Pre-sort every board completion of an incomplete `board` (trailing slots
+    /// [`NO_CARD`]): 4 real cards ⇒ the 48 river runouts (turn); 3 real cards ⇒
+    /// the 1176 turn+river runouts (flop).  Panics otherwise (a complete or
+    /// under-specified board is not a depth-cut leaf board).
+    pub fn new(board: [u8; 5]) -> Self {
+        let mut used = 0u64;
+        let mut real = 0;
+        for &c in &board {
+            if c != poker_core::state::NO_CARD {
+                used |= 1 << c;
+                real += 1;
+            }
+        }
+        assert!(
+            real == 3 || real == 4,
+            "PreparedRunout needs a flop (3-card) or turn (4-card) board, got {real} cards"
+        );
+        let missing = 5 - real;
+        let unused: Vec<u8> = (0u8..52).filter(|c| used & (1 << c) == 0).collect();
+
+        let mut completions = Vec::new();
+        let mut full = board;
+        match missing {
+            1 => {
+                for &r in &unused {
+                    full[4] = r;
+                    completions.push(PreparedShowdown::new(full));
+                }
+            }
+            2 => {
+                for i in 0..unused.len() {
+                    for j in (i + 1)..unused.len() {
+                        full[3] = unused[i];
+                        full[4] = unused[j];
+                        completions.push(PreparedShowdown::new(full));
+                    }
+                }
+            }
+            _ => unreachable!("real is 3 or 4"),
         }
 
-        for &(_, a, b) in &combos[i..j] {
-            let (a, b) = (a as usize, b as usize);
-            let rh = opp_reach[combo_index(a as u8, b as u8)];
-            // Weaker / tied / stronger opponent reach, blockers removed.  Re-add
-            // the hero's own combo (subtracted twice via card a and card b).
-            let weaker = g_below - below[a] - below[b];
-            let tied = tier_w - tier_card[a] - tier_card[b] + rh;
-            let valid = total_w - card_w[a] - card_w[b] + rh;
-            let stronger = valid - weaker - tied;
-            out[combo_index(a as u8, b as u8)] = half_pot * (weaker - stronger);
-        }
-
-        g_below += tier_w;
-        for &(_, a, b) in &combos[i..j] {
-            below[a as usize] += opp_reach[combo_index(a, b)];
-            below[b as usize] += opp_reach[combo_index(a, b)];
-            tier_card[a as usize] = 0.0;
-            tier_card[b as usize] = 0.0;
-        }
-        i = j;
+        // C(48 − real, missing): completions avoiding board (real) + hero (2) +
+        // opp (2), i.e. drawn from the 48 − real cards a compatible pair leaves.
+        let free = 48 - real; // cards not on the board and not in either hand
+        let live_per_pair = if missing == 1 {
+            free as f64
+        } else {
+            (free * (free - 1) / 2) as f64
+        };
+        Self { completions, live_per_pair }
     }
+
+    /// The showdown CFV averaged over the runout: sum every completion's
+    /// reach-weighted showdown into `out`, then divide by the live-completion
+    /// count (see [`board_runout_cfvs`]).
+    pub fn evaluate(&self, opp_reach: &[f64; 1326], half_pot: f64, out: &mut [f64; 1326]) {
+        out.fill(0.0);
+        for c in &self.completions {
+            c.accumulate(opp_reach, half_pot, out);
+        }
+        for o in out.iter_mut() {
+            *o /= self.live_per_pair;
+        }
+    }
+}
+
+/// Depth-limit showdown counterfactual value, averaged over the board runout —
+/// the check-down leaf value for **turn** (one-card) and **flop** (two-card)
+/// subgame resolving.
+///
+/// `board` holds the known cards with trailing [`NO_CARD`] slots; `opp_reach` is
+/// the opponent range in [`combo_index`] ordering, `half_pot` the stake at
+/// showdown (bb).  For each board completion the exact showdown CFV
+/// [`board_cfvs`] is accumulated, then divided by the number of completions a
+/// compatible (hero, opp) pair leaves live — `44` on the turn, `C(45, 2) = 990`
+/// on the flop.  Completions colliding with the hero's own cards contribute zero
+/// (`board_cfvs` never writes a blocked hero combo), so summing over *all*
+/// completions and dividing by that count is exact: it reproduces
+/// `Σ_g π(g)·(eq(h,g) − ½)·pot`, the value the explicit
+/// [`CheckdownLeafEval`](crate::resolving::leaf_eval) oracle scores there.
+///
+/// This convenience wrapper rebuilds the sort each call; the hot resolve path
+/// builds a [`PreparedRunout`] once and calls [`PreparedRunout::evaluate`].
+pub fn board_runout_cfvs(board: [u8; 5], opp_reach: &[f64; 1326], half_pot: f64, out: &mut [f64; 1326]) {
+    PreparedRunout::new(board).evaluate(opp_reach, half_pot, out);
 }
 
 /// Exact equity-distribution histograms for **every** hole combo on a partial
@@ -683,6 +819,52 @@ mod tests {
             make_card(2, 3),
             make_card(0, 0),
         ]
+    }
+
+    /// Against a single opponent hand, the runout-averaged showdown CFV must
+    /// equal `half_pot·(2·equity − 1)` with the equity from the independent
+    /// enumerator `hand_vs_hand_equity` — a direct check of the runout
+    /// normalization (44 on the turn, 990 on the flop).
+    fn check_runout_matches_equity(board: [u8; 5], real: usize, g: [u8; 2]) {
+        let visible: Vec<u8> = board[..real].to_vec();
+        let half_pot = 7.0;
+        let mut reach = [0.0_f64; 1326];
+        reach[combo_index(g[0], g[1])] = 1.0;
+        let mut cfv = [0.0_f64; 1326];
+        board_runout_cfvs(board, &reach, half_pot, &mut cfv);
+
+        let used: u64 = board[..real].iter().chain(g.iter()).fold(0, |m, &c| m | (1 << c));
+        for a in 0..52u8 {
+            for b in (a + 1)..52u8 {
+                if used & (1 << a) != 0 || used & (1 << b) != 0 {
+                    assert_eq!(cfv[combo_index(a, b)], 0.0, "blocked hero combo is zero");
+                    continue;
+                }
+                let eq = hand_vs_hand_equity([a, b], g, &visible);
+                let expected = half_pot * (2.0 * eq - 1.0);
+                assert!(
+                    (cfv[combo_index(a, b)] - expected).abs() < 1e-9,
+                    "hero {a},{b}: {} vs {expected}",
+                    cfv[combo_index(a, b)]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn turn_runout_cfvs_matches_hand_vs_hand_equity() {
+        // One-card (river) runout: divisor 44.
+        use poker_core::state::NO_CARD;
+        let turn = [make_card(12, 0), make_card(11, 1), make_card(7, 2), make_card(2, 3), NO_CARD];
+        check_runout_matches_equity(turn, 4, [make_card(11, 0), make_card(11, 2)]);
+    }
+
+    #[test]
+    fn flop_runout_cfvs_matches_hand_vs_hand_equity() {
+        // Two-card (turn+river) runout: divisor C(45, 2) = 990.
+        use poker_core::state::NO_CARD;
+        let flop = [make_card(12, 0), make_card(11, 1), make_card(7, 2), NO_CARD, NO_CARD];
+        check_runout_matches_equity(flop, 3, [make_card(11, 0), make_card(11, 2)]);
     }
 
     #[test]
