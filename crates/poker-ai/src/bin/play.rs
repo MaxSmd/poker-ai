@@ -13,8 +13,14 @@
 //!     --stack-bb=N       blueprint stack depth in bb (default 200 — Slumbot's)
 //!     --cap=N            blueprint raise cap (default 3 — must match training)
 //!     --no-resolve       blueprint-only river (skip the vectorized re-solve)
+//!     --resolve-turn     also re-solve the turn (runout leaves — slower)
+//!     --resolve-flop     also re-solve the flop (two-card runout — much slower;
+//!                        for small-sample testing)
 //!     --iters=N          CFR⁺ iterations per river resolve (default 1500)
-//!     --river-cap=N      raise cap inside a river resolve (default 3)
+//!     --turn-iters=N     CFR⁺ iterations per turn/flop resolve (default 500)
+//!     --river-cap=N      raise cap inside a resolve, every street (default 3)
+//!     --continuations=L  comma-separated turn/flop leaf pot scales, first 0.0
+//!                        (default 0.0,0.75,1.5,3.0; a single 0.0 = check-down)
 //!     --purify=X         drop action probabilities below X (default 0.1)
 //!     --seed=N           sampling seed (default 1)
 //!     --log-hands=PATH   write full per-hand histories (final action string,
@@ -282,8 +288,9 @@ fn run_slumbot(args: &[String]) {
     validate(
         args,
         &[
-            "data", "policy", "stack-bb", "cap", "no-resolve", "iters", "river-cap", "purify",
-            "seed", "log-hands", "token", "username", "password",
+            "data", "policy", "stack-bb", "cap", "no-resolve", "resolve-turn", "resolve-flop",
+            "iters", "turn-iters", "river-cap", "continuations", "purify", "seed", "log-hands",
+            "token", "username", "password",
         ],
         1,
     );
@@ -295,10 +302,20 @@ fn run_slumbot(args: &[String]) {
     let dir = PathBuf::from(flag::<String>(args, "data").unwrap_or_else(|| "data".into()));
     let stack_bb: u32 = flag(args, "stack-bb").unwrap_or(200);
     let cap: u32 = flag(args, "cap").unwrap_or(3);
+    // Turn/flop continuation scales (finding #1): comma-separated, first should
+    // be 0.0.  A single value (e.g. `--continuations=0.0`) is a plain check-down.
+    let continuations: Vec<f64> = flag::<String>(args, "continuations")
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect::<Vec<f64>>())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| vec![0.0, 0.75, 1.5, 3.0]);
     let cfg = BotConfig {
         resolve_river: !args.iter().any(|a| a == "--no-resolve"),
+        resolve_turn: args.iter().any(|a| a == "--resolve-turn"),
+        resolve_flop: args.iter().any(|a| a == "--resolve-flop"),
         river_iters: flag(args, "iters").unwrap_or(1_500),
+        turn_iters: flag(args, "turn-iters").unwrap_or(500),
         river_cap: flag(args, "river-cap").unwrap_or(3),
+        continuations,
         purify: flag(args, "purify").unwrap_or(0.1),
         seed: flag(args, "seed").unwrap_or(1),
     };
@@ -311,15 +328,23 @@ fn run_slumbot(args: &[String]) {
         eprintln!("cannot load {}: {e}", policy_path.display());
         std::process::exit(1);
     });
-    println!(
-        "  {} info sets; river resolve: {}",
-        policy.len(),
-        if cfg.resolve_river {
-            format!("on ({} iters, cap {})", cfg.river_iters, cfg.river_cap)
+    let resolve_state = |on: bool, iters: u64| {
+        if on {
+            format!("on ({iters} iters, cap {})", cfg.river_cap)
         } else {
             "off".into()
         }
+    };
+    println!(
+        "  {} info sets; resolve — river: {}, turn: {}, flop: {}",
+        policy.len(),
+        resolve_state(cfg.resolve_river, cfg.river_iters),
+        resolve_state(cfg.resolve_turn, cfg.turn_iters),
+        resolve_state(cfg.resolve_flop, cfg.turn_iters),
     );
+    if cfg.resolve_turn || cfg.resolve_flop {
+        println!("  continuations (K={}): {:?}", cfg.continuations.len(), cfg.continuations);
+    }
     let mut bot = Bot::new(game, policy, cfg);
 
     // Session token: flag > persisted file > fresh (server mints one).

@@ -1,18 +1,24 @@
-//! The playing agent: blueprint policy + belief tracking + river re-solving.
+//! The playing agent: blueprint policy + belief tracking + postflop re-solving.
 //!
 //! Decision architecture (Pluribus-style split, sized to what a single machine
 //! can compute in real time at 200 bb):
 //!
-//! * **Preflop / flop / turn** — play directly from the trained blueprint:
-//!   translate the real hand into the abstract game ([`AbstractHand`]), look up
-//!   the average strategy at the info key, purify + sample.
-//! * **River** — full-range re-solve of the *actual* public state with the
-//!   vectorized public-tree CFR ([`solve_vectorized_capped`]): the resolve root
-//!   carries the real pot and stacks (off-tree bets included, so translation
-//!   distortion vanishes exactly where the money is deepest), our range and
-//!   the opponent's range are carried Bayes updates of the blueprint
-//!   (`P(observed abstract action | hand)` at every prior decision), and the
-//!   resolved root distribution is played directly in real chips.
+//! * **Preflop** — play directly from the trained blueprint: translate the real
+//!   hand into the abstract game ([`AbstractHand`]), look up the average
+//!   strategy at the info key, purify + sample.
+//! * **Flop / turn / river** — full-range re-solve of the *actual* public state
+//!   with the vectorized public-tree CFR: the resolve root carries the real pot
+//!   and stacks (off-tree bets included, so translation distortion vanishes
+//!   exactly where the money is deepest), our range and the opponent's range are
+//!   carried Bayes updates of the blueprint (`P(observed abstract action | hand)`
+//!   at every prior decision), and the resolved root distribution is played
+//!   directly in real chips.  A **river** resolve is exact to showdown
+//!   ([`solve_vectorized_capped`]); a **turn / flop** resolve cuts at the undealt
+//!   street and scores each depth-cut leaf as the check-down showdown averaged
+//!   over the runout, with the opponent choosing among K continuations at the
+//!   leaf ([`solve_vectorized_multi`], finding #1) so the resolve is robust to
+//!   post-leaf betting the check-down ignores.  Turn/flop resolves are far
+//!   costlier (each leaf averages 44 / 990 runouts) and are opt-in.
 //!
 //! Both ranges are maintained per hand; the opponent's is additionally
 //! filtered by card removal (board + our own hole cards).
@@ -26,17 +32,34 @@ use crate::play::policy::CompactPolicy;
 use crate::play::protocol::{parse_action, Event, EventKind, Parsed, BIG_BLIND, SMALL_BLIND, STACK_SIZE};
 use crate::play::tracker::{AbstractHand, MapOutcome, RealMove};
 use crate::resolving::belief_state::{combo_cards, combo_index, BeliefState, NUM_COMBOS};
-use crate::resolving::vector_cfr::{capped_root_actions, solve_vectorized_capped, subgame_info_key};
+use crate::resolving::vector_cfr::{
+    capped_root_actions, solve_vectorized_capped, solve_vectorized_multi, subgame_info_key,
+};
 
 /// Tunables for the playing agent.
 #[derive(Clone, Debug)]
 pub struct BotConfig {
     /// Re-solve river decisions (recommended); otherwise blueprint throughout.
     pub resolve_river: bool,
+    /// Re-solve turn decisions.  Each depth-cut leaf averages 44 river runouts,
+    /// so this is materially slower than a river resolve — off by default.
+    pub resolve_turn: bool,
+    /// Re-solve flop decisions.  Each depth-cut leaf averages C(45,2)=990
+    /// turn+river runouts, an order of magnitude slower again — intended for
+    /// small-sample testing, off by default.
+    pub resolve_flop: bool,
     /// CFR⁺ iterations per river resolve.
     pub river_iters: u64,
-    /// Raise cap inside a river resolve (bounds the public tree).
+    /// CFR⁺ iterations per turn/flop resolve — kept lower than `river_iters`
+    /// because runout leaves make each iteration far costlier.
+    pub turn_iters: u64,
+    /// Raise cap inside a resolve (bounds the public tree; used at every street).
     pub river_cap: u32,
+    /// Rest-of-hand pot scales for the turn/flop depth-limit continuation choice
+    /// (finding #1): the opponent picks among these at each runout leaf, so the
+    /// resolve is robust to the post-leaf betting a plain check-down ignores.
+    /// `scales[0]` should be `0.0`; `[0.0]` is a single check-down (no chooser).
+    pub continuations: Vec<f64>,
     /// Purification: drop actions below this probability, renormalize, then
     /// sample (`0.0` = sample the raw mixed strategy).
     pub purify: f64,
@@ -46,7 +69,17 @@ pub struct BotConfig {
 
 impl Default for BotConfig {
     fn default() -> Self {
-        Self { resolve_river: true, river_iters: 1_500, river_cap: 3, purify: 0.1, seed: 1 }
+        Self {
+            resolve_river: true,
+            resolve_turn: false,
+            resolve_flop: false,
+            river_iters: 1_500,
+            turn_iters: 500,
+            river_cap: 3,
+            continuations: vec![0.0, 0.75, 1.5, 3.0],
+            purify: 0.1,
+            seed: 1,
+        }
     }
 }
 
@@ -132,12 +165,24 @@ impl Bot {
             ));
         }
 
-        let mv = if parsed.street == 3 && self.cfg.resolve_river && board.len() == 5 {
-            self.decide_river(hs, &parsed, board)
+        let mv = if self.should_resolve(parsed.street, board) {
+            self.decide_resolve(hs, &parsed, board)
         } else {
             self.decide_blueprint(hs, &parsed, board)
         };
         Ok(mv.to_incr())
+    }
+
+    /// Whether to re-solve this street, given the enabled flags and a board with
+    /// the right number of revealed cards for the street (a defensive guard —
+    /// the resolve root synthesis assumes the board matches the street).
+    fn should_resolve(&self, street: u8, board: &[u8]) -> bool {
+        match street {
+            3 => self.cfg.resolve_river && board.len() == 5,
+            2 => self.cfg.resolve_turn && board.len() == 4,
+            1 => self.cfg.resolve_flop && board.len() == 3,
+            _ => false, // preflop is always blueprint
+        }
     }
 
     /// Bring the abstract state, board, and ranges up to date with the
@@ -297,9 +342,12 @@ impl Bot {
         }
     }
 
-    /// River decision by full-range vectorized re-solve of the real state.
-    fn decide_river(&mut self, hs: &mut HandState, parsed: &Parsed, board: &[u8]) -> RealMove {
-        let root = self.river_root(hs, parsed, board);
+    /// Postflop decision by full-range vectorized re-solve of the real state —
+    /// exact to showdown on the river, cut at the undealt street on turn/flop
+    /// (runout leaves with K continuations).  Dispatched by [`Self::should_resolve`].
+    fn decide_resolve(&mut self, hs: &mut HandState, parsed: &Parsed, board: &[u8]) -> RealMove {
+        let street = parsed.street;
+        let root = self.resolve_root(hs, parsed, board);
         let acts = capped_root_actions(&root, self.cfg.river_cap);
         if acts.is_empty() {
             return self.decide_blueprint(hs, parsed, board);
@@ -329,12 +377,26 @@ impl Bot {
             beliefs[hs.my_seat].update(&ones); // renormalize
         }
 
-        let resolved = solve_vectorized_capped(&root, &beliefs, self.cfg.river_iters, self.cfg.river_cap);
+        // River: exact showdown terminals.  Turn/flop: the board is undealt past
+        // this street, so the solver cuts at the runout with K continuations.
+        let resolved = if board.len() == 5 {
+            solve_vectorized_capped(&root, &beliefs, self.cfg.river_iters, self.cfg.river_cap)
+        } else {
+            solve_vectorized_multi(
+                &root,
+                &beliefs,
+                self.cfg.turn_iters,
+                self.cfg.river_cap,
+                self.cfg.continuations.clone(),
+            )
+        };
 
         let mut hole = hs.my_hole;
         hole.sort_unstable();
+        // The root key filters NO_CARD, so a padded board yields the visible
+        // cards only — matching the solver's own root emission.
         let mut board5 = [NO_CARD; 5];
-        board5.copy_from_slice(&board[..5]);
+        board5[..board.len()].copy_from_slice(board);
         let key = subgame_info_key(hs.my_seat, hole, &board5, &[]);
         let Some(probs) = resolved.strategy.get(&key).cloned() else {
             // Unreached in the resolve (shouldn't happen with the floor):
@@ -373,7 +435,7 @@ impl Bot {
             RealMove::Call => EventKind::Call,
             RealMove::BetTo(n) => EventKind::BetTo(n),
         };
-        if hs.hand.expects(&self.game, hs.my_seat, 3) {
+        if hs.hand.expects(&self.game, hs.my_seat, street) {
             let mut rng = self.rng;
             let mut unit = || {
                 rng ^= rng >> 12;
@@ -402,11 +464,13 @@ impl Bot {
         mv
     }
 
-    /// Synthesize the real river public state (Slumbot chips) as an engine
-    /// `GameState` — the resolve root.
-    fn river_root(&self, hs: &HandState, parsed: &Parsed, board: &[u8]) -> GameState {
+    /// Synthesize the real postflop public state (Slumbot chips) as an engine
+    /// `GameState` at `parsed.street` — the resolve root.  The board is padded
+    /// with `NO_CARD` past the revealed cards (turn/flop), which the solver
+    /// reads as the depth cut.
+    fn resolve_root(&self, hs: &HandState, parsed: &Parsed, board: &[u8]) -> GameState {
         let mut board5 = [NO_CARD; 5];
-        board5.copy_from_slice(&board[..5]);
+        board5[..board.len()].copy_from_slice(board);
         // Placeholder opponent cards (never read by the public-tree solver).
         let mut used = 0u64;
         for &c in board {
@@ -421,7 +485,7 @@ impl Bot {
         holes[1 - hs.my_seat] = opp_cards;
 
         let mut gs = GameState::new(2, BIG_BLIND, SMALL_BLIND, [STACK_SIZE; MAX_PLAYERS], holes, board5, 0);
-        gs.street = 3;
+        gs.street = parsed.street;
         for pos in 0..2usize {
             let seat = 1 - pos;
             gs.total_committed[seat] = parsed.total_committed[pos];
@@ -439,8 +503,8 @@ impl Bot {
                 gs.allin |= 1 << seat;
             }
         }
-        let river_fresh = !parsed.events.iter().any(|e| e.street == 3);
-        gs.players_to_act = if river_fresh && gs.current_bet == 0 { 2 } else { 1 };
+        let street_fresh = !parsed.events.iter().any(|e| e.street == parsed.street);
+        gs.players_to_act = if street_fresh && gs.current_bet == 0 { 2 } else { 1 };
         gs.last_aggressor = if parsed.last_bettor >= 0 {
             (1 - parsed.last_bettor) as u8
         } else {
@@ -499,7 +563,14 @@ mod tests {
         Bot::new(
             game,
             policy,
-            BotConfig { resolve_river: resolve, river_iters: 120, river_cap: 2, purify: 0.0, seed: 42 },
+            BotConfig {
+                resolve_river: resolve,
+                river_iters: 120,
+                river_cap: 2,
+                purify: 0.0,
+                seed: 42,
+                ..Default::default()
+            },
         )
     }
 
@@ -594,7 +665,14 @@ mod tests {
         let mut b = Bot::new(
             game,
             policy,
-            BotConfig { resolve_river: false, river_iters: 0, river_cap: 2, purify: 0.0, seed: 7 },
+            BotConfig {
+                resolve_river: false,
+                river_iters: 0,
+                river_cap: 2,
+                purify: 0.0,
+                seed: 7,
+                ..Default::default()
+            },
         );
         // We are the BB (first to act postflop): SB opens, we call, flop comes,
         // our decision triggers a bucketed range update over the full board.
@@ -682,6 +760,67 @@ mod tests {
             let incr = b.act(&mut hs, action, &board).expect("bot acts");
             assert_eq!(incr, expected, "holding {hole:?} facing a flop shove");
         }
+    }
+
+    /// Turn re-solving is wired end-to-end: `decide_resolve` synthesizes the
+    /// turn root, runs the K-continuation runout solver, and plays a legal root
+    /// action.  Small cap + K keep the deep-stack turn tree fast for a unit test.
+    fn resolve_bot(turn: bool, flop: bool, continuations: Vec<f64>) -> Bot {
+        let game = BlueprintHoldem::new(400, 2, 1, 0).with_raise_cap(3);
+        let policy = CompactPolicy::from_entries(vec![]);
+        Bot::new(
+            game,
+            policy,
+            BotConfig {
+                resolve_river: false,
+                resolve_turn: turn,
+                resolve_flop: flop,
+                river_iters: 0,
+                turn_iters: 40,
+                river_cap: 1,
+                continuations,
+                purify: 0.0,
+                seed: 42,
+            },
+        )
+    }
+
+    #[test]
+    fn turn_resolve_returns_a_root_action() {
+        // K=2 exercises the continuation-chooser path through the bot as well.
+        let mut b = resolve_bot(true, false, vec![0.0, 1.0]);
+        let hole = [parse_card("Ac").unwrap(), parse_card("Kd").unwrap()];
+        let mut hs = b.start_hand(0, hole); // BB, first to act postflop
+        // Preflop SB open + call; flop checks through; turn is on us, unopened.
+        let action = "b200c/kk/";
+        let board = cards(&["Qs", "4s", "3h", "Th"]);
+        let incr = b.act(&mut hs, action, &board).expect("turn decision");
+        assert!(
+            incr == "k" || incr.starts_with('b'),
+            "unopened turn allows check or bet, got {incr:?}"
+        );
+        if let Some(n) = incr.strip_prefix('b') {
+            let to: u32 = n.parse().unwrap();
+            assert!((BIG_BLIND..=19_800).contains(&to), "legal turn bet size, got {to}");
+        }
+        assert!(parse_action(&format!("{action}{incr}")).is_ok());
+    }
+
+    #[test]
+    #[ignore = "flop resolve enumerates C(45,2)=990 runouts per leaf — seconds-slow; \
+                the wiring is exercised fast by turn_resolve_returns_a_root_action"]
+    fn flop_resolve_returns_a_root_action() {
+        let mut b = resolve_bot(false, true, vec![0.0, 1.0]);
+        let hole = [parse_card("Ac").unwrap(), parse_card("Kd").unwrap()];
+        let mut hs = b.start_hand(0, hole); // BB, first to act postflop
+        let action = "b200c/"; // preflop done; flop is on us, unopened
+        let board = cards(&["Qs", "4s", "3h"]);
+        let incr = b.act(&mut hs, action, &board).expect("flop decision");
+        assert!(
+            incr == "k" || incr.starts_with('b'),
+            "unopened flop allows check or bet, got {incr:?}"
+        );
+        assert!(parse_action(&format!("{action}{incr}")).is_ok());
     }
 
     #[test]
