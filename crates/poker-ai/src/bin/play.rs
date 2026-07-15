@@ -159,6 +159,30 @@ fn classify(menu: &[Action], probs: &[f64]) -> (f64, f64, f64) {
     (fold, passive, aggro)
 }
 
+/// Number of concrete combos a chart cell stands for: pair 6, suited 4,
+/// offsuit 12 (sums to 1326 over the 169 cells).
+fn combo_weight(row: usize, col: usize) -> f64 {
+    if row == col {
+        6.0
+    } else if row < col {
+        4.0
+    } else {
+        12.0
+    }
+}
+
+/// Short label for a preflop root action; raise levels shown in big blinds.
+/// `Call` reads "limp" because this is only used at the SB's opening node.
+fn action_label(a: &Action) -> String {
+    match a {
+        Action::Fold => "fold".into(),
+        Action::Check => "check".into(),
+        Action::Call => "limp".into(),
+        Action::Raise(n) => format!("{}bb", *n as f64 / ABSTRACT_BB as f64),
+        Action::AllIn => "all-in".into(),
+    }
+}
+
 /// Print a 13×13 percentage grid (values already in 0..=100), `?` where the
 /// blueprint never stored the info set (uniform fallback).
 fn print_grid(title: &str, vals: &[[f64; 13]; 13], missing: &[[bool; 13]; 13]) {
@@ -204,10 +228,18 @@ fn run_chart(args: &[String]) {
 
     let mut sb_open = [[0.0f64; 13]; 13]; // P(raise/all-in) opening the button
     let mut sb_fold = [[0.0f64; 13]; 13]; // P(fold) — the SB min-fold
+    let mut sb_small = [[0.0f64; 13]; 13]; // P(smallest open) — the node the BB charts condition on
     let mut bb_fold = [[0.0f64; 13]; 13]; // P(fold) facing the smallest SB open
     let mut bb_3bet = [[0.0f64; 13]; 13]; // P(raise/all-in) — the BB 3-bet
     let mut sb_missing = [[false; 13]; 13];
     let mut bb_missing = [[false; 13]; 13];
+    // Combo-weighted mean probability per SB root action (pair=6, suited=4,
+    // offsuit=12 combos): how the blueprint's SB splits its play across
+    // limp / each open size — invisible in the aggregated `sb_open` grid, and
+    // exactly what determines the range the BB response was trained against.
+    let mut sb_mix: Vec<f64> = Vec::new();
+    let mut sb_mix_labels: Vec<String> = Vec::new();
+    let mut sb_mix_weight = 0.0f64;
 
     for row in 0..13 {
         for col in 0..13 {
@@ -223,6 +255,18 @@ fn run_chart(args: &[String]) {
             let (fold, _passive, aggro) = classify(&menu, &probs);
             sb_open[row][col] = 100.0 * aggro;
             sb_fold[row][col] = 100.0 * fold;
+            if let Some(i) = menu.iter().position(|a| matches!(a, Action::Raise(_))) {
+                sb_small[row][col] = 100.0 * probs[i];
+            }
+            if sb_mix_labels.is_empty() {
+                sb_mix_labels = menu.iter().map(action_label).collect();
+                sb_mix = vec![0.0; menu.len()];
+            }
+            let w = combo_weight(row, col);
+            for (m, &p) in sb_mix.iter_mut().zip(probs.iter()) {
+                *m += w * p;
+            }
+            sb_mix_weight += w;
 
             // --- BB defense vs the smallest SB open. ---
             // Put the hero hand in the BB (seat 1); a filler SB (seat 0) makes
@@ -249,6 +293,23 @@ fn run_chart(args: &[String]) {
 
     print_grid("SB open — P(raise/all-in) %", &sb_open, &sb_missing);
     print_grid("SB fold % (limp-or-fold: high = over-folding the button)", &sb_fold, &sb_missing);
+    let small_label = sb_mix_labels
+        .iter()
+        .find(|l| l.ends_with("bb"))
+        .cloned()
+        .unwrap_or_else(|| "smallest open".into());
+    print_grid(
+        &format!(
+            "SB smallest open ({small_label}) — P %  (the range the BB response below was trained against)"
+        ),
+        &sb_small,
+        &sb_missing,
+    );
+    print!("\nSB action mix (combo-weighted over all 1326 hands): ");
+    for (label, m) in sb_mix_labels.iter().zip(&sb_mix) {
+        print!(" {label} {:.1}%", 100.0 * m / sb_mix_weight);
+    }
+    println!();
     print_grid("BB vs smallest SB open — P(fold) %", &bb_fold, &bb_missing);
     print_grid("BB vs smallest SB open — P(3-bet) %", &bb_3bet, &bb_missing);
     println!(
