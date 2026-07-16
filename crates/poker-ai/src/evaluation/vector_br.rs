@@ -10,14 +10,22 @@
 //! * **ranges** — exact: all 1326×1326 hand pairs via reach vectors, card
 //!   removal by blocker-corrected sweeps ([`PreparedShowdown`]) at showdowns
 //!   and inclusion–exclusion at folds;
-//! * **turn / river** — exact: every card is enumerated, with the *per-pair*
-//!   divisor (45 turns, 44 rivers consistent with any two disjoint holdings)
-//!   so each branch is an exact conditional expectation;
 //! * **flops** — Monte-Carlo: a sampled flop set stands in for all C(52,3),
-//!   scaled by `|F| · C(48,3)/C(52,3)` (the expected number of samples
-//!   consistent with a hand pair).  Per-pair values stay unbiased; the final
-//!   max over BR actions inherits a mild upward bias that shrinks with the
-//!   sample (pass [`all_flops`] for none at all).
+//!   scaled by `|F| · C(48,3)/C(52,3)`;
+//! * **turn / river** — Monte-Carlo (`board_samples > 0`): `k` cards drawn per
+//!   reveal and averaged, OR exact enumeration (`board_samples == 0`) with the
+//!   per-pair divisor (45 turns, 44 rivers).
+//!
+//! **On cost — the reason `board_samples` exists.** Exact turn/river
+//! enumeration recurses into the *whole betting subtree* at each of ~48×44
+//! cards.  On a tiny validation game that finishes; on the real 200 bb cap-3
+//! blueprint it multiplies an already-billion-node tree by ~2000× and does
+//! not finish in any practical time (an early exact run was killed after
+//! 45 min with no single flop complete).  Sampling the runouts collapses the
+//! 48×44 factor to `k²`, turning it into a minutes-to-hours job.  The
+//! blueprint side stays unbiased; the BR's max over sampled continuations is
+//! mildly upward-biased (shrinks with `k`), and with a fixed seed the bias is
+//! reproducible so before/after abstraction A/Bs compare cleanly.
 //!
 //! `exploitability = (br₀ + br₁) / 2` (NashConv/2, the same convention as
 //! `solver::best_response`), in bb/hand.  The number is an *abstract-game*
@@ -27,10 +35,20 @@
 //!
 //! Cost model: dominated by river betting nodes × 1326-wide arithmetic.  Work
 //! parallelizes over flops (each flop subtree is independent; results are
-//! reduced in fixed order, so the value is deterministic for a fixed flop set).
+//! reduced in fixed order, so the value is deterministic for a fixed flop set
+//! and seed), with a per-flop progress line to stderr.
 
 use rayon::prelude::*;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+/// Global progress heartbeat: flop subtrees evaluated in the current BR pass.
+/// A flop fan-out happens at *every* pre-flop→flop transition (many per pass),
+/// so a per-fan-out counter would reset and repeat — this counts the total.
+/// Reset at the start of each [`best_response_value`]; the tool runs one BR at
+/// a time so a process-global counter is safe.
+static FLOP_SUBTREES_DONE: AtomicU64 = AtomicU64::new(0);
 
 use crate::abstraction::features::{combo_cards, PreparedShowdown};
 use crate::games::blueprint::BlueprintHoldem;
@@ -57,14 +75,17 @@ pub struct BrReport {
 }
 
 /// Exploitability of `policy` in the abstract game `game`, over the given
-/// flop set (see module docs for exactness semantics).
+/// flop set, sampling `board_samples` turn/river runouts per reveal
+/// (`0` = exact enumeration; see [`best_response_value`]).
 pub fn blueprint_exploitability(
     game: &BlueprintHoldem,
     policy: &CompactPolicy,
     flops: &[[u8; 3]],
+    board_samples: usize,
+    seed: u64,
 ) -> BrReport {
-    let br0 = best_response_value(game, policy, 0, flops);
-    let br1 = best_response_value(game, policy, 1, flops);
+    let br0 = best_response_value(game, policy, 0, flops, board_samples, seed);
+    let br1 = best_response_value(game, policy, 1, flops, board_samples, seed);
     BrReport {
         br_value_bb: [br0, br1],
         exploitability_mbb: (br0 + br1) / 2.0 * 1000.0,
@@ -72,16 +93,26 @@ pub fn blueprint_exploitability(
     }
 }
 
-/// Value (bb/hand) of the exact best response for seat `br` when the other
-/// seat plays `policy` (uniform at info sets the blueprint never stored —
-/// matching how the playing agent treats them).
+/// Value (bb/hand) of the best response for seat `br` when the other seat
+/// plays `policy` (uniform at info sets the blueprint never stored — matching
+/// how the playing agent treats them).
+///
+/// `board_samples`: turn/river cards drawn per reveal.  `0` enumerates every
+/// card — exact, but only tractable on tiny games (the deep 200 bb cap-3 tree
+/// × 48 × 44 does not finish).  `k > 0` samples `k` per reveal; the blueprint
+/// side stays unbiased, the BR's max over sampled continuations is mildly
+/// upward-biased and shrinks with `k`.  With a fixed `seed` the result is
+/// reproducible, so old-vs-new blueprint A/Bs share the sampling bias and
+/// compare cleanly.
 pub fn best_response_value(
     game: &BlueprintHoldem,
     policy: &CompactPolicy,
     br: usize,
     flops: &[[u8; 3]],
+    board_samples: usize,
+    seed: u64,
 ) -> f64 {
-    let v = br_value_vector(game, policy, br, flops);
+    let v = br_value_vector(game, policy, br, flops, board_samples, seed);
     // Missing constant weights: P(opp hand | ours) = 1/1225 and the average
     // over our own 1326 uniformly-dealt hands; then chips → bb.
     v.iter().sum::<f64>() / 1225.0 / 1326.0 / game.big_blind_chips() as f64
@@ -98,9 +129,12 @@ pub fn br_value_vector(
     policy: &CompactPolicy,
     br: usize,
     flops: &[[u8; 3]],
+    board_samples: usize,
+    seed: u64,
 ) -> Vec<f64> {
     assert!(!flops.is_empty(), "need at least one flop");
-    let mut ctx = Ctx::new(game, policy, br, flops);
+    FLOP_SUBTREES_DONE.store(0, Ordering::Relaxed);
+    let mut ctx = Ctx::new(game, policy, br, flops, board_samples, seed);
     let state = game.play_state([[48, 49], [50, 51]], [poker_core::state::NO_CARD; 5]);
     let mut gs = game.game_state(&state).clone();
     let buckets = game.bucket_vector(&[]);
@@ -163,19 +197,54 @@ struct Ctx<'a> {
     flops: &'a [[u8; 3]],
     /// `|F| · C(48,3)/C(52,3)` — the flop-chance divisor (see module docs).
     flop_div: f64,
+    /// Turn/river runout sampling: `0` enumerates every card (exact, only
+    /// tractable on small games — the deep 200 bb tree × 48 × 44 does not
+    /// finish); `k > 0` samples `k` cards per reveal and averages, the mode
+    /// that makes a real blueprint measurable.  See [`sample_flops`]-style
+    /// determinism note on [`best_response_value`].
+    board_samples: usize,
+    /// Base RNG seed; per-reveal streams are derived deterministically from
+    /// this and the board prefix, so a fixed seed is fully reproducible even
+    /// across the parallel flop fan-out.
+    seed: u64,
+    /// Start of the BR pass, for the progress heartbeat.
+    start: Instant,
     cache: HashMap<u64, Box<[f64]>>,
     /// `combo_cards` for 0..1326, precomputed.
     cards: Vec<[u8; 2]>,
 }
 
 impl<'a> Ctx<'a> {
-    fn new(game: &'a BlueprintHoldem, policy: &'a CompactPolicy, br: usize, flops: &'a [[u8; 3]]) -> Self {
+    fn new(
+        game: &'a BlueprintHoldem,
+        policy: &'a CompactPolicy,
+        br: usize,
+        flops: &'a [[u8; 3]],
+        board_samples: usize,
+        seed: u64,
+    ) -> Self {
+        Self::with_start(game, policy, br, flops, board_samples, seed, Instant::now())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_start(
+        game: &'a BlueprintHoldem,
+        policy: &'a CompactPolicy,
+        br: usize,
+        flops: &'a [[u8; 3]],
+        board_samples: usize,
+        seed: u64,
+        start: Instant,
+    ) -> Self {
         Self {
             game,
             policy,
             br,
             flops,
             flop_div: flops.len() as f64 * FLOP_CONSISTENT_RATE,
+            board_samples,
+            seed,
+            start,
             cache: HashMap::new(),
             cards: (0..COMBOS).map(combo_cards).collect(),
         }
@@ -303,16 +372,27 @@ impl<'a> Ctx<'a> {
                 // fixed order so the result is deterministic.  Workers build
                 // their own `Ctx` (the policy cache is not shared).
                 let (game, policy, br, flops) = (self.game, self.policy, self.br, self.flops);
+                let (board_samples, seed, start) = (self.board_samples, self.seed, self.start);
                 let (gs0, hist0) = (&*gs, &*hist);
                 let branches: Vec<Vec<f64>> = flops
                     .par_iter()
-                    .map(move |f| {
-                        let mut ctx = Ctx::new(game, policy, br, flops);
+                    .map(|f| {
+                        let mut ctx = Ctx::with_start(game, policy, br, flops, board_samples, seed, start);
                         let mut gs2 = gs0.clone();
                         gs2.board[..3].copy_from_slice(f);
                         let mut hist2 = hist0.clone();
                         let child_reach = masked_reach(reach, f, &ctx.cards);
-                        ctx.after_deal(&mut gs2, &mut hist2, raises, 3, &child_reach)
+                        let v = ctx.after_deal(&mut gs2, &mut hist2, raises, 3, &child_reach);
+                        // Heartbeat every 200 flop subtrees (a pass has many
+                        // pre-flop→flop transitions × |flops| of these).
+                        let n = FLOP_SUBTREES_DONE.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n.is_multiple_of(200) {
+                            eprintln!(
+                                "    {n} flop subtrees evaluated  [{:.0}s]",
+                                start.elapsed().as_secs_f64()
+                            );
+                        }
+                        v
                     })
                     .collect();
                 let mut out = vec![0.0f64; COMBOS];
@@ -331,15 +411,34 @@ impl<'a> Ctx<'a> {
                 out
             }
             3 | 4 => {
-                // One card: 45 turns / 44 rivers are consistent with any two
-                // disjoint holdings — the exact per-pair divisor.
-                let div = if revealed == 3 { 45.0 } else { 44.0 };
+                // Turn (45) / river (44) reveal.  `board_samples == 0`
+                // enumerates every card — exact, only tractable on tiny games.
+                // Otherwise sample `board_samples` cards without replacement and
+                // average: each sampled card is a uniform draw over the live
+                // deck, so the mean is an unbiased estimate of the exact
+                // per-pair conditional expectation for the blueprint side; the
+                // BR's max over sampled continuations is mildly upward-biased,
+                // shrinking with more samples (documented on the CLI).
                 let prefix = card_mask(&gs.board[..revealed]);
-                let mut out = vec![0.0f64; COMBOS];
-                for c in 0..52u8 {
-                    if prefix & (1 << c) != 0 {
-                        continue;
+                let live: Vec<u8> = (0..52u8).filter(|&c| prefix & (1 << c) == 0).collect();
+                let cards: Vec<u8> = if self.board_samples == 0 || self.board_samples >= live.len() {
+                    live
+                } else {
+                    // Deterministic per-path stream: seed from the board prefix
+                    // so parallel flops stay reproducible.
+                    let mut st = splitmix(self.seed ^ (prefix.wrapping_mul(0x9E37_79B9_7F4A_7C15)));
+                    let mut pool = live;
+                    let len = pool.len();
+                    for i in 0..self.board_samples {
+                        let j = i + (next_unit(&mut st) * (len - i) as f64) as usize;
+                        pool.swap(i, j.min(len - 1));
                     }
+                    pool.truncate(self.board_samples);
+                    pool
+                };
+                let div = cards.len() as f64;
+                let mut out = vec![0.0f64; COMBOS];
+                for &c in &cards {
                     gs.board[revealed] = c;
                     let child_reach = masked_reach(reach, &[c], &self.cards);
                     let branch = self.after_deal(gs, hist, raises, revealed + 1, &child_reach);
@@ -431,6 +530,21 @@ impl<'a> Ctx<'a> {
 /// Bitmask of `cards`.
 fn card_mask(cards: &[u8]) -> u64 {
     cards.iter().fold(0u64, |m, &c| m | 1 << c)
+}
+
+/// SplitMix64 state initializer (identity — the first [`next_unit`] advances).
+fn splitmix(seed: u64) -> u64 {
+    seed
+}
+
+/// One SplitMix64 draw in `[0, 1)`, advancing `state` in place.
+fn next_unit(state: &mut u64) -> f64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    (z >> 11) as f64 / (1u64 << 53) as f64
 }
 
 /// `reach` with every combo that uses one of `cards` zeroed.
@@ -654,7 +768,9 @@ mod tests {
         let policy = biased_root_policy(&game);
         let flops = vec![[2u8, 17, 33], [5u8, 6, 40]];
         for br in [0usize, 1] {
-            let v = br_value_vector(&game, &policy, br, &flops);
+            // board_samples=0 → exact enumeration, so the walker equals the
+            // exact scalar oracle.
+            let v = br_value_vector(&game, &policy, br, &flops, 0, 1);
             // AKo-ish and a low suited hand: exercise both biased and uniform keys.
             for hero in [[0u8, 1], [12u8, 16]] {
                 let want = Oracle::value(&game, &policy, br, &flops, hero);
@@ -678,13 +794,27 @@ mod tests {
         let game = BlueprintHoldem::new(2, 2, 1, 0).with_raise_cap(1);
         let policy = CompactPolicy::from_entries(vec![]);
         let flops = sample_flops(1, 7);
-        let r = blueprint_exploitability(&game, &policy, &flops);
+        let r = blueprint_exploitability(&game, &policy, &flops, 0, 1);
         assert!(
             r.exploitability_mbb > 0.0,
             "uniform play must be exploitable, got {} mbb",
             r.exploitability_mbb
         );
-        let again = best_response_value(&game, &policy, 0, &flops);
+        let again = best_response_value(&game, &policy, 0, &flops, 0, 1);
         assert_eq!(again, r.br_value_bb[0], "evaluator must be deterministic");
+    }
+
+    /// Board sampling is deterministic for a fixed seed and reduces to the
+    /// same shape of answer: uniform play stays exploitable, and two runs
+    /// with the same seed agree exactly (the parallel flop fan-out included).
+    #[test]
+    fn sampled_board_runouts_are_deterministic() {
+        let game = BlueprintHoldem::new(2, 2, 1, 0).with_raise_cap(1);
+        let policy = CompactPolicy::from_entries(vec![]);
+        let flops = sample_flops(2, 7);
+        let a = best_response_value(&game, &policy, 0, &flops, 3, 42);
+        let b = best_response_value(&game, &policy, 0, &flops, 3, 42);
+        assert_eq!(a, b, "fixed seed must be reproducible");
+        assert!(a.is_finite());
     }
 }

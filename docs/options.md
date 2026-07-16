@@ -148,7 +148,7 @@ resets the magnitude.
 | `best_response::exploitability` | Enumerable games — the exact gate | Doesn't exist for sampled games |
 | `evaluation::exploitability::push_fold_exploitability` | Push/fold benchmarks | Decoupled estimator (removes max-over-noise bias); reads slightly negative within noise near Nash |
 | `evaluation::local_br` (sampled BR) | Non-enumerable blueprints (`--expl`) | Lower bound; needs large sample counts to be meaningful; commit argmax per *info set*, never per node (clairvoyance trap) |
-| `evaluation::vector_br` (`play expl`) | **The blueprint quality metric**: exact abstract-game BR (betting/turn/river/ranges exact, flops Monte-Carlo) | CPU-heavy (hours for ~100 flops on many cores); abstract-game number, not full-NLHE exploitability |
+| `evaluation::vector_br` (`play expl`) | **The blueprint quality metric**: abstract-game BR — betting/ranges exact, flops + turn/river Monte-Carlo (`--board-samples`, default 2). Exact turn/river enumeration (`--board-samples=0`) is refused above 6 bb: the deep tree × 48 × 44 runouts does not finish | Sampling makes the BR-max mildly upward-biased; use a fixed seed so old-vs-new A/Bs share the bias. Abstract-game number, not full-NLHE exploitability |
 | `play::luck` (luck-adjusted scoring, always on in `play slumbot`) | Match A/Bs | Unbiased AIVAT-style chance correction; adjusted bb/100 CIs shrink with pot-swing luck removed |
 | `evaluation::aivat` | Match evaluation | ~3× tighter stderr **[measured on Leduc: 0.0080 vs 0.0247]**, unbiased |
 | `evaluation::self_play` | A/B strategy comparison | Seat alternation cancels positional EV |
@@ -176,7 +176,8 @@ play slumbot [hands]                       live match vs slumbot.com (raw + luck
       --iters=N --turn-iters=N --river-cap=N --continuations=L --purify=X --seed=N
       --log-hands=PATH --token=T | --username=U --password=P
 play expl                                  abstract-game exploitability (vectorized BR)
-      --flops=N|all --seed=N [--data --stack-bb --cap --policy]
+      --flops=N|all --board-samples=N --seed=N [--data --stack-bb --cap --policy]
+      # default: 16 flops, 2 turn/river samples/reveal; progress on stderr
 play chart                                 preflop strategy grids + SB size mix
 scripts/train_wandb.py -- <train args>     W&B tracking wrapper
 POKER_AI_METRICS=1                         emit @wandb metric lines (no-op otherwise)

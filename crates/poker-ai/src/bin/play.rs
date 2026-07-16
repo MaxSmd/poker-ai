@@ -116,16 +116,27 @@ fn main() {
 ///
 ///   play expl [--flops=N|all --seed=S --data=DIR --stack-bb=N --cap=N --policy=PATH]
 fn run_expl(args: &[String]) {
-    validate(args, &["data", "stack-bb", "cap", "policy", "flops", "seed"], 0);
+    validate(args, &["data", "stack-bb", "cap", "policy", "flops", "seed", "board-samples"], 0);
     let dir = PathBuf::from(flag::<String>(args, "data").unwrap_or_else(|| "data".into()));
     let stack_bb: u32 = flag(args, "stack-bb").unwrap_or(200);
     let cap: u32 = flag(args, "cap").unwrap_or(3);
     let seed: u64 = flag(args, "seed").unwrap_or(1);
     let flops = match flag::<String>(args, "flops").as_deref() {
         Some("all") => all_flops(),
-        Some(n) => sample_flops(n.parse().unwrap_or(48), seed),
-        None => sample_flops(48, seed),
+        Some(n) => sample_flops(n.parse().unwrap_or(16), seed),
+        None => sample_flops(16, seed),
     };
+    // Turn/river runout samples per reveal. 0 = exact enumeration, which does
+    // NOT finish on a real deep-stacked blueprint — guard against it there.
+    let board_samples: usize = flag(args, "board-samples").unwrap_or(2);
+    if board_samples == 0 && stack_bb > 6 {
+        eprintln!(
+            "refusing --board-samples=0 (exact turn/river enumeration) at {stack_bb}bb: \
+             the deep betting tree × 48 × 44 runouts does not finish. Use a small \
+             positive value (2–4) for a real blueprint; 0 is only for tiny test games."
+        );
+        std::process::exit(2);
+    }
 
     println!("Loading abstraction from {} ({stack_bb}bb, cap-{cap})", dir.display());
     let game = load_game(&dir, stack_bb, cap);
@@ -135,13 +146,24 @@ fn run_expl(args: &[String]) {
         eprintln!("cannot load {}: {e}", policy_path.display());
         std::process::exit(1);
     });
-    println!("  {} info sets; evaluating over {} flops (seed {seed})", policy.len(), flops.len());
+    let runout = if board_samples == 0 {
+        "exact enumeration".to_string()
+    } else {
+        format!("{board_samples} turn/river samples per reveal")
+    };
+    println!(
+        "  {} info sets; {} flops × {} (seed {seed}) — per-flop progress on stderr",
+        policy.len(),
+        flops.len(),
+        runout
+    );
 
     let t0 = std::time::Instant::now();
     let mut br_bb = [0.0f64; 2];
     for (seat, out) in br_bb.iter_mut().enumerate() {
         let t = std::time::Instant::now();
-        *out = best_response_value(&game, &policy, seat, &flops);
+        eprintln!("  seat {seat} best response starting ...");
+        *out = best_response_value(&game, &policy, seat, &flops, board_samples, seed);
         println!(
             "  BR as seat {seat} ({}) = {:+.4} bb/hand   [{:.0}s]",
             if seat == 0 { "SB/button" } else { "BB" },
