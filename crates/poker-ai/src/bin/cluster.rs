@@ -205,17 +205,23 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cap: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(300);
     let seed: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
+    // Bucket targets: [flop] [turn] [river], same positional shape as
+    // `memory_estimate` so the two tools stay in lockstep — check the
+    // footprint there BEFORE spending the build time here.  Defaults bumped
+    // from the original 500/500/800 plan minimum: river dominates node count
+    // (~78%, Step 18/29 finding) so it gets the largest multiplier.
+    let flop_buckets: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(1500);
+    let turn_buckets: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1500);
+    let river_buckets: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(3000);
 
     let cap_str = if cap == 0 { "full".to_string() } else { cap.to_string() };
     println!(
         "Building card abstraction (exact sweep; cap {cap_str} boards/street, seed {seed}, \
-         mem budget {:.1} GB/street)",
+         mem budget {:.1} GB/street, buckets flop={flop_buckets} turn={turn_buckets} river={river_buckets})",
         mem_budget_bytes() as f64 / 1e9
     );
-    // Plan bucket targets: flop/turn 500–800, river 800–1200.  Capped to the
-    // number of filled situations at small scales.
-    build_street("flop", 3, 500, seed, cap);
-    build_street("turn", 4, 500, seed, cap);
-    build_street("river", 5, 800, seed, cap);
+    build_street("flop", 3, flop_buckets, seed, cap);
+    build_street("turn", 4, turn_buckets, seed, cap);
+    build_street("river", 5, river_buckets, seed, cap);
     println!("Done. Load the *_buckets.bin maps into BlueprintHoldem::with_street_bucket.");
 }

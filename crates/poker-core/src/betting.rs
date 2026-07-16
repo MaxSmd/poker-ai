@@ -19,9 +19,16 @@
 pub const FLOP_BET_FRACS: &[(u32, u32)] = &[(33, 100), (67, 100), (1, 1)];
 pub const TURN_BET_FRACS: &[(u32, u32)] = &[(1, 2), (3, 4), (1, 1)];
 pub const RIVER_BET_FRACS: &[(u32, u32)] = &[(1, 2), (3, 4), (1, 1), (3, 2)];
-/// Preflop uses the same pot-fraction logic; fractions chosen to yield
-/// roughly 2.5 BB, 3.5 BB, and 6 BB opens from a standard blind structure.
-pub const PREFLOP_BET_FRACS: &[(u32, u32)] = &[(1, 2), (1, 1), (2, 1)];
+/// Preflop uses the same pot-fraction logic. The smallest size is `(2,5)` so
+/// it resolves to EXACTLY a min-raise (2 BB) rather than 2.5 BB: the BB
+/// defense chart showed the blueprint's smallest-open node folding real
+/// hands 90%+ (K3o, Q5o) despite that node carrying a wide, representative
+/// range — the abstract equilibrium itself over-folds, not a translation
+/// artifact (2.5bb opens WERE wide: 43% combo-weighted usage). A true
+/// min-open removes the residual translation stretch (every real min-open
+/// no longer rounds up past its natural abstract size) while the retrain
+/// this accompanies (finer postflop buckets) targets the equilibrium itself.
+pub const PREFLOP_BET_FRACS: &[(u32, u32)] = &[(2, 5), (1, 1), (2, 1)];
 
 /// Compute abstract raise amounts (as total bet levels, not increments) for
 /// the current state.

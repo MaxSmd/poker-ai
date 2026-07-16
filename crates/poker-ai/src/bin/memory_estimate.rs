@@ -422,9 +422,15 @@ fn main() {
 mod tests {
     use super::*;
 
-    /// THE gate: the walker must reproduce, exactly, the info-set count the
-    /// real `BlueprintHoldem::with_indexing` reported on the server run
-    /// (heads-up, 20 bb, cap-2, buckets 169/500/500/800 → 4,631,870).
+    /// A regression pin on the walker's own exact enumeration (heads-up,
+    /// 20 bb, cap-2, buckets 169/500/500/800), NOT a live server cross-check:
+    /// the numbers below were re-measured after `PREFLOP_BET_FRACS` changed
+    /// (Step 39, min-open 2.5bb→2bb) and no longer match the Step 28/29
+    /// server run (which trained the OLD abstraction: 4,631,870 / 5,011,836).
+    /// A fresh server run under the new abstraction should re-validate this
+    /// pin against `with_indexing()`'s real count before it is trusted as a
+    /// cross-check again; until then it only guards the walker against
+    /// silently changing behavior.
     #[test]
     fn walker_reproduces_the_measured_hu_blueprint() {
         // The legacy tree is the one the server measured; the walker must still
@@ -432,17 +438,16 @@ mod tests {
         let old = enumerate_tree(2, 20, 2, usize::MAX, CapRule::Legacy);
         assert!(!old.truncated);
         let (old_info_sets, _) = table_size(&old.counts, [169, 500, 500, 800]);
-        assert_eq!(old_info_sets, 4_631_870);
+        assert_eq!(old_info_sets, 5_448_070);
 
         let m = enumerate_tree(2, 20, 2, usize::MAX, CapRule::AllInAtCap);
         assert!(!m.truncated);
         let (info_sets, slots) = table_size(&m.counts, [169, 500, 500, 800]);
-        assert_eq!(info_sets, 5_011_836);
+        assert_eq!(info_sets, 5_893_436);
         assert!(info_sets > old_info_sets, "keeping all-in at the cap adds nodes");
-        // ~2.5 slots/info set exactly counted; 16 B/slot (f64 strategy sums)
-        // + 5 B index ≈ 0.21 GB.
+        // 2.5 slots/info-set; 16 B/slot (f64 strategy sums) + 5 B index ≈ 0.265 GB.
         let bytes = f32_bytes(info_sets, slots) as f64;
-        assert!((0.19e9..0.23e9).contains(&bytes), "got {}", fmt_bytes(bytes as u64));
+        assert!((0.24e9..0.29e9).contains(&bytes), "got {}", fmt_bytes(bytes as u64));
     }
 
     /// 6-max plumbing smoke test: micro stacks collapse the tree to a
