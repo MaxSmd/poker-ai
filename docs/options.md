@@ -130,7 +130,11 @@ resets the magnitude.
 
 | Option | Use when | Benefits | Drawbacks |
 |---|---|---|---|
-| River re-solve (**default**) | Every river decision | Full-range vectorized CFR⁺ from the *real* public state — real pot/stacks, so bet-translation error vanishes on the deepest street; ~1–2 s/decision | River only (turn/flop resolving needs the blueprint leaf-value table) |
+| River re-solve (**default**) | Every river decision | Full-range vectorized CFR⁺ from the *real* public state — real pot/stacks, so bet-translation error vanishes on the deepest street; ~1–2 s/decision | — |
+| `--resolve-turn` (full-river mode default) | Turn decisions | Deals the river as an explicit chance node and solves the **real river betting** below — exact to showdown, no leaf model (true-game gate: 0.0014 bb vs 1.44 bb for the leaf cut) | ~48× a river resolve's tree per iteration; tune `--turn-iters` |
+| `--turn-checkdown` | Speed A/Bs | Turn resolves fall back to the K-continuation check-down cut | Reintroduces the leaf model the full-river mode removes |
+| `--resolve-flop` | Flop decisions (experimental) | K-continuation cut at the undealt turn | Slowest; leaf model on the turn boundary |
+| Continual re-solving (**default**) | Multiple resolves per hand | Carries opponent CFVs, gadget-constrains the next resolve (DeepStack-style safety: re-entry can't be exploited) | `--no-continual` for independent per-decision resolves |
 | `--no-resolve` (blueprint throughout) | Debugging; latency-sensitive runs | Instant decisions, pure blueprint quality | Off-tree river bets only handled by translation, not by solving |
 | Pseudo-harmonic bet mapping (always on) | Opponent uses off-tree sizes | Randomized, boundary-indifferent mapping — much harder to exploit than nearest-size | Bets are never mapped to passive actions (desync-safe), so a min-bet reads as the smallest abstract size |
 | `--purify=X` (default 0.1) | Live play | Drops low-probability noise actions (trembling-hand cleanup) | Slightly narrows the mixed strategy; `0` to sample raw |
@@ -144,6 +148,8 @@ resets the magnitude.
 | `best_response::exploitability` | Enumerable games — the exact gate | Doesn't exist for sampled games |
 | `evaluation::exploitability::push_fold_exploitability` | Push/fold benchmarks | Decoupled estimator (removes max-over-noise bias); reads slightly negative within noise near Nash |
 | `evaluation::local_br` (sampled BR) | Non-enumerable blueprints (`--expl`) | Lower bound; needs large sample counts to be meaningful; commit argmax per *info set*, never per node (clairvoyance trap) |
+| `evaluation::vector_br` (`play expl`) | **The blueprint quality metric**: exact abstract-game BR (betting/turn/river/ranges exact, flops Monte-Carlo) | CPU-heavy (hours for ~100 flops on many cores); abstract-game number, not full-NLHE exploitability |
+| `play::luck` (luck-adjusted scoring, always on in `play slumbot`) | Match A/Bs | Unbiased AIVAT-style chance correction; adjusted bb/100 CIs shrink with pot-swing luck removed |
 | `evaluation::aivat` | Match evaluation | ~3× tighter stderr **[measured on Leduc: 0.0080 vs 0.0247]**, unbiased |
 | `evaluation::self_play` | A/B strategy comparison | Seat alternation cancels positional EV |
 
@@ -165,9 +171,13 @@ cluster [cap] [seed]                       card abstraction build
       POKER_AI_RIVER_OCHS=1                OCHS river feature
 memory_estimate [flop turn river]          exact footprint matrix (2p + 6-max)
       POKER_AI_ESTIMATE_STATES=N           betting-tree memo cap
-play slumbot [hands]                       live match vs slumbot.com (bb/100 ± CI)
-      --no-resolve --iters=N --river-cap=N --purify=X --seed=N
-      --token=T | --username=U --password=P
+play slumbot [hands]                       live match vs slumbot.com (raw + luck-adjusted bb/100 ± CI)
+      --no-resolve --resolve-turn --resolve-flop --turn-checkdown --no-continual
+      --iters=N --turn-iters=N --river-cap=N --continuations=L --purify=X --seed=N
+      --log-hands=PATH --token=T | --username=U --password=P
+play expl                                  abstract-game exploitability (vectorized BR)
+      --flops=N|all --seed=N [--data --stack-bb --cap --policy]
+play chart                                 preflop strategy grids + SB size mix
 scripts/train_wandb.py -- <train args>     W&B tracking wrapper
 POKER_AI_METRICS=1                         emit @wandb metric lines (no-op otherwise)
 ```

@@ -598,12 +598,14 @@ pub fn board_histograms(board: &[u8], bins: usize) -> Vec<f32> {
 }
 
 /// Exact equity of `h0` against the *specific* opponent hand `h1` on a partial
-/// `board` (length 3, 4, or 5), enumerating every runout.
+/// `board` (length 0 to 5), enumerating every runout.
 ///
 /// Returns `P(h0 wins) + 0.5·P(tie)`, in `[0, 1]`; `h1`'s equity is the
 /// complement.  This is the all-in showdown value used by the resolver's
 /// depth-limited leaf evaluator, where both hands are known and the remaining
-/// board is rolled out.
+/// board is rolled out.  An empty board enumerates all C(48,5) ≈ 1.7M runouts
+/// (a few tens of ms with the LUT) — used by the luck-adjusted match scorer,
+/// which needs the exact tower property `E[eq after a reveal] = eq before`.
 pub fn hand_vs_hand_equity(h0: [u8; 2], h1: [u8; 2], board: &[u8]) -> f64 {
     assert!(board.len() <= 5, "board must have at most 5 cards");
     let mut used = 0u64;
@@ -628,24 +630,32 @@ pub fn hand_vs_hand_equity(h0: [u8; 2], h1: [u8; 2], board: &[u8]) -> f64 {
         }
     };
 
-    match need {
-        0 => showdown(&full, &mut win, &mut tie, &mut total),
-        1 => {
-            for &c in &remaining {
-                full[4] = c;
-                showdown(&full, &mut win, &mut tie, &mut total);
-            }
+    // Enumerate every `need`-card completion (combinations of `remaining`) by
+    // recursion on the slot index; `need` ≤ 2 covers the resolver's hot path
+    // exactly as the old hand-rolled loops did, deeper boards are the offline
+    // luck-scorer path.
+    fn complete(
+        remaining: &[u8],
+        from: usize,
+        slot: usize,
+        full: &mut [u8; 5],
+        f: &mut impl FnMut(&[u8; 5]),
+    ) {
+        if slot == 5 {
+            f(full);
+            return;
         }
-        2 => {
-            for i in 0..remaining.len() {
-                for j in (i + 1)..remaining.len() {
-                    full[3] = remaining[i];
-                    full[4] = remaining[j];
-                    showdown(&full, &mut win, &mut tie, &mut total);
-                }
-            }
+        for i in from..remaining.len() {
+            full[slot] = remaining[i];
+            complete(remaining, i + 1, slot + 1, full, f);
         }
-        _ => unreachable!("board has 3–5 cards"),
+    }
+    if need == 0 {
+        showdown(&full, &mut win, &mut tie, &mut total);
+    } else {
+        complete(&remaining, 0, 5 - need, &mut full, &mut |b: &[u8; 5]| {
+            showdown(b, &mut win, &mut tie, &mut total)
+        });
     }
     (win as f64 + 0.5 * tie as f64) / total as f64
 }

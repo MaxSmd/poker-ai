@@ -41,7 +41,9 @@ use std::path::{Path, PathBuf};
 use poker_ai::abstraction::bucket_map::BucketMap;
 use poker_ai::games::blueprint::BlueprintHoldem;
 use poker_ai::games::Game;
+use poker_ai::evaluation::vector_br::{all_flops, best_response_value, sample_flops};
 use poker_ai::play::cards::parse_cards;
+use poker_ai::play::luck::luck_adjustment;
 use poker_ai::play::protocol::{parse_action, BIG_BLIND};
 use poker_ai::play::slumbot::SlumbotClient;
 use poker_ai::play::{Bot, BotConfig, CompactPolicy};
@@ -94,14 +96,73 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("slumbot") => run_slumbot(&args),
         Some("chart") => run_chart(&args),
+        Some("expl") => run_expl(&args),
         _ => {
             eprintln!(
-                "usage: play slumbot [hands] [flags]  |  play chart [flags]\n\
+                "usage: play slumbot [hands] [flags]  |  play chart [flags]  |  play expl [flags]\n\
                  see the header of src/bin/play.rs"
             );
             std::process::exit(2);
         }
     }
+}
+
+/// Abstract-game exploitability of the blueprint via the vectorized best
+/// response (`evaluation::vector_br`): exact betting/turn/river/ranges,
+/// Monte-Carlo over `--flops` sampled flops (or every flop with
+/// `--flops=all`).  Runtime scales linearly in flops and parallelizes over
+/// them; the river-heavy cap-3 tree costs on the order of CPU-hours per
+/// hundred flops — a milestone metric, not a per-checkpoint one.
+///
+///   play expl [--flops=N|all --seed=S --data=DIR --stack-bb=N --cap=N --policy=PATH]
+fn run_expl(args: &[String]) {
+    validate(args, &["data", "stack-bb", "cap", "policy", "flops", "seed"], 0);
+    let dir = PathBuf::from(flag::<String>(args, "data").unwrap_or_else(|| "data".into()));
+    let stack_bb: u32 = flag(args, "stack-bb").unwrap_or(200);
+    let cap: u32 = flag(args, "cap").unwrap_or(3);
+    let seed: u64 = flag(args, "seed").unwrap_or(1);
+    let flops = match flag::<String>(args, "flops").as_deref() {
+        Some("all") => all_flops(),
+        Some(n) => sample_flops(n.parse().unwrap_or(48), seed),
+        None => sample_flops(48, seed),
+    };
+
+    println!("Loading abstraction from {} ({stack_bb}bb, cap-{cap})", dir.display());
+    let game = load_game(&dir, stack_bb, cap);
+    let policy_path = policy_path(args, &dir);
+    println!("Loading blueprint strategy {} ...", policy_path.display());
+    let policy = CompactPolicy::load(&policy_path).unwrap_or_else(|e| {
+        eprintln!("cannot load {}: {e}", policy_path.display());
+        std::process::exit(1);
+    });
+    println!("  {} info sets; evaluating over {} flops (seed {seed})", policy.len(), flops.len());
+
+    let t0 = std::time::Instant::now();
+    let mut br_bb = [0.0f64; 2];
+    for (seat, out) in br_bb.iter_mut().enumerate() {
+        let t = std::time::Instant::now();
+        *out = best_response_value(&game, &policy, seat, &flops);
+        println!(
+            "  BR as seat {seat} ({}) = {:+.4} bb/hand   [{:.0}s]",
+            if seat == 0 { "SB/button" } else { "BB" },
+            *out,
+            t.elapsed().as_secs_f64()
+        );
+    }
+    let expl_mbb = (br_bb[0] + br_bb[1]) / 2.0 * 1000.0;
+    println!(
+        "\nAbstract-game exploitability: {expl_mbb:.1} mbb/hand  \
+         (BR sum {:.4} bb; {} flops; {:.0}s total)",
+        br_bb[0] + br_bb[1],
+        flops.len(),
+        t0.elapsed().as_secs_f64()
+    );
+    println!(
+        "@wandb {{\"expl_mbb\":{expl_mbb:.2},\"br_sb_bb\":{:.4},\"br_bb_bb\":{:.4},\"flops\":{}}}",
+        br_bb[0],
+        br_bb[1],
+        flops.len()
+    );
 }
 
 /// Rank letters for the preflop chart, display index 0=A … 12=2.
@@ -350,8 +411,8 @@ fn run_slumbot(args: &[String]) {
         args,
         &[
             "data", "policy", "stack-bb", "cap", "no-resolve", "resolve-turn", "resolve-flop",
-            "iters", "turn-iters", "river-cap", "continuations", "purify", "seed", "log-hands",
-            "token", "username", "password",
+            "turn-checkdown", "no-continual", "iters", "turn-iters", "river-cap",
+            "continuations", "purify", "seed", "log-hands", "token", "username", "password",
         ],
         1,
     );
@@ -377,6 +438,12 @@ fn run_slumbot(args: &[String]) {
         turn_iters: flag(args, "turn-iters").unwrap_or(500),
         river_cap: flag(args, "river-cap").unwrap_or(3),
         continuations,
+        // Turn resolves solve the real river betting by default; the
+        // K-continuation check-down cut stays available for A/Bs and speed.
+        turn_full_river: !args.iter().any(|a| a == "--turn-checkdown"),
+        // Continual re-solving (CFV-gadget carry) on by default; --no-continual
+        // gives independent per-decision resolves for A/Bs.
+        continual: !args.iter().any(|a| a == "--no-continual"),
         purify: flag(args, "purify").unwrap_or(0.1),
         seed: flag(args, "seed").unwrap_or(1),
     };
@@ -439,15 +506,21 @@ fn run_slumbot(args: &[String]) {
     let mut errors: u64 = 0;
     let mut net_bb: f64 = 0.0;
     let mut sumsq_bb: f64 = 0.0;
+    let mut adj_net_bb: f64 = 0.0;
+    let mut adj_sumsq_bb: f64 = 0.0;
     println!("Playing {hands} hands against Slumbot ...");
     while played < hands {
         match play_one_hand(&client, &mut bot, &mut token) {
-            Ok(rec) => {
+            Ok(mut rec) => {
+                rec.luck = hand_luck(&rec);
                 let winnings = rec.winnings;
                 played += 1;
                 let bb = winnings as f64 / BIG_BLIND as f64;
                 net_bb += bb;
                 sumsq_bb += bb * bb;
+                let adj = (winnings as f64 - rec.luck) / BIG_BLIND as f64;
+                adj_net_bb += adj;
+                adj_sumsq_bb += adj * adj;
                 if let Some(f) = csv.as_mut() {
                     let _ = writeln!(f, "{played},{winnings}");
                 }
@@ -458,16 +531,22 @@ fn run_slumbot(args: &[String]) {
                     let _ = std::fs::write(&token_path, t);
                 }
                 if played.is_multiple_of(100) || played == hands {
-                    let mean = net_bb / played as f64;
-                    let var = (sumsq_bb / played as f64 - mean * mean).max(0.0);
-                    let ci = 1.96 * (var / played as f64).sqrt() * 100.0;
+                    let n = played as f64;
+                    let mean = net_bb / n;
+                    let var = (sumsq_bb / n - mean * mean).max(0.0);
+                    let ci = 1.96 * (var / n).sqrt() * 100.0;
+                    let adj_mean = adj_net_bb / n;
+                    let adj_var = (adj_sumsq_bb / n - adj_mean * adj_mean).max(0.0);
+                    let adj_ci = 1.96 * (adj_var / n).sqrt() * 100.0;
                     println!(
-                        "  {played:>6} hands   net {net_bb:>9.1} bb   {:>8.1} ± {ci:.1} bb/100",
-                        mean * 100.0
+                        "  {played:>6} hands   net {net_bb:>9.1} bb   {:>8.1} ± {ci:.1} bb/100   luck-adj {:>8.1} ± {adj_ci:.1} bb/100",
+                        mean * 100.0,
+                        adj_mean * 100.0
                     );
                     println!(
-                        "@wandb {{\"hand\":{played},\"net_bb\":{net_bb:.2},\"bb100\":{:.2},\"bb100_ci\":{ci:.2}}}",
-                        mean * 100.0
+                        "@wandb {{\"hand\":{played},\"net_bb\":{net_bb:.2},\"bb100\":{:.2},\"bb100_ci\":{ci:.2},\"adj_bb100\":{:.2},\"adj_bb100_ci\":{adj_ci:.2}}}",
+                        mean * 100.0,
+                        adj_mean * 100.0
                     );
                 }
             }
@@ -489,11 +568,34 @@ fn run_slumbot(args: &[String]) {
     let mean = if played > 0 { net_bb / played as f64 } else { 0.0 };
     let var = if played > 0 { (sumsq_bb / played as f64 - mean * mean).max(0.0) } else { 0.0 };
     let ci = if played > 0 { 1.96 * (var / played as f64).sqrt() * 100.0 } else { 0.0 };
+    let adj_mean = if played > 0 { adj_net_bb / played as f64 } else { 0.0 };
+    let adj_var =
+        if played > 0 { (adj_sumsq_bb / played as f64 - adj_mean * adj_mean).max(0.0) } else { 0.0 };
+    let adj_ci = if played > 0 { 1.96 * (adj_var / played as f64).sqrt() * 100.0 } else { 0.0 };
     println!(
-        "\nDone: {played} hands, net {net_bb:.1} bb, {:.1} ± {ci:.1} bb/100 (95% CI), {errors} errors",
-        mean * 100.0
+        "\nDone: {played} hands, net {net_bb:.1} bb, {:.1} ± {ci:.1} bb/100 (95% CI), luck-adjusted {:.1} ± {adj_ci:.1} bb/100, {errors} errors",
+        mean * 100.0,
+        adj_mean * 100.0
     );
     println!("Per-hand log: {}", csv_path.display());
+}
+
+/// The AIVAT-style luck correction for a finished hand, in chips (see
+/// `play::luck`).  Zero (always unbiased) whenever the opponent's cards are
+/// missing or anything fails to parse — a skipped correction never biases the
+/// adjusted estimate, it only forgoes variance reduction on that hand.
+fn hand_luck(rec: &HandRecord) -> f64 {
+    let (Ok(ours), Ok(theirs), Ok(board)) = (
+        parse_cards(&rec.hole_cards),
+        parse_cards(&rec.bot_hole_cards),
+        parse_cards(&rec.board),
+    ) else {
+        return 0.0;
+    };
+    if ours.len() != 2 || theirs.len() != 2 {
+        return 0.0;
+    }
+    luck_adjustment([ours[0], ours[1]], [theirs[0], theirs[1]], &board, &rec.action).unwrap_or(0.0)
 }
 
 /// The outcome of one played hand — winnings plus the fields a post-mortem
@@ -505,6 +607,9 @@ struct HandRecord {
     bot_hole_cards: Vec<String>,
     board: Vec<String>,
     action: String,
+    /// AIVAT-style chance correction in chips (`play::luck`); 0 when not
+    /// computable.  Adjusted winnings = `winnings - luck`.
+    luck: f64,
 }
 
 impl HandRecord {
@@ -519,6 +624,7 @@ impl HandRecord {
             "i": index,
             "pos": self.client_pos,
             "winnings": self.winnings,
+            "luck": self.luck,
             "reached_street": reached,
             "hole": self.hole_cards,
             "bot_hole": self.bot_hole_cards,
@@ -557,6 +663,7 @@ fn play_one_hand(
                 bot_hole_cards: r.bot_hole_cards.clone().unwrap_or_default(),
                 board: r.board.clone().unwrap_or_default(),
                 action: r.action.clone().unwrap_or_default(),
+                luck: 0.0,
             });
         }
         let action = r.action.clone().ok_or("response missing action")?;

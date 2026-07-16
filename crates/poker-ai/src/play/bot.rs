@@ -12,13 +12,19 @@
 //!   exactly where the money is deepest), our range and the opponent's range are
 //!   carried Bayes updates of the blueprint (`P(observed abstract action | hand)`
 //!   at every prior decision), and the resolved root distribution is played
-//!   directly in real chips.  A **river** resolve is exact to showdown
-//!   ([`solve_vectorized_capped`]); a **turn / flop** resolve cuts at the undealt
-//!   street and scores each depth-cut leaf as the check-down showdown averaged
-//!   over the runout, with the opponent choosing among K continuations at the
-//!   leaf ([`solve_vectorized_multi`], finding #1) so the resolve is robust to
-//!   post-leaf betting the check-down ignores.  Turn/flop resolves are far
-//!   costlier (each leaf averages 44 / 990 runouts) and are opt-in.
+//!   directly in real chips.  A **river** resolve is exact to showdown; a
+//!   **turn** resolve deals the river as an explicit chance node and solves the
+//!   real river betting below it (exact to showdown, no leaf model — the
+//!   default; `turn_full_river = false` falls back to the K-continuation
+//!   check-down cut); a **flop** resolve cuts at the undealt turn with the
+//!   opponent choosing among K continuations at the leaf (finding #1) so the
+//!   resolve is robust to post-leaf betting the check-down ignores.  Turn/flop
+//!   resolves are far costlier than river ones and are opt-in.
+//! * **Continual re-solving** (DeepStack-style, on by default) — every resolve
+//!   extracts the opponent's per-hand counterfactual values under the emitted
+//!   strategy; the next resolve in the same hand is constrained by the CFV
+//!   gadget (per-hand Follow/Terminate), so the opponent cannot profit from our
+//!   strategy being recomputed between decisions.
 //!
 //! Both ranges are maintained per hand; the opponent's is additionally
 //! filtered by card removal (board + our own hole cards).
@@ -33,7 +39,7 @@ use crate::play::protocol::{parse_action, Event, EventKind, Parsed, BIG_BLIND, S
 use crate::play::tracker::{AbstractHand, MapOutcome, RealMove};
 use crate::resolving::belief_state::{combo_cards, combo_index, BeliefState, NUM_COMBOS};
 use crate::resolving::vector_cfr::{
-    capped_root_actions, solve_vectorized_capped, solve_vectorized_multi, subgame_info_key,
+    capped_root_actions, subgame_info_key, VectorCfr,
 };
 
 /// Tunables for the playing agent.
@@ -60,6 +66,18 @@ pub struct BotConfig {
     /// resolve is robust to the post-leaf betting a plain check-down ignores.
     /// `scales[0]` should be `0.0`; `[0.0]` is a single check-down (no chooser).
     pub continuations: Vec<f64>,
+    /// Turn resolves deal the river as an explicit chance node and solve the
+    /// **real river betting** — exact to showdown, no leaf model at all
+    /// (default).  Off = cut at the reveal with the K-continuation check-down
+    /// leaf (`continuations`), ~48× cheaper per iteration; flop resolves
+    /// always use the continuation cut either way.
+    pub turn_full_river: bool,
+    /// Continual re-solving (DeepStack-style): carry the opponent's
+    /// counterfactual values from each resolve and constrain the next one
+    /// with the CFV gadget, so the opponent cannot profit from our strategy
+    /// being recomputed between decisions.  The hand's first resolve is the
+    /// unconstrained bootstrap.
+    pub continual: bool,
     /// Purification: drop actions below this probability, renormalize, then
     /// sample (`0.0` = sample the raw mixed strategy).
     pub purify: f64,
@@ -77,6 +95,8 @@ impl Default for BotConfig {
             turn_iters: 500,
             river_cap: 3,
             continuations: vec![0.0, 0.75, 1.5, 3.0],
+            turn_full_river: true,
+            continual: true,
             purify: 0.1,
             seed: 1,
         }
@@ -101,6 +121,13 @@ pub struct HandState {
     /// `Some(Some(i))` = applied index `i`; `Some(None)` = deliberately skipped
     /// (no abstract node existed).  `None` = nothing pending.
     pending_self: Option<Option<u8>>,
+    /// Continual re-solving: the opponent's per-hand counterfactual values
+    /// extracted from our previous resolve this hand (bb, `features`
+    /// combo order).  The next resolve is gadget-constrained by these, so the
+    /// opponent cannot profit from our strategy being recomputed between
+    /// decisions; refreshed after every resolve.  `None` until the hand's
+    /// first (bootstrap) resolve.
+    carried_cfvs: Option<Box<[f64; NUM_COMBOS]>>,
 }
 
 /// The playing agent. One instance plays many hands (per-hand state lives in
@@ -148,6 +175,7 @@ impl Bot {
             processed: 0,
             board_seen: 0,
             pending_self: None,
+            carried_cfvs: None,
         }
     }
 
@@ -377,19 +405,41 @@ impl Bot {
             beliefs[hs.my_seat].update(&ones); // renormalize
         }
 
-        // River: exact showdown terminals.  Turn/flop: the board is undealt past
-        // this street, so the solver cuts at the runout with K continuations.
-        let resolved = if board.len() == 5 {
-            solve_vectorized_capped(&root, &beliefs, self.cfg.river_iters, self.cfg.river_cap)
-        } else {
-            solve_vectorized_multi(
-                &root,
-                &beliefs,
+        // River: exact showdown terminals.  Turn (full-river mode): the river
+        // is dealt as a chance node and the real river betting solved below —
+        // exact to showdown, no leaf model.  Otherwise turn/flop cut at the
+        // undealt street with the K-continuation check-down leaf.
+        let (mut solver, iters) = if board.len() == 5 {
+            (VectorCfr::new_capped(&root, &beliefs, self.cfg.river_cap), self.cfg.river_iters)
+        } else if board.len() == 4 && self.cfg.turn_full_river {
+            (
+                VectorCfr::new_full(&root, &beliefs, self.cfg.river_cap, vec![0.0], true),
                 self.cfg.turn_iters,
-                self.cfg.river_cap,
-                self.cfg.continuations.clone(),
+            )
+        } else {
+            (
+                VectorCfr::new_capped_multi(
+                    &root,
+                    &beliefs,
+                    self.cfg.river_cap,
+                    self.cfg.continuations.clone(),
+                ),
+                self.cfg.turn_iters,
             )
         };
+        // Continual re-solving: constrain by the opponent CFVs carried from
+        // our previous resolve this hand (the first resolve bootstraps), then
+        // refresh the carry from the new solution.
+        if self.cfg.continual {
+            if let Some(cfvs) = &hs.carried_cfvs {
+                solver = solver.with_opponent_gadget(*cfvs.clone());
+            }
+        }
+        solver.run(iters);
+        if self.cfg.continual {
+            hs.carried_cfvs = Some(Box::new(solver.opponent_cfvs()));
+        }
+        let resolved = solver.into_resolved();
 
         let mut hole = hs.my_hole;
         hole.sort_unstable();
@@ -718,6 +768,39 @@ mod tests {
         assert!(parse_action(&format!("{action}{incr}")).is_ok());
     }
 
+    /// Continual re-solving end-to-end: the hand's first resolve bootstraps
+    /// and stores the opponent's CFVs; a second decision in the same hand
+    /// runs the gadget-constrained resolve off that carry and still produces
+    /// a legal move.
+    #[test]
+    fn second_river_decision_carries_cfvs_through_the_gadget() {
+        let mut b = bot(true);
+        assert!(b.cfg.continual, "production default");
+        let hole = [parse_card("Ac").unwrap(), parse_card("Kd").unwrap()];
+        let mut hs = b.start_hand(0, hole); // we are BB, first to act postflop
+        let action = "b200c/kk/kk/";
+        let board = cards(&["Qs", "4s", "3h", "Th", "8c"]);
+        let incr = b.act(&mut hs, action, &board).expect("first river decision");
+        let carried = hs.carried_cfvs.clone().expect("bootstrap resolve must store CFVs");
+        assert!(carried.iter().all(|v| v.is_finite()), "CFVs must be finite");
+
+        // The opponent raises us back into a second decision on the same street.
+        let action2 = if incr == "k" {
+            format!("{action}kb1000")
+        } else {
+            let to: u32 = incr.strip_prefix('b').expect("check or bet").parse().unwrap();
+            format!("{action}{incr}b{}", (to * 3).min(19_000))
+        };
+        let incr2 = b.act(&mut hs, &action2, &board).expect("gadget-constrained decision");
+        assert!(
+            incr2 == "f" || incr2 == "c" || incr2.starts_with('b'),
+            "facing a bet allows fold/call/raise, got {incr2:?}"
+        );
+        assert!(parse_action(&format!("{action2}{incr2}")).is_ok());
+        // The carry was refreshed by the second resolve.
+        assert!(hs.carried_cfvs.is_some());
+    }
+
     /// A preflop raise war no longer desyncs: `AllIn` survives the cap, so the
     /// opponent's 5-bet maps onto it and the tracker keeps up.
     #[test]
@@ -779,10 +862,32 @@ mod tests {
                 turn_iters: 40,
                 river_cap: 1,
                 continuations,
+                // These tests pin the K-continuation leaf path; the full-river
+                // path has its own test below.
+                turn_full_river: false,
+                continual: true,
                 purify: 0.0,
                 seed: 42,
             },
         )
+    }
+
+    #[test]
+    fn turn_full_river_resolve_returns_a_root_action() {
+        // The default turn mode: river dealt as chance, real river betting
+        // solved below.  Same scenario as the K-continuation test.
+        let mut b = resolve_bot(true, false, vec![0.0]);
+        b.cfg.turn_full_river = true;
+        let hole = [parse_card("Ac").unwrap(), parse_card("Kd").unwrap()];
+        let mut hs = b.start_hand(0, hole);
+        let action = "b200c/kk/";
+        let board = cards(&["Qs", "4s", "3h", "Th"]);
+        let incr = b.act(&mut hs, action, &board).expect("turn decision");
+        assert!(
+            incr == "k" || incr.starts_with('b'),
+            "unopened turn allows check or bet, got {incr:?}"
+        );
+        assert!(parse_action(&format!("{action}{incr}")).is_ok());
     }
 
     #[test]

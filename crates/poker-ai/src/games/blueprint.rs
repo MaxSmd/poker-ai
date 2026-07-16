@@ -411,10 +411,17 @@ impl BlueprintHoldem {
     fn key_for_cards(&self, player: usize, mut hole: [u8; 2], board: &[u8], history: &[u8]) -> u64 {
         hole.sort_unstable();
         let bucket = self.situation_bucket(&hole, board);
+        self.key_from_bucket(player, board.len(), bucket, history)
+    }
 
+    /// Fold an already-computed card `bucket` into the info key — the hashing
+    /// kernel of [`key_for_cards`](Self::key_for_cards), public so bulk walkers
+    /// (`evaluation::vector_br`) can hoist the per-hand bucket computation out
+    /// of the per-node loop and still land on identical blueprint keys.
+    pub fn key_from_bucket(&self, player: usize, visible: usize, bucket: u64, history: &[u8]) -> u64 {
         let mut h = Fnv1a::new();
         h.write(player as u8);
-        h.write(board.len() as u8);
+        h.write(visible as u8);
         h.write_all(&bucket.to_le_bytes());
         h.write(0xFF); // separator so bucket bytes / history can't blur
         h.write_all(history);
@@ -463,6 +470,60 @@ impl BlueprintHoldem {
     /// The big blind in the game's chip units (play-time chip↔bb conversion).
     pub fn big_blind_chips(&self) -> u32 {
         self.big_blind
+    }
+
+    // ------------------------------------------------------------------
+    // Raw-walk API (`crate::evaluation::vector_br`): drive the abstract
+    // betting tree over a bare `GameState` (mutate-and-undo), outside the
+    // `Game`/`CursorGame` plumbing, while staying on exactly the same
+    // action menus, raise bookkeeping, and info keys as training.
+    // ------------------------------------------------------------------
+
+    /// The capped legal actions at a bare engine state (see `capped_legal`).
+    pub fn capped_actions(&self, gs: &GameState, street_raises: u8) -> ActionList {
+        self.capped_legal(gs, street_raises)
+    }
+
+    /// The info key `player` has holding `hole` at `(board, history)` — the
+    /// card-based form of [`key_from_bucket`](Self::key_from_bucket), for
+    /// callers that have concrete cards rather than a hoisted bucket.
+    pub fn key_for(&self, player: usize, hole: [u8; 2], board: &[u8], history: &[u8]) -> u64 {
+        self.key_for_cards(player, hole, board, history)
+    }
+
+    /// Street-raise counter after an action moved `gs` from
+    /// `(old_street, old_bet)` to its current state (see `next_raises`).
+    pub fn raises_after(&self, prev: u8, old_street: u8, old_bet: u32, gs: &GameState) -> u8 {
+        Self::next_raises(prev, old_street, old_bet, gs)
+    }
+
+    /// The card bucket for every one of the 1326 hole combos on `board`
+    /// (indexed by [`crate::abstraction::features::combo_index`]) — the bulk
+    /// form of the per-hand bucket inside the info key, hoisted so tree
+    /// walkers compute it once per board prefix instead of once per node.
+    /// Combos that overlap the board get an arbitrary bucket (their reach is
+    /// zero everywhere they could be queried).
+    pub fn bucket_vector(&self, board: &[u8]) -> Vec<u64> {
+        let mut out = vec![0u64; 1326];
+        let mut blocked = 0u64;
+        for &c in board {
+            blocked |= 1 << c;
+        }
+        for hi in 1..52u8 {
+            for lo in 0..hi {
+                let idx = crate::abstraction::features::combo_index(hi, lo);
+                if blocked & (1 << hi) != 0 || blocked & (1 << lo) != 0 {
+                    continue;
+                }
+                out[idx] = self.situation_bucket(&[lo, hi], board);
+            }
+        }
+        out
+    }
+
+    /// The per-player starting stack in chips (seat 0's; all seats equal).
+    pub fn stack_chips(&self) -> u32 {
+        self.stacks[0]
     }
 }
 

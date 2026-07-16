@@ -33,11 +33,17 @@ use std::collections::HashMap;
 use poker_core::legal_actions;
 use poker_core::state::{GameState, NO_CARD};
 
-// `board_cfvs` indexes its reach/output by `features::combo_index`, so the whole
-// solver works in that ordering (NOT `belief_state`'s, a different bijection).
-use crate::abstraction::features::{board_cfvs, combo_cards, PreparedRunout};
+// The showdown sweeps index reach/output by `features::combo_index`, so the
+// whole solver works in that ordering (NOT `belief_state`'s, a different
+// bijection).
+use crate::abstraction::features::{combo_cards, PreparedRunout, PreparedShowdown};
 use crate::resolving::belief_state::{BeliefState, NUM_COMBOS};
 use crate::util::hash::fnv1a;
+
+/// Key-namespace markers for [`NodeKind::Decision`] (see its docs).
+const MARKER_NONE: u8 = 0;
+const MARKER_CONTINUATION: u8 = 0xFE;
+const MARKER_GADGET: u8 = 0xA6;
 
 /// A solved vectorized subgame (mirrors [`Resolved`](crate::resolving::subgame::Resolved)).
 pub struct VectorResolved {
@@ -53,9 +59,11 @@ pub struct VectorResolved {
 
 /// A terminal or decision node of the public betting tree.
 enum NodeKind {
-    /// River showdown: each player's value is `board_cfvs` over the opponent's
-    /// reach with `half_pot` chips at stake (already in big-blind units).
-    Showdown { half_pot: f64 },
+    /// River showdown: each player's value is the reach-weighted sweep over
+    /// the opponent with `half_pot` at stake (bb units), on the pre-sorted
+    /// complete board `prepared[prep]` (a full-river turn resolve has one
+    /// prepared board per river card; a river resolve has exactly one).
+    Showdown { half_pot: f64, prep: usize },
     /// Turn/flop depth-limit or all-in leaf: the board is incomplete, so the
     /// showdown is the check-down value averaged over the runout
     /// (`board_runout_cfvs`).  The vectorized analogue of the explicit oracle's
@@ -64,22 +72,38 @@ enum NodeKind {
     /// A fold terminal: card-independent per-player net payoff (bb units),
     /// weighted at solve time by the blocker-corrected opponent reach.
     Fold { payoffs: [f64; 2] },
+    /// The river reveal inside a **full-river turn resolve**: one child per
+    /// live river card.  Both players' reaches are masked per branch (combos
+    /// using the card are impossible) and the sum is divided by 44 — the
+    /// exact number of rivers consistent with any two disjoint holdings — so
+    /// each hand pair's value is an exact conditional expectation, the same
+    /// per-pair convention as `board_runout_cfvs`.
+    Chance { children: Vec<(u8, usize)> },
+    /// The re-solving gadget's **Terminate** terminal (Burch–Johanson–Bowling
+    /// 2014, vectorized): the constrained opponent opts out of the subgame and
+    /// banks its carried per-hand counterfactual value instead
+    /// ([`VectorCfr::carried`], bb).  The resolver's seat receives the
+    /// negation.  Constraining the resolve so Follow can never beat the carry
+    /// is what makes re-solving *safe*: the opponent cannot profit from our
+    /// strategy having been recomputed since the values were extracted.
+    CfvTerminal,
     /// A betting decision for `player`; `children[a]` is the node after legal
     /// action `a`.  `store` indexes the regret/strategy arrays; `board`/`history`
     /// reproduce the explicit info key when emitting the strategy.
     ///
-    /// When `is_continuation`, this is not a betting node but the opponent's
-    /// depth-limit **continuation choice** (finding #1): `player` is the fixed
-    /// chooser, `children[i]` a `RunoutShowdown` at the `i`-th continuation's
-    /// inflated pot, and the emitted key carries the `0xFE` marker so it matches
-    /// the explicit oracle's continuation info set (and never a betting one).
+    /// `marker` namespaces the emitted key: `MARKER_NONE` for a betting node;
+    /// `MARKER_CONTINUATION` for the opponent's depth-limit **continuation
+    /// choice** (finding #1: `player` is the fixed chooser, `children[i]` a
+    /// `RunoutShowdown` at the `i`-th continuation's inflated pot, matching the
+    /// explicit oracle's continuation info set); `MARKER_GADGET` for the
+    /// re-solving gadget's per-hand Follow/Terminate choice (never emitted).
     Decision {
         player: usize,
         store: usize,
         children: Vec<usize>,
         board: [u8; 5],
         history: Vec<u8>,
-        is_continuation: bool,
+        marker: u8,
     },
 }
 
@@ -118,6 +142,27 @@ impl NodeStore {
         out
     }
 
+    /// The linear-averaged strategy (normalized `strategy_sum`, uniform where
+    /// no mass accumulated — matching what `into_resolved` emits), row-major
+    /// `[hand][action]`.  Used by the CFV-extraction evaluation pass.
+    fn average(&self) -> Vec<f64> {
+        let a = self.num_actions;
+        let mut out = vec![0.0; NUM_COMBOS * a];
+        for h in 0..NUM_COMBOS {
+            let row = &self.strategy_sum[h * a..h * a + a];
+            let total: f64 = row.iter().sum();
+            let dst = &mut out[h * a..h * a + a];
+            if total > 0.0 {
+                for (o, &s) in dst.iter_mut().zip(row) {
+                    *o = s / total;
+                }
+            } else {
+                dst.fill(1.0 / a as f64);
+            }
+        }
+        out
+    }
+
     /// CFR⁺ / RM⁺ update for this node's player: add the instantaneous
     /// counterfactual regret `child_p[a] − v_p` and **floor the accumulated regret
     /// at 0**, then accumulate the linearly-weighted (`weight = t`) reach-weighted
@@ -140,6 +185,38 @@ impl NodeStore {
     }
 }
 
+/// The read-only traversal environment — everything `cfr` needs besides the
+/// mutable stores, bundled so the recursion's signature stays sane.
+struct Env<'a> {
+    kinds: &'a [NodeKind],
+    board: &'a [u8; 5],
+    runout: Option<&'a PreparedRunout>,
+    prepared: &'a [PreparedShowdown],
+    cards: &'a [[u8; 2]],
+    /// Carried opponent CFVs when a gadget wraps the root (`CfvTerminal`).
+    carried: Option<&'a [f64; NUM_COMBOS]>,
+    /// The constrained opponent (the gadget's owner).
+    chooser: usize,
+}
+
+/// Values at the gadget's Terminate terminal, for `player`'s hands weighted by
+/// the other seat's reach: the owner banks its carried per-hand CFV; the other
+/// seat pays it (blocker-corrected inclusion–exclusion over the weighted
+/// opponent reach, the same sums as a fold terminal).
+fn cfv_terminal_values(env: &Env<'_>, reach_other: &[f64; NUM_COMBOS], player: usize) -> Vec<f64> {
+    let cfvs = env.carried.expect("CfvTerminal requires carried CFVs");
+    if player == env.chooser {
+        let vr = valid_reach(env.board, reach_other);
+        cfvs.iter().zip(vr.iter()).map(|(&c, &r)| c * r).collect()
+    } else {
+        let mut weighted = [0.0f64; NUM_COMBOS];
+        for ((w, &r), &c) in weighted.iter_mut().zip(reach_other.iter()).zip(cfvs.iter()) {
+            *w = r * c;
+        }
+        valid_reach(env.board, &weighted).iter().map(|&w| -w).collect()
+    }
+}
+
 /// The vectorized public-tree solver.
 pub struct VectorCfr {
     kinds: Vec<NodeKind>,
@@ -152,6 +229,18 @@ pub struct VectorCfr {
     /// river resolve, which has no `RunoutShowdown` leaves).  Built once and
     /// shared across every iteration and every turn leaf.
     runout: Option<PreparedRunout>,
+    /// Pre-sorted complete boards for `Showdown` leaves: one entry for a river
+    /// resolve, one per live river card for a full-river turn resolve.  Built
+    /// once at construction so no iteration ever re-sorts a board.
+    prepared: Vec<PreparedShowdown>,
+    /// Solve the river betting exactly inside a turn resolve (a `Chance` node
+    /// per street close) instead of cutting at the reveal with a check-down /
+    /// continuation leaf.  Only affects turn roots; a flop root still cuts at
+    /// the turn reveal, and all-in run-outs stay exact check-downs either way.
+    full_river: bool,
+    /// `combo_cards(h)` for every `h` — the chance-mask hot path decodes each
+    /// combo per branch per iteration, so it is precomputed once.
+    cards: Vec<[u8; 2]>,
     big_blind: f64,
     /// Maximum raises in the subgame (`u32::MAX` = the engine's unbounded
     /// re-raising).  Deep-stacked resolving needs a finite cap for the same
@@ -166,6 +255,12 @@ pub struct VectorCfr {
     /// whose post-leaf adaptation the resolve must be robust to (only used when
     /// `scales.len() > 1`).
     chooser: usize,
+    /// The betting-tree root *before* any gadget wrap (`== root` without one);
+    /// CFV extraction always evaluates from here.
+    inner_root: usize,
+    /// Carried opponent CFVs (bb, per opponent hand in `features::combo_index`
+    /// order) when this is a gadget-constrained continual resolve.
+    carried: Option<Box<[f64; NUM_COMBOS]>>,
     t: u64,
 }
 
@@ -195,6 +290,22 @@ impl VectorCfr {
         beliefs: &[BeliefState],
         raise_cap: u32,
         scales: Vec<f64>,
+    ) -> Self {
+        Self::new_full(root, beliefs, raise_cap, scales, false)
+    }
+
+    /// The general constructor.  With `full_river` (turn roots only), a turn
+    /// street close deals the river as an explicit [`NodeKind::Chance`] and
+    /// solves the **real river betting** below it — no leaf model at all on
+    /// that boundary — instead of cutting with a check-down / continuation
+    /// leaf.  All-in run-outs (no betting left) stay exact check-downs, and a
+    /// flop root still cuts at the turn reveal with the `scales` leaf.
+    pub fn new_full(
+        root: &GameState,
+        beliefs: &[BeliefState],
+        raise_cap: u32,
+        scales: Vec<f64>,
+        full_river: bool,
     ) -> Self {
         assert_eq!(beliefs.len(), 2, "heads-up vectorized resolving needs two ranges");
         assert!(!scales.is_empty(), "need at least one continuation");
@@ -238,14 +349,162 @@ impl VectorCfr {
             reach1,
             board,
             runout,
+            prepared: Vec::new(),
+            full_river,
+            cards: (0..NUM_COMBOS).map(combo_cards).collect(),
             big_blind,
             raise_cap,
             scales,
             chooser,
+            inner_root: 0,
+            carried: None,
             t: 0,
         };
-        me.root = me.build(root.clone(), Vec::new(), 0);
+        // A complete-board root shares one prepared showdown; incomplete roots
+        // get one per dealt river card (full-river mode) or none (leaf cuts).
+        let root_prep = if board.contains(&NO_CARD) {
+            usize::MAX
+        } else {
+            me.prepared.push(PreparedShowdown::new(board));
+            0
+        };
+        me.root = me.build(root.clone(), Vec::new(), 0, root_prep);
+        me.inner_root = me.root;
         me
+    }
+
+    /// Constrain this resolve with the opponent's **carried counterfactual
+    /// values** (continual re-solving): the root is wrapped in the re-solving
+    /// gadget, a per-hand Follow/Terminate choice for the opponent whose
+    /// Terminate banks `cfvs[hand]` (bb).  The solved strategy is then *safe*:
+    /// the opponent's best response cannot exceed its carried guarantee, no
+    /// matter that our strategy was recomputed since.  Extract fresh values
+    /// after solving with [`opponent_cfvs`](Self::opponent_cfvs).
+    pub fn with_opponent_gadget(mut self, cfvs: [f64; NUM_COMBOS]) -> Self {
+        assert!(self.carried.is_none(), "gadget already applied");
+        let term = self.kinds.len();
+        self.kinds.push(NodeKind::CfvTerminal);
+        let store = self.stores.len();
+        self.stores.push(NodeStore::new(2));
+        let id = self.kinds.len();
+        self.kinds.push(NodeKind::Decision {
+            player: self.chooser,
+            store,
+            // Action 0 = Terminate (bank the carry), action 1 = Follow.
+            children: vec![term, self.root],
+            board: self.board,
+            history: Vec::new(),
+            marker: MARKER_GADGET,
+        });
+        self.root = id;
+        self.carried = Some(Box::new(cfvs));
+        self
+    }
+
+    /// The opponent's per-hand counterfactual values at the (inner) resolve
+    /// root under the emitted **average** profile, conditional on each hand
+    /// (bb; zero where its prior reach has no mass) — the carry for the next
+    /// continual resolve.  Evaluated below any gadget wrap, i.e. assuming
+    /// Follow, matching how the explicit `ContinualResolver` refreshes.
+    pub fn opponent_cfvs(&self) -> [f64; NUM_COMBOS] {
+        let opp = self.chooser;
+        let (reach_opp, reach_me) =
+            if opp == 0 { (&self.reach0, &self.reach1) } else { (&self.reach1, &self.reach0) };
+        let env = Env {
+            kinds: &self.kinds,
+            board: &self.board,
+            runout: self.runout.as_ref(),
+            prepared: &self.prepared,
+            cards: &self.cards,
+            carried: self.carried.as_deref(),
+            chooser: self.chooser,
+        };
+        let raw = Self::eval_average(&env, &self.stores, self.inner_root, reach_me, opp);
+        let mass = valid_reach(&self.board, reach_me);
+        let mut out = [0.0; NUM_COMBOS];
+        for (o, (&v, (&m, &prior))) in
+            out.iter_mut().zip(raw.iter().zip(mass.iter().zip(reach_opp.iter())))
+        {
+            if m > 0.0 && prior > 0.0 {
+                *o = v / m;
+            }
+        }
+        out
+    }
+
+    /// Expected value per `player` hand under the stored **average** strategy
+    /// (both seats), weighted by the other seat's reach — the evaluation
+    /// (no-update) counterpart of [`cfr`](Self::cfr) used for CFV extraction.
+    fn eval_average(
+        env: &Env<'_>,
+        stores: &[NodeStore],
+        id: usize,
+        reach_other: &[f64; NUM_COMBOS],
+        player: usize,
+    ) -> Vec<f64> {
+        match &env.kinds[id] {
+            NodeKind::Showdown { half_pot, prep } => {
+                let mut v = [0.0; NUM_COMBOS];
+                env.prepared[*prep].accumulate(reach_other, *half_pot, &mut v);
+                v.to_vec()
+            }
+            NodeKind::RunoutShowdown { half_pot } => {
+                let mut v = [0.0; NUM_COMBOS];
+                env.runout
+                    .expect("turn resolve must build a runout table for its leaves")
+                    .evaluate(reach_other, *half_pot, &mut v);
+                v.to_vec()
+            }
+            NodeKind::Fold { payoffs } => {
+                let vr = valid_reach(env.board, reach_other);
+                vr.iter().map(|&r| payoffs[player] * r).collect()
+            }
+            NodeKind::CfvTerminal => cfv_terminal_values(env, reach_other, player),
+            NodeKind::Chance { children } => {
+                let mut v = vec![0.0; NUM_COMBOS];
+                for &(c, child) in children {
+                    let mut ro = *reach_other;
+                    for (h, cards) in env.cards.iter().enumerate() {
+                        if cards[0] == c || cards[1] == c {
+                            ro[h] = 0.0;
+                        }
+                    }
+                    let cv = Self::eval_average(env, stores, child, &ro, player);
+                    for (h, cards) in env.cards.iter().enumerate() {
+                        if cards[0] != c && cards[1] != c {
+                            v[h] += cv[h];
+                        }
+                    }
+                }
+                for x in &mut v {
+                    *x /= 44.0;
+                }
+                v
+            }
+            NodeKind::Decision { player: p, store, children, .. } => {
+                let a = children.len();
+                let sigma = stores[*store].average();
+                let mut v = vec![0.0; NUM_COMBOS];
+                for (ai, &child) in children.iter().enumerate() {
+                    if *p == player {
+                        let cv = Self::eval_average(env, stores, child, reach_other, player);
+                        for h in 0..NUM_COMBOS {
+                            v[h] += sigma[h * a + ai] * cv[h];
+                        }
+                    } else {
+                        let mut ro = *reach_other;
+                        for h in 0..NUM_COMBOS {
+                            ro[h] *= sigma[h * a + ai];
+                        }
+                        let cv = Self::eval_average(env, stores, child, &ro, player);
+                        for h in 0..NUM_COMBOS {
+                            v[h] += cv[h];
+                        }
+                    }
+                }
+                v
+            }
+        }
     }
 
     /// The subgame's legal actions under the raise cap: past `raises` ≥ cap,
@@ -264,7 +523,7 @@ impl VectorCfr {
             .collect()
     }
 
-    fn build(&mut self, gs: GameState, history: Vec<u8>, raises: u32) -> usize {
+    fn build(&mut self, gs: GameState, history: Vec<u8>, raises: u32, prep: usize) -> usize {
         // A node is a leaf when the hand ends (fold / river showdown) or when the
         // current street wants a board card the resolve root does not have — the
         // depth cut of a turn or flop subgame (or an all-in run-out past it).
@@ -285,13 +544,25 @@ impl VectorCfr {
             if real_cards == 5 {
                 // Complete board: exact river showdown.
                 let id = self.kinds.len();
-                self.kinds.push(NodeKind::Showdown { half_pot });
+                self.kinds.push(NodeKind::Showdown { half_pot, prep });
                 return id;
+            }
+            // Full-river mode, betting still open, only the river missing:
+            // deal it as an explicit chance node and solve the real river
+            // betting below — the exact replacement for the depth-cut leaf.
+            // (A terminal here is an all-in run-out: no betting remains, so
+            // the plain runout check-down is already exact.)
+            if self.full_river && !gs.is_terminal() && real_cards == 4 {
+                return self.build_river_chance(gs, history);
             }
             // Board undealt (depth cut or all-in run-out): check-down showdown
             // averaged over the runout.  With K > 1 continuations, the opponent
             // first chooses among them (finding #1); otherwise a plain leaf.
-            if self.scales.len() > 1 {
+            // In full-river mode a turn all-in run-out gets NO chooser: with no
+            // betting left, the plain check-down is exact and a continuation
+            // choice would hand the opponent fictitious post-all-in leverage.
+            let exact_runout = self.full_river && real_cards == 4;
+            if self.scales.len() > 1 && !exact_runout {
                 return self.build_continuation_chooser(half_pot, gs.board, history);
             }
             let id = self.kinds.len();
@@ -309,7 +580,7 @@ impl VectorCfr {
             let r = if next.current_bet > old_bet { raises + 1 } else { raises };
             let mut h = history.clone();
             h.push(i as u8);
-            children.push(self.build(next, h, r));
+            children.push(self.build(next, h, r, prep));
         }
         let store = self.stores.len();
         self.stores.push(NodeStore::new(acts.len()));
@@ -320,8 +591,36 @@ impl VectorCfr {
             children,
             board: gs.board,
             history,
-            is_continuation: false,
+            marker: MARKER_NONE,
         });
+        id
+    }
+
+    /// Deal the river inside a full-river turn resolve: one branch per live
+    /// card, each with its own pre-sorted showdown board and the real river
+    /// betting tree below.  The action history continues across the reveal
+    /// (branches are distinguished by each decision node's own `board`, which
+    /// the info key already includes).
+    fn build_river_chance(&mut self, gs: GameState, history: Vec<u8>) -> usize {
+        let mut used = 0u64;
+        for &c in &gs.board[..4] {
+            used |= 1 << c;
+        }
+        let mut children = Vec::with_capacity(48);
+        for c in 0..52u8 {
+            if used & (1 << c) != 0 {
+                continue;
+            }
+            let mut next = gs.clone();
+            next.board[4] = c;
+            let prep = self.prepared.len();
+            self.prepared.push(PreparedShowdown::new(next.board));
+            // The raise counter resets on the new street, mirroring the
+            // blueprint's per-street cap semantics.
+            children.push((c, self.build(next, history.clone(), 0, prep)));
+        }
+        let id = self.kinds.len();
+        self.kinds.push(NodeKind::Chance { children });
         id
     }
 
@@ -349,7 +648,7 @@ impl VectorCfr {
             children,
             board,
             history,
-            is_continuation: true,
+            marker: MARKER_CONTINUATION,
         });
         id
     }
@@ -366,30 +665,37 @@ impl VectorCfr {
             let traverser = ((self.t - 1) % 2) as usize;
             let (reach0, reach1) = (self.reach0, self.reach1);
             let (reach_tr, reach_op) = if traverser == 0 { (reach0, reach1) } else { (reach1, reach0) };
-            Self::cfr(&self.kinds, &mut self.stores, self.root, &reach_tr, &reach_op, traverser, self.t, &self.board, self.runout.as_ref());
+            let env = Env {
+                kinds: &self.kinds,
+                board: &self.board,
+                runout: self.runout.as_ref(),
+                prepared: &self.prepared,
+                cards: &self.cards,
+                carried: self.carried.as_deref(),
+                chooser: self.chooser,
+            };
+            Self::cfr(&env, &mut self.stores, self.root, &reach_tr, &reach_op, traverser, self.t);
         }
     }
 
     /// Counterfactual value vector for `traverser` (per traverser hand), given
     /// the traverser's reach `reach_tr` and the opponent's reach `reach_op`.
     /// Regrets/strategy are updated only at the traverser's own decision nodes.
-    #[allow(clippy::too_many_arguments)]
     fn cfr(
-        kinds: &[NodeKind],
+        env: &Env<'_>,
         stores: &mut [NodeStore],
         id: usize,
         reach_tr: &[f64; NUM_COMBOS],
         reach_op: &[f64; NUM_COMBOS],
         traverser: usize,
         t: u64,
-        board: &[u8; 5],
-        runout: Option<&PreparedRunout>,
     ) -> Vec<f64> {
-        match &kinds[id] {
-            NodeKind::Showdown { half_pot } => {
-                // Traverser's value = reach-weighted showdown over the opponent.
+        match &env.kinds[id] {
+            NodeKind::Showdown { half_pot, prep } => {
+                // Traverser's value = reach-weighted showdown over the opponent,
+                // on this leaf's pre-sorted complete board.
                 let mut v = [0.0; NUM_COMBOS];
-                board_cfvs(*board, reach_op, *half_pot, &mut v);
+                env.prepared[*prep].accumulate(reach_op, *half_pot, &mut v);
                 v.to_vec()
             }
             NodeKind::RunoutShowdown { half_pot } => {
@@ -397,14 +703,40 @@ impl VectorCfr {
                 // undealt river (check-down continuation), via the pre-sorted
                 // runout table built once for this board.
                 let mut v = [0.0; NUM_COMBOS];
-                runout
+                env.runout
                     .expect("turn resolve must build a runout table for its leaves")
                     .evaluate(reach_op, *half_pot, &mut v);
                 v.to_vec()
             }
             NodeKind::Fold { payoffs } => {
-                let vr = valid_reach(board, reach_op);
+                let vr = valid_reach(env.board, reach_op);
                 vr.iter().map(|&r| payoffs[traverser] * r).collect()
+            }
+            NodeKind::CfvTerminal => cfv_terminal_values(env, reach_op, traverser),
+            NodeKind::Chance { children } => {
+                // River reveal: mask both reaches per branch, sum, divide by
+                // the per-pair-consistent count (44) — see `NodeKind::Chance`.
+                let mut v = vec![0.0; NUM_COMBOS];
+                for &(c, child) in children {
+                    let mut rt = *reach_tr;
+                    let mut ro = *reach_op;
+                    for (h, cards) in env.cards.iter().enumerate() {
+                        if cards[0] == c || cards[1] == c {
+                            rt[h] = 0.0;
+                            ro[h] = 0.0;
+                        }
+                    }
+                    let cv = Self::cfr(env, stores, child, &rt, &ro, traverser, t);
+                    for (h, cards) in env.cards.iter().enumerate() {
+                        if cards[0] != c && cards[1] != c {
+                            v[h] += cv[h];
+                        }
+                    }
+                }
+                for x in &mut v {
+                    *x /= 44.0;
+                }
+                v
             }
             NodeKind::Decision { player, store, children, .. } => {
                 let a = children.len();
@@ -420,7 +752,7 @@ impl VectorCfr {
                         for h in 0..NUM_COMBOS {
                             rt[h] *= sigma[h * a + ai];
                         }
-                        let cv = Self::cfr(kinds, stores, child, &rt, reach_op, traverser, t, board, runout);
+                        let cv = Self::cfr(env, stores, child, &rt, reach_op, traverser, t);
                         for h in 0..NUM_COMBOS {
                             v[h] += sigma[h * a + ai] * cv[h];
                         }
@@ -435,7 +767,7 @@ impl VectorCfr {
                         for h in 0..NUM_COMBOS {
                             ro[h] *= sigma[h * a + ai];
                         }
-                        let cv = Self::cfr(kinds, stores, child, reach_tr, &ro, traverser, t, board, runout);
+                        let cv = Self::cfr(env, stores, child, reach_tr, &ro, traverser, t);
                         for h in 0..NUM_COMBOS {
                             v[h] += cv[h];
                         }
@@ -451,10 +783,15 @@ impl VectorCfr {
         let mut strategy = HashMap::new();
         let mut public_nodes = 0;
         for kind in &self.kinds {
-            let NodeKind::Decision { player, store, board, history, children, is_continuation } = kind
+            let NodeKind::Decision { player, store, board, history, children, marker } = kind
             else {
                 continue;
             };
+            if *marker == MARKER_GADGET {
+                // The gadget's Follow/Terminate mix is a solving device, not a
+                // deployable strategy — never emitted.
+                continue;
+            }
             public_nodes += 1;
             let a = children.len();
             let s = &self.stores[*store];
@@ -464,7 +801,7 @@ impl VectorCfr {
                 if total <= 0.0 {
                     continue; // unreached hand: defaults to uniform in the oracle
                 }
-                let key = info_key(*player, combo_cards(h), board, history, *is_continuation);
+                let key = info_key(*player, combo_cards(h), board, history, *marker);
                 strategy.insert(key, row.iter().map(|&x| x / total).collect());
             }
         }
@@ -506,6 +843,23 @@ pub fn solve_vectorized_multi(
     scales: Vec<f64>,
 ) -> VectorResolved {
     let mut solver = VectorCfr::new_capped_multi(root, beliefs, raise_cap, scales);
+    solver.run(iters);
+    solver.into_resolved()
+}
+
+/// A **full-river turn resolve**: the river is dealt as an explicit chance
+/// node and the real river betting is solved below it — exact to showdown, no
+/// leaf model on the turn/river boundary (all-in run-outs are exact
+/// check-downs).  ~48× the tree of a leaf-cut turn resolve; budget iterations
+/// accordingly.  For turn roots; other roots behave like
+/// [`solve_vectorized_capped`] (`scales` still applies to a flop root's cut).
+pub fn solve_vectorized_full_river(
+    root: &GameState,
+    beliefs: &[BeliefState],
+    iters: u64,
+    raise_cap: u32,
+) -> VectorResolved {
+    let mut solver = VectorCfr::new_full(root, beliefs, raise_cap, vec![0.0], true);
     solver.run(iters);
     solver.into_resolved()
 }
@@ -568,15 +922,16 @@ pub fn capped_root_actions(root: &GameState, raise_cap: u32) -> Vec<poker_core::
 /// (empty at the root itself).  Betting nodes only — continuation-choice nodes
 /// (finding #1) carry an extra marker and are never queried by hole+history.
 pub fn subgame_info_key(player: usize, hole: [u8; 2], board: &[u8; 5], history: &[u8]) -> u64 {
-    info_key(player, hole, board, history, false)
+    info_key(player, hole, board, history, MARKER_NONE)
 }
 
 /// Reproduce [`Subgame::info_key`](crate::resolving::subgame): FNV-1a of
 /// `player`, the (sorted) hole, the visible board, a separator, then the action
 /// history.  `combo_cards` already returns `a < b`, matching the sort there.
-/// `is_continuation` appends the `0xFE` marker so a depth-limit continuation
-/// choice can never collide with a betting info set at the same key.
-fn info_key(player: usize, hole: [u8; 2], board: &[u8; 5], history: &[u8], is_continuation: bool) -> u64 {
+/// A nonzero `marker` byte is appended so a depth-limit continuation choice
+/// (`0xFE`) or gadget choice (`0xA6`) can never collide with a betting info
+/// set at the same key.
+fn info_key(player: usize, hole: [u8; 2], board: &[u8; 5], history: &[u8], marker: u8) -> u64 {
     let mut bytes = Vec::with_capacity(8 + history.len());
     bytes.push(player as u8);
     bytes.push(hole[0]);
@@ -588,8 +943,8 @@ fn info_key(player: usize, hole: [u8; 2], board: &[u8; 5], history: &[u8], is_co
     }
     bytes.push(0xFF);
     bytes.extend_from_slice(history);
-    if is_continuation {
-        bytes.push(0xFE);
+    if marker != MARKER_NONE {
+        bytes.push(marker);
     }
     fnv1a(&bytes)
 }
@@ -599,7 +954,7 @@ mod tests {
     use super::*;
     use crate::resolving::leaf_eval::CheckdownLeafEval;
     use crate::resolving::subgame::Subgame;
-    use crate::solver::best_response::exploitability;
+    use crate::solver::best_response::{best_response_value, exploitability, profile_value};
     use poker_core::action::Action;
     use poker_core::make_card;
     use poker_core::state::MAX_PLAYERS;
@@ -714,7 +1069,7 @@ mod tests {
         let solver = VectorCfr::new_capped_multi(&root, &beliefs, u32::MAX, scales.clone());
         let mut choosers = 0;
         for k in &solver.kinds {
-            let NodeKind::Decision { player, children, is_continuation: true, .. } = k else {
+            let NodeKind::Decision { player, children, marker: MARKER_CONTINUATION, .. } = k else {
                 continue;
             };
             choosers += 1;
@@ -736,7 +1091,7 @@ mod tests {
         // K = 1 stays a plain leaf — no chooser nodes.
         let single = VectorCfr::new(&root, &beliefs);
         assert!(
-            !single.kinds.iter().any(|k| matches!(k, NodeKind::Decision { is_continuation: true, .. })),
+            !single.kinds.iter().any(|k| matches!(k, NodeKind::Decision { marker: MARKER_CONTINUATION, .. })),
             "a single-continuation resolve must not insert chooser nodes"
         );
 
@@ -920,6 +1275,392 @@ mod tests {
     fn strategies_are_valid_distributions() {
         let beliefs = duel_ranges();
         let resolved = solve_vectorized(&public_root(river_board(), 20), &beliefs, 500);
+        for probs in resolved.strategy.values() {
+            let sum: f64 = probs.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-9, "strategy must be a distribution, got {sum}");
+            assert!(probs.iter().all(|&p| p >= 0.0), "no negative probabilities");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Full-river turn resolving (real river betting inside the subgame).
+    // ------------------------------------------------------------------
+
+    /// Exact best response in the TRUE turn+river game (real river betting,
+    /// no leaf model), over small explicit supports — the independent gate
+    /// for the full-river mode.  Support-vector BR: per-BR-hand values, the
+    /// profile seat's reach weighted by the resolved strategy (uniform where
+    /// it stored nothing), explicit per-pair collision skips at terminals,
+    /// direct 7-card rank comparison at showdowns, per-pair river divisor.
+    struct TrueBr<'a> {
+        strategy: &'a HashMap<u64, Vec<f64>>,
+        cap: u32,
+        br: usize,
+        hands: [&'a [[u8; 2]]; 2],
+        big_blind: f64,
+    }
+
+    impl TrueBr<'_> {
+        /// `(br₀ + br₁)/2` in bb — exploitability of `strategy` in the true
+        /// game, deals uniform over non-colliding support pairs.
+        fn exploitability(
+            root: &GameState,
+            hands: [&[[u8; 2]]; 2],
+            strategy: &HashMap<u64, Vec<f64>>,
+            cap: u32,
+        ) -> f64 {
+            let mut sum = 0.0;
+            for br in 0..2 {
+                let me = TrueBr { strategy, cap, br, hands, big_blind: root.big_blind as f64 };
+                let opp = 1 - br;
+                let reach = vec![1.0f64; hands[opp].len()];
+                let v = me.node(&mut root.clone(), &mut Vec::new(), 0, &reach);
+                // Normalize by the number of consistent (h, j) pairs.
+                let pairs: usize = hands[br]
+                    .iter()
+                    .map(|h| {
+                        hands[opp].iter().filter(|j| !collide(h, j, &root.board)).count()
+                    })
+                    .sum();
+                sum += v.iter().sum::<f64>() / pairs as f64 / me.big_blind;
+            }
+            sum / 2.0
+        }
+
+        fn node(&self, gs: &mut GameState, hist: &mut Vec<u8>, raises: u32, reach: &[f64]) -> Vec<f64> {
+            let acts = test_capped(gs, raises, self.cap);
+            let actor = gs.current_player();
+            let n = acts.len();
+            if actor == self.br {
+                let mut out = vec![f64::NEG_INFINITY; self.hands[self.br].len()];
+                for (i, &a) in acts.iter().enumerate() {
+                    let child = self.descend(gs, hist, raises, reach, a, i);
+                    for (o, c) in out.iter_mut().zip(&child) {
+                        *o = o.max(*c);
+                    }
+                }
+                out
+            } else {
+                let mut out = vec![0.0f64; self.hands[self.br].len()];
+                for (i, &a) in acts.iter().enumerate() {
+                    let mut child_reach = vec![0.0f64; reach.len()];
+                    for (j, cr) in child_reach.iter_mut().enumerate() {
+                        if reach[j] == 0.0 {
+                            continue;
+                        }
+                        let mut hole = self.hands[actor][j];
+                        hole.sort_unstable();
+                        let key = subgame_info_key(actor, hole, &gs.board, hist);
+                        let sigma = match self.strategy.get(&key) {
+                            Some(p) if p.len() == n => p[i],
+                            _ => 1.0 / n as f64,
+                        };
+                        *cr = reach[j] * sigma;
+                    }
+                    let child = self.descend(gs, hist, raises, &child_reach, a, i);
+                    for (o, c) in out.iter_mut().zip(&child) {
+                        *o += c;
+                    }
+                }
+                out
+            }
+        }
+
+        fn descend(&self, gs: &mut GameState, hist: &mut Vec<u8>, raises: u32, reach: &[f64], act: Action, i: usize) -> Vec<f64> {
+            let (old_street, old_bet) = (gs.street, gs.current_bet);
+            gs.apply_action(act);
+            hist.push(i as u8);
+            let new_raises = if gs.street != old_street {
+                0
+            } else if gs.current_bet > old_bet {
+                raises + 1
+            } else {
+                raises
+            };
+            let undealt = gs.board[..gs.board_cards_count()].contains(&NO_CARD);
+            let out = if gs.is_terminal() {
+                if gs.folded != 0 {
+                    self.fold_value(gs, reach)
+                } else if undealt {
+                    self.deal_river(gs, hist, new_raises, reach)
+                } else {
+                    self.showdown(gs, reach)
+                }
+            } else if undealt {
+                self.deal_river(gs, hist, new_raises, reach)
+            } else {
+                self.node(gs, hist, new_raises, reach)
+            };
+            hist.pop();
+            gs.undo_action();
+            out
+        }
+
+        fn deal_river(&self, gs: &mut GameState, hist: &mut Vec<u8>, raises: u32, reach: &[f64]) -> Vec<f64> {
+            let opp = 1 - self.br;
+            let mut used = 0u64;
+            for &c in &gs.board[..4] {
+                used |= 1 << c;
+            }
+            let mut out = vec![0.0f64; self.hands[self.br].len()];
+            for c in 0..52u8 {
+                if used & (1 << c) != 0 {
+                    continue;
+                }
+                gs.board[4] = c;
+                let mut child_reach = reach.to_vec();
+                for (j, cr) in child_reach.iter_mut().enumerate() {
+                    let h = self.hands[opp][j];
+                    if h[0] == c || h[1] == c {
+                        *cr = 0.0;
+                    }
+                }
+                let child = if gs.is_terminal() {
+                    self.showdown(gs, &child_reach)
+                } else {
+                    self.node(gs, hist, raises, &child_reach)
+                };
+                for (h, (o, cv)) in out.iter_mut().zip(&child).enumerate() {
+                    let hb = self.hands[self.br][h];
+                    if hb[0] != c && hb[1] != c {
+                        *o += cv;
+                    }
+                }
+            }
+            gs.board[4] = NO_CARD;
+            for o in &mut out {
+                *o /= 44.0;
+            }
+            out
+        }
+
+        fn fold_value(&self, gs: &GameState, reach: &[f64]) -> Vec<f64> {
+            let folder = if gs.folded & 1 != 0 { 0usize } else { 1 };
+            let sign = if folder == self.br { -1.0 } else { 1.0 };
+            let amount = gs.total_committed[folder] as f64;
+            let opp = 1 - self.br;
+            self.hands[self.br]
+                .iter()
+                .map(|h| {
+                    let mut v = 0.0;
+                    for (j, &r) in reach.iter().enumerate() {
+                        if r != 0.0 && !collide(h, &self.hands[opp][j], &gs.board) {
+                            v += sign * amount * r;
+                        }
+                    }
+                    v
+                })
+                .collect()
+        }
+
+        fn showdown(&self, gs: &GameState, reach: &[f64]) -> Vec<f64> {
+            use poker_core::lut_eval::evaluate_7_lut;
+            let matched = gs.total_committed[0].min(gs.total_committed[1]) as f64;
+            let b = &gs.board;
+            let opp = 1 - self.br;
+            self.hands[self.br]
+                .iter()
+                .map(|h| {
+                    let hr = evaluate_7_lut(&[h[0], h[1], b[0], b[1], b[2], b[3], b[4]]);
+                    let mut v = 0.0;
+                    for (j, &r) in reach.iter().enumerate() {
+                        let jh = self.hands[opp][j];
+                        if r == 0.0 || collide(h, &jh, b) {
+                            continue;
+                        }
+                        let jr = evaluate_7_lut(&[jh[0], jh[1], b[0], b[1], b[2], b[3], b[4]]);
+                        v += r * matched
+                            * if hr > jr {
+                                1.0
+                            } else if hr < jr {
+                                -1.0
+                            } else {
+                                0.0
+                            };
+                    }
+                    v
+                })
+                .collect()
+        }
+    }
+
+    /// Two holdings collide with each other or the visible board.
+    fn collide(h: &[u8; 2], j: &[u8; 2], board: &[u8; 5]) -> bool {
+        let mut used = 0u64;
+        for &c in board {
+            if c != NO_CARD {
+                used |= 1 << c;
+            }
+        }
+        for &c in h {
+            if used & (1 << c) != 0 {
+                return true;
+            }
+            used |= 1 << c;
+        }
+        j.iter().any(|&c| used & (1 << c) != 0)
+    }
+
+    /// Test-local mirror of the solver's raise-cap filter (per-street reset).
+    fn test_capped(gs: &GameState, raises: u32, cap: u32) -> Vec<Action> {
+        let full = legal_actions(gs);
+        if raises < cap {
+            return full.to_vec();
+        }
+        let has_passive = full.iter().any(|a| matches!(a, Action::Check | Action::Call));
+        full.iter()
+            .copied()
+            .filter(|a| !(matches!(a, Action::Raise(_)) || (matches!(a, Action::AllIn) && has_passive)))
+            .collect()
+    }
+
+    /// Richer-than-duel supports on the turn board (sets, pairs, draws, air)
+    /// so the river betting actually matters.
+    fn turn_supports() -> ([[u8; 2]; 3], [[u8; 2]; 3]) {
+        (
+            [
+                [make_card(12, 1), make_card(12, 2)], // A♦A♥: top set
+                [make_card(11, 2), make_card(10, 2)], // K♥Q♥: top-ish pair
+                [make_card(4, 0), make_card(3, 0)],   // 6♣5♣: air
+            ],
+            [
+                [make_card(6, 0), make_card(6, 1)],   // 8♣8♦: bluff-catcher
+                [make_card(12, 3), make_card(2, 0)],  // A♠4♣: two pair
+                [make_card(9, 0), make_card(8, 1)],   // J♣T♦: gutshot air
+            ],
+        )
+    }
+
+    /// The headline gate for full-river turn resolving: solved WITH the real
+    /// river betting, the strategy is near-equilibrium in the TRUE turn+river
+    /// game (measured by the independent support-vector exact BR above).  The
+    /// leaf-cut resolves cannot even express river play (their keys stop at
+    /// the reveal → uniform river in the true game), which is exactly the gap
+    /// this mode closes — their true-game exploitability must be clearly worse.
+    #[test]
+    fn full_river_turn_resolve_is_near_equilibrium_in_the_true_game() {
+        let (s0, s1) = turn_supports();
+        let beliefs = [BeliefState::from_hands(&s0), BeliefState::from_hands(&s1)];
+        let root = public_root_at(turn_board(), 16, 2);
+        let cap = 1;
+
+        // 150 iterations already lands well under the bound (600 → 0.0014 bb,
+        // bound 0.05 — huge slack); the cut arm only needs to be *worse*,
+        // which it is by three orders of magnitude (~1.4 bb: it cannot
+        // express river play at all).
+        let full = solve_vectorized_full_river(&root, &beliefs, 150, cap);
+        let cut = solve_vectorized_capped(&root, &beliefs, 150, cap);
+        assert!(
+            full.public_nodes > cut.public_nodes,
+            "full-river tree must contain the river betting ({} vs {})",
+            full.public_nodes,
+            cut.public_nodes
+        );
+
+        let expl_full = TrueBr::exploitability(&root, [&s0, &s1], &full.strategy, cap);
+        let expl_cut = TrueBr::exploitability(&root, [&s0, &s1], &cut.strategy, cap);
+        println!("true-game exploitability: full-river {expl_full:.4} bb, leaf-cut {expl_cut:.4} bb");
+        assert!(
+            expl_full < 0.05,
+            "full-river resolve should be near-optimal in the true game, got {expl_full}"
+        );
+        assert!(
+            expl_full < expl_cut,
+            "solving the real river betting must beat the leaf cut in the true game \
+             ({expl_full} vs {expl_cut})"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Continual re-solving: the vectorized CFV gadget.
+    // ------------------------------------------------------------------
+
+    /// The safety + no-distortion gate for the vectorized gadget (mirrors the
+    /// explicit `gadget.rs`/`continual.rs` tests):
+    ///
+    /// 1. extracted CFVs are consistent — their reach-weighted mean equals the
+    ///    profile's value for the opponent in the explicit oracle;
+    /// 2. re-solving the same spot constrained by those CFVs leaves the
+    ///    opponent's exact best response vs our deployed strategy no better
+    ///    than it was against the bootstrap (re-entry stays safe);
+    /// 3. our own deployed strategy stays near-optimal (feeding
+    ///    near-equilibrium CFVs does not distort the resolve).
+    #[test]
+    fn gadget_resolve_is_safe_and_true_cfvs_do_not_distort() {
+        let beliefs = duel_ranges();
+        let root = public_root(river_board(), 20);
+
+        let mut boot = VectorCfr::new(&root, &beliefs);
+        boot.run(1_000);
+        let cfvs = boot.opponent_cfvs();
+        let me = root.current_player();
+        let opp = 1 - me;
+        let strat_a = boot.into_resolved().strategy;
+
+        // (1) CFV consistency against the explicit oracle's profile value.
+        let leaf = CheckdownLeafEval::new();
+        let oracle = Subgame::new(root.clone(), &beliefs, &leaf);
+        let opp_reach = if opp == 0 { &beliefs[0] } else { &beliefs[1] };
+        let mut prior = [0.0f64; NUM_COMBOS];
+        for (i, p) in prior.iter_mut().enumerate() {
+            let [a, b] = combo_cards(i);
+            *p = opp_reach.prob(a, b);
+        }
+        let me_reach = if me == 0 { &beliefs[0] } else { &beliefs[1] };
+        let mut me_prior = [0.0f64; NUM_COMBOS];
+        for (i, p) in me_prior.iter_mut().enumerate() {
+            let [a, b] = combo_cards(i);
+            *p = me_reach.prob(a, b);
+        }
+        let mass = valid_reach(&root.board, &me_prior);
+        let (mut num, mut den) = (0.0, 0.0);
+        for j in 0..NUM_COMBOS {
+            let w = prior[j] * mass[j];
+            num += w * cfvs[j];
+            den += w;
+        }
+        let mean_cfv = num / den;
+        let pv = profile_value(&oracle, &strat_a, opp);
+        assert!(
+            (mean_cfv - pv).abs() < 0.02,
+            "reach-weighted mean CFV {mean_cfv:.4} should match the oracle profile value {pv:.4}"
+        );
+
+        // (2)+(3) Gadget re-solve constrained by the carried values.
+        let mut gadget = VectorCfr::new(&root, &beliefs).with_opponent_gadget(cfvs);
+        gadget.run(1_000);
+        let strat_b = gadget.into_resolved().strategy;
+
+        // Safety AND no-distortion are both measured by the opponent's exact
+        // BR against OUR deployed strategy (the Step-27 lesson: full-profile
+        // exploitability is spuriously high here, because the opponent's own
+        // emitted betting strategy is untrained on hands the gadget would
+        // Terminate — junk we never deploy).  No better than the bootstrap =
+        // safe; no more than ε worse = the near-equilibrium CFVs did not
+        // distort our side of the resolve.
+        let br_vs_boot = best_response_value(&oracle, opp, &strat_a);
+        let br_vs_gadget = best_response_value(&oracle, opp, &strat_b);
+        assert!(
+            br_vs_gadget <= br_vs_boot + 0.02,
+            "opponent BR vs the gadget re-solve ({br_vs_gadget:.4}) must not beat \
+             its value vs the bootstrap ({br_vs_boot:.4})"
+        );
+        assert!(
+            br_vs_gadget >= br_vs_boot - 0.05,
+            "gadget resolve distorted our strategy: opp BR collapsed from \
+             {br_vs_boot:.4} to {br_vs_gadget:.4} (untrained lines would show here)"
+        );
+    }
+
+    /// Full-river resolves must emit valid distributions on river betting
+    /// nodes too (keys distinguished by each node's own board card).
+    #[test]
+    fn full_river_strategies_are_valid_distributions() {
+        let (s0, s1) = turn_supports();
+        let beliefs = [BeliefState::from_hands(&s0), BeliefState::from_hands(&s1)];
+        let root = public_root_at(turn_board(), 20, 2);
+        let resolved = solve_vectorized_full_river(&root, &beliefs, 50, 1);
+        assert!(resolved.info_sets > 0);
         for probs in resolved.strategy.values() {
             let sum: f64 = probs.iter().sum();
             assert!((sum - 1.0).abs() < 1e-9, "strategy must be a distribution, got {sum}");
