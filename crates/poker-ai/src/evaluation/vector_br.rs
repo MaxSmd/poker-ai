@@ -56,8 +56,8 @@ use crate::play::CompactPolicy;
 use crate::util::rng::Rng;
 use poker_core::state::GameState;
 
-/// Number of two-card combos.
-pub const COMBOS: usize = 1326;
+/// Number of two-card combos (the crate-wide canonical count).
+pub const COMBOS: usize = crate::util::combos::NUM_COMBOS;
 
 /// `C(48,3) / C(52,3)`: the probability a uniform flop misses two disjoint
 /// hole pairs — the per-pair consistency rate behind the sampled-flop scale.

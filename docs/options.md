@@ -81,10 +81,10 @@ stores). Implement the deepest tier the game can support.
 | River OCHS: 8-dim equity-vs-hand-class (`POKER_AI_RIVER_OCHS=1`) | Server builds (the production choice) | Strictly dominates scalar at every bucket count **[measured: +12% @k=8 → +38% @k=50 held-out RMSE; scalar@50 never reaches OCHS@8]**; solver-side RAM unchanged | Offline equity cache is 8× (≈3.9 GB river full); k-means instead of exact DP |
 | `POKER_AI_CLUSTER_MEM_GB` | Sizing the build to the machine | Skips any street whose flat cache exceeds the budget (default 1.5 GB) | Skipped street = unabstracted at train time (info sets won't plateau — that's the signal) |
 
-Bucket counts (edit in `cluster.rs` main): current 500/500/800. Coarse is a
-*feature* in this architecture — the resolver re-solves from the flop at play
-time, so blueprint buckets are a prior, not the ceiling. Decide on measured
-`--expl`, not a priori.
+Bucket counts (positional args to `cluster`, defaults 1500/1500/3000). Coarse
+is a *feature* in this architecture — the resolver re-solves at play time, so
+blueprint buckets are a prior, not the ceiling. Decide on measured `play expl`
+numbers, not a priori.
 
 ## 7. Betting abstraction (`BlueprintHoldem` policy, not engine)
 
@@ -122,7 +122,7 @@ resets the magnitude.
 | `SolverKind::Dcfr` (average) | The designated multiway fallback | Average-strategy safety when CFR+'s guarantees lapse | Slower to the same quality **[measured: 0.0294 vs 0.0055 bb @2k iters]** |
 | `with_warm_start` (blueprint-seeded regrets) | Every resolve | Enormous head start **[measured: 3 iters — cold 3.27 bb vs warm 0.0048 bb]** | Warm-start `scale` must track pot size or it washes out |
 | `CheckdownLeafEval` | Local testing; fallback | Exact all-in-equity leaves, no artifacts needed | Assumes check-down — blind to future betting leverage |
-| `BlueprintLeafEval` (+ `with_continuations`, K=4) | Production depth limits | The depth-limited-solving fix: opponent picks among K continuations **[measured: K-aware resolve 0.003 bb vs 1.31 bb exploitable in the K=4 game — ~400×]** | Value table must be populated from a trained blueprint (pending) |
+| `MultiContinuationLeaf` (K=4 pot-scale continuations) | Depth-limited resolves | The depth-limited-solving fix: opponent picks among K continuations **[measured: K-aware resolve 0.003 bb vs 1.31 bb exploitable in the K=4 game — ~400×]** | Constructed continuations, not blueprint-derived (a blueprint-value-table backend was tried and dropped: those values don't factorize inside vectorized CFR — production instead deals the river as explicit chance, §9b) |
 | `resolving::gadget` + `continual` (CFV re-solving) | Multi-street play | Provable safety (opponent held to carried CFVs); warm re-entry **[measured: ~2× fewer iters from a coarse carry, up to ~1000× on re-entry]** | Explicit-deal enumeration — fine for narrowed ranges |
 | `resolving::vector_cfr` | Full-range (1326×1326) river resolves | Public-tree vectorization **[measured: ~1.1M-deal equivalent in ~1.3 s; agrees with the explicit oracle to 0.0001 bb]** | Complete-board subgames only; depth-limit leaves panic rather than mis-score |
 
@@ -147,11 +147,10 @@ resets the magnitude.
 |---|---|---|
 | `best_response::exploitability` | Enumerable games — the exact gate | Doesn't exist for sampled games |
 | `evaluation::exploitability::push_fold_exploitability` | Push/fold benchmarks | Decoupled estimator (removes max-over-noise bias); reads slightly negative within noise near Nash |
-| `evaluation::local_br` (sampled BR) | Non-enumerable blueprints (`--expl`) | Lower bound; needs large sample counts to be meaningful; commit argmax per *info set*, never per node (clairvoyance trap) |
+| `evaluation::local_br` (sampled BR) | Non-enumerable games `vector_br` can't drive (it is `BlueprintHoldem`-specific) — e.g. future multiway | Lower bound; needs large sample counts to be meaningful (its in-loop `--expl` trainer flag was removed for exactly that reason); commit argmax per *info set*, never per node (clairvoyance trap) |
 | `evaluation::vector_br` (`play expl`) | **The blueprint quality metric**: abstract-game BR — betting/ranges exact, flops + turn/river Monte-Carlo (`--board-samples`, default 2). Exact turn/river enumeration (`--board-samples=0`) is refused above 6 bb: the deep tree × 48 × 44 runouts does not finish | Sampling makes the BR-max mildly upward-biased; use a fixed seed so old-vs-new A/Bs share the bias. Abstract-game number, not full-NLHE exploitability |
 | `play::luck` (luck-adjusted scoring, always on in `play slumbot`) | Match A/Bs | Unbiased AIVAT-style chance correction; adjusted bb/100 CIs shrink with pot-swing luck removed |
-| `evaluation::aivat` | Match evaluation | ~3× tighter stderr **[measured on Leduc: 0.0080 vs 0.0247]**, unbiased |
-| `evaluation::self_play` | A/B strategy comparison | Seat alternation cancels positional EV |
+| `evaluation::aivat` | Conceptual oracle for `play::luck` (validated on enumerable games) | ~3× tighter stderr **[measured on Leduc: 0.0080 vs 0.0247]**, unbiased |
 
 ## 11. CLI & environment quick reference
 
@@ -163,10 +162,12 @@ train [iters] [stack_bb] [seed]            push/fold trainer (HashMap path)
       --optimistic --rbp                   Phase-3 refinements (serial HashMap path)
       --resume                             continue from checkpoint
       --chunk=N --expl-every=N             progress/checkpoint/eval cadence
+      --data=DIR                           artifact directory (default data/)
 train blueprint [iters] [stack] [seed]     full HU blueprint
-      --cap=N --soa --atomic --expl --expl-iters=N   (see README §3)
+      --cap=N --soa --atomic --data=DIR    (see README §3; measure with play expl)
 train compare                              before/after table of the refinements
-cluster [cap] [seed]                       card abstraction build
+cluster [cap] [seed] [flop turn river]     card abstraction build
+      --data=DIR                           output directory (default data/)
       POKER_AI_CLUSTER_MEM_GB=8            per-street cache budget
       POKER_AI_RIVER_OCHS=1                OCHS river feature
 memory_estimate [flop turn river]          exact footprint matrix (2p + 6-max)

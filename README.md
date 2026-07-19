@@ -39,8 +39,8 @@ This trains a 20 bb heads-up push/fold blueprint with DCFR + variance-reduced
 MCCFR (3M iterations, ~20 s), prints the 13×13 SB shove chart plus a measured
 exploitability (mbb/hand), and persists the strategy to
 `data/blueprint_pushfold.bin`. Flags: `--optimistic`, `--rbp`,
-`--parallel[=BATCH]`, `--soa`, `--resume`, `--chunk=N`, `--expl-every=N`
-(see `train --help` header in `src/bin/train.rs`).
+`--parallel[=BATCH]`, `--soa`, `--resume`, `--chunk=N`, `--expl-every=N`,
+`--data=DIR` (see `train --help` header in `src/bin/train.rs`).
 
 ## Training the headline model (heads-up NLHE blueprint)
 
@@ -61,6 +61,10 @@ cargo run --release --bin cluster -- 300 1
 POKER_AI_CLUSTER_MEM_GB=8 POKER_AI_RIVER_OCHS=1 \
   cargo run --release --bin cluster -- 0 1
 ```
+
+Both `cluster` and `train` take `--data=DIR` to redirect all artifacts
+(caches, maps, checkpoints, blueprints) away from the default `data/` — use it
+on quota-limited boxes to point the bulk files at scratch space.
 
 Writes `data/{flop,turn,river}_buckets.bin` (+ equity caches). Full coverage is
 flop 1.29M / turn 13.96M / river 123.16M canonical situations; on a 64-core
@@ -102,13 +106,14 @@ cargo run --release --bin train -- blueprint 2000000000 200 1 \
   (bit-reproducible per seed+batch, but merge-bound: ~7 effective cores)
 - `--resume` — continue from `data/blueprint_holdem_soa.ckpt` (checkpoints are
   atomic and written every `--chunk`; an interruption costs at most one chunk)
-- `--expl` / `--expl-iters=N` — periodic sampled best-response exploitability.
-  Fine for push/fold-sized games; at blueprint scale (hundreds of millions of
-  info sets) the sampled bound is meaningless at any affordable N and the
-  single-threaded pass costs ~25 min per report — leave it off and evaluate
-  offline instead
-- `--chunk=N`, `--expl-every=N` — progress/checkpoint cadence (default: line
-  every 1%, exploitability every 10 chunks)
+- `--chunk=N` — progress/checkpoint cadence (default: line every 1%)
+- `--data=DIR` — artifact directory (default `data/`)
+
+There is no in-loop exploitability on the blueprint paths: the sampled
+best-response bound is meaningless at any affordable sample count on a tree
+this size (it read *negative*) and cost ~25 min per report. Measure the trained
+artifact with `play expl` (the vectorized abstract-game best response) as a
+milestone metric instead.
 
 Outputs `data/blueprint_holdem.bin` — the average strategy, keyed identically
 to the HashMap path, which is what the resolver loads.
@@ -159,18 +164,20 @@ Flags: `--iters=N` (resolve iterations), `--river-cap=N`, `--purify=X`
 `--token=`/`--username=`/`--password=` — see the header of `src/bin/play.rs`.
 
 The rest of the resolving stack (`crates/poker-ai/src/resolving/`) — CFV-gadget
-continual re-solving, blueprint warm-starting, multi-valued leaf continuations
-— is implemented and tested; extending play-time resolving from the river to
-turn/flop (which needs those depth-limited pieces plus a blueprint-derived
-leaf-value table) is the next quality lever.
+continual re-solving, blueprint warm-starting, multi-valued leaf continuations,
+full-river turn resolves — is implemented and tested; turn/flop play-time
+resolving is wired into the bot but off by default (`--resolve-turn`
+/`--resolve-flop`), and a Slumbot A/B of those arms is the next measurement.
 
 ## Evaluation toolkit
 
-- `--expl` on the trainer: sampled best-response exploitability (lower bound)
+- `play expl`: vectorized abstract-game best response — the blueprint quality
+  metric (`evaluation/vector_br.rs`)
 - `evaluation/exploitability.rs`: exact-style push/fold exploitability (mbb/g)
-- `evaluation/local_br.rs`: sampled best response for non-enumerable games
-- `evaluation/aivat.rs`: AIVAT variance-reduced match evaluation
-- `evaluation/self_play.rs`: seat-alternated head-to-head match runner
+- `evaluation/local_br.rs`: sampled best response, generic over `Game` — the
+  tool for future non-`BlueprintHoldem` (e.g. multiway) games
+- `evaluation/aivat.rs`: AIVAT variance-reduced match evaluation (the
+  conceptual oracle behind `play/luck.rs`'s live luck adjustment)
 - `examples/`: bucket inspector, OCHS-vs-scalar benchmark, continual-resolving
   benchmark
 
@@ -184,7 +191,7 @@ crates/poker-ai/src/
                             push/fold, BlueprintHoldem
   solver/                   CFR, DCFR, MCCFR (+SoA store), CFR+, pruning
   resolving/                subgame, gadget, continual re-solving, vector CFR
-  evaluation/               exploitability, LBR, AIVAT, self-play
+  evaluation/               exploitability, LBR, AIVAT, vectorized BR
   bin/                      train, cluster, memory_estimate, benchmark, play
 docs/                       architecture & design notes
 scripts/                    W&B wrapper, analysis helpers

@@ -3,8 +3,8 @@
 //! A seeded `xorshift64*` generator — small, fast, and reproducible, so the
 //! solver, evaluators, and clustering all draw the same way without a `rand`
 //! dependency.  The math here is the single source of truth previously
-//! copy-pasted across `mccfr`, `aivat`, `local_br`, `self_play`, `clustering`,
-//! and the abstraction test helpers.
+//! copy-pasted across `mccfr`, `aivat`, `local_br`, `clustering`, and the
+//! abstraction test helpers.
 
 /// One `xorshift64*` step: advance `state` and return the scrambled `u64`.
 #[inline]

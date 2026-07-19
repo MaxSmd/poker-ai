@@ -317,8 +317,15 @@ impl BlueprintHoldem {
     /// under opponent aggression: a shove past the cap could not be translated
     /// at all, and the playing agent was left with no node to act from.
     fn capped_legal(&self, gs: &GameState, street_raises: u8) -> ActionList {
+        Self::capped_legal_at(gs, street_raises, self.raise_cap)
+    }
+
+    /// The raise-cap filter as a pure function of `(state, raise count, cap)`.
+    /// Public so `bin/memory_estimate` enumerates the tree with **this exact
+    /// policy** rather than a copy that could drift from the trained game.
+    pub fn capped_legal_at(gs: &GameState, street_raises: u8, raise_cap: u32) -> ActionList {
         let full = legal_actions(gs);
-        if (street_raises as u32) < self.raise_cap {
+        if (street_raises as u32) < raise_cap {
             return full;
         }
         let mut buf = [Action::Fold; 8];
@@ -334,8 +341,9 @@ impl BlueprintHoldem {
 
     /// Raises on the current street after an action took `gs` from `old_street`/
     /// `old_bet` to its present state: reset on a street change, +1 when the bet
-    /// level rose (a raise or all-in-raise), unchanged otherwise.
-    fn next_raises(prev: u8, old_street: u8, old_bet: u32, gs: &GameState) -> u8 {
+    /// level rose (a raise or all-in-raise), unchanged otherwise.  Public for the
+    /// same reason as [`capped_legal_at`](Self::capped_legal_at).
+    pub fn next_raises(prev: u8, old_street: u8, old_bet: u32, gs: &GameState) -> u8 {
         if gs.street != old_street {
             0
         } else if gs.current_bet > old_bet {

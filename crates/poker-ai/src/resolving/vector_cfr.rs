@@ -33,9 +33,6 @@ use std::collections::HashMap;
 use poker_core::legal_actions;
 use poker_core::state::{GameState, NO_CARD};
 
-// The showdown sweeps index reach/output by `features::combo_index`, so the
-// whole solver works in that ordering (NOT `belief_state`'s, a different
-// bijection).
 use crate::abstraction::features::{combo_cards, PreparedRunout, PreparedShowdown};
 use crate::resolving::belief_state::{BeliefState, NUM_COMBOS};
 use crate::util::hash::fnv1a;

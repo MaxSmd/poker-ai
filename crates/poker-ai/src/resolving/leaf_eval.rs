@@ -10,9 +10,11 @@
 //! down to showdown from the leaf and scores each player's value by the exact
 //! all-in equity of the (known) hands over the remaining runout.  It is simple,
 //! parameter-free, and correct under the check-down continuation — the standard
-//! baseline.  A `BlueprintLeafEval` that instead reads the blueprint's own
-//! values (more accurate, especially when continued betting matters) slots in
-//! behind the same trait once a full blueprint exists.
+//! baseline.  (A blueprint-value-table backend was once planned behind this
+//! trait, but exact blueprint-play leaf values don't factorize tractably inside
+//! vectorized CFR; the production resolver instead deals the next street as an
+//! explicit chance node and solves the real betting below — see
+//! `resolving::vector_cfr`.)
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -137,9 +139,8 @@ impl LeafEvaluator for CheckdownLeafEval {
 ///
 /// **This is a constructed stand-in, not a blueprint-derived continuation.** The
 /// poker-faithful four continuations (normal / fold- / call- / raise-biased
-/// copies of the blueprint) need a trained blueprint and live in
-/// [`BlueprintLeafEval`]; locally that table is empty.  To exercise — and test —
-/// the *mechanism* without a blueprint, each continuation here is a different
+/// copies of the blueprint) would need a trained blueprint.  To exercise — and
+/// test — the *mechanism* without one, each continuation here is a different
 /// **rest-of-hand pot scale**: both players put `scale · pot` more in (a notional
 /// bet-and-call past the leaf), the realized check-down equity `e` unchanged.
 /// Player `p`'s value under scale `s` is
@@ -238,114 +239,6 @@ impl LeafEvaluator for MultiContinuationLeaf {
     }
 }
 
-/// Leaf evaluator backed by **blueprint table lookups** — the default
-/// resolving leaf evaluator.
-///
-/// At a subgame boundary the most accurate leaf value is the blueprint's own
-/// value for the players' hands there (it accounts for continued betting, unlike
-/// the check-down assumption).  This evaluator stores those values keyed by a
-/// caller-supplied function of the leaf state (typically `(hand bucket, board)`,
-/// matching how the blueprint was trained) and returns them directly.
-///
-/// Crucially, the **fallback is wired in**: a
-/// leaf the blueprint never stored a value for — an off-tree board, a bucket the
-/// blueprint skipped — is scored by an inner evaluator (default
-/// [`CheckdownLeafEval`]) instead of failing.  So the resolver degrades to the
-/// parameter-free check-down baseline exactly where the blueprint has nothing to
-/// say, rather than producing garbage.
-///
-/// Locally the value table is sparse/empty because a postflop blueprint is a
-/// cloud-burst artifact; the mechanism, keying, and fallback are complete and the
-/// table is populated from the trained blueprint once it exists.
-pub struct BlueprintLeafEval<'a> {
-    /// Per-player chip value (start-of-hand convention) keyed by [`Self::key`].
-    values: HashMap<u64, Vec<f64>>,
-    /// **Multi-valued** leaf table (finding #1): the `K` continuation value
-    /// vectors per leaf key (normal / fold- / call- / raise-biased blueprint
-    /// copies).  Empty until populated from a trained blueprint (cloud artifact);
-    /// when empty the evaluator is single-continuation and identical to before.
-    continuation_values: HashMap<u64, Vec<Vec<f64>>>,
-    /// Continuations advertised via [`LeafEvaluator::num_continuations`] when the
-    /// `K`-table is in use; falls back to the inner evaluator's `K` otherwise.
-    k: usize,
-    /// Maps a leaf state to a value-table key (e.g. hand bucket + board).
-    key: Box<dyn Fn(&GameState) -> u64 + 'a>,
-    /// Scored for leaves the blueprint has no stored value for.
-    fallback: &'a dyn LeafEvaluator,
-}
-
-impl<'a> BlueprintLeafEval<'a> {
-    /// Build a blueprint leaf evaluator from a precomputed value table, a keying
-    /// function over the leaf state, and a `fallback` evaluator for misses.
-    /// Single-continuation (`K` follows the fallback).
-    pub fn new(
-        values: HashMap<u64, Vec<f64>>,
-        key: impl Fn(&GameState) -> u64 + 'a,
-        fallback: &'a dyn LeafEvaluator,
-    ) -> Self {
-        let k = fallback.num_continuations();
-        Self { values, continuation_values: HashMap::new(), k, key: Box::new(key), fallback }
-    }
-
-    /// Build a **multi-valued** blueprint leaf evaluator: `continuation_values`
-    /// holds the `k` continuation vectors per leaf key.  `values` (the normal,
-    /// single value) is derived as continuation 0 so [`LeafEvaluator::evaluate`]
-    /// and the `K = 1` consumers still work.
-    pub fn with_continuations(
-        continuation_values: HashMap<u64, Vec<Vec<f64>>>,
-        k: usize,
-        key: impl Fn(&GameState) -> u64 + 'a,
-        fallback: &'a dyn LeafEvaluator,
-    ) -> Self {
-        assert!(k >= 1, "need at least one continuation");
-        let values = continuation_values
-            .iter()
-            .map(|(&key, conts)| (key, conts[0].clone()))
-            .collect();
-        Self { values, continuation_values, k, key: Box::new(key), fallback }
-    }
-
-    /// Number of stored leaf values (blueprint coverage of the boundary).
-    pub fn len(&self) -> usize {
-        self.values.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
-    }
-}
-
-impl LeafEvaluator for BlueprintLeafEval<'_> {
-    fn evaluate(&self, state: &GameState, beliefs: &[BeliefState]) -> Vec<f64> {
-        match self.values.get(&(self.key)(state)) {
-            Some(v) => v.clone(),
-            None => self.fallback.evaluate(state, beliefs),
-        }
-    }
-
-    fn num_continuations(&self) -> usize {
-        self.k
-    }
-
-    fn continuations(&self, state: &GameState, beliefs: &[BeliefState]) -> Vec<Vec<f64>> {
-        if let Some(v) = self.continuation_values.get(&(self.key)(state)) {
-            return v.clone();
-        }
-        // Miss: fall back, but normalize to exactly `k` continuations so the
-        // chooser node always has the same action count (a leaf the blueprint
-        // never stored simply offers the fallback's value under every choice).
-        let mut conts = self.fallback.continuations(state, beliefs);
-        if conts.is_empty() {
-            conts.push(self.fallback.evaluate(state, beliefs));
-        }
-        while conts.len() < self.k {
-            conts.push(conts[0].clone());
-        }
-        conts.truncate(self.k);
-        conts
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,30 +269,6 @@ mod tests {
         assert!((v[0] + v[1]).abs() < 1e-9, "zero-sum");
         assert!(v[0] > 9.0, "near-nuts wins ~the whole pot, net ≈ +10: {v:?}");
         assert!(v[1] < -9.0, "dominated hand loses its contribution");
-    }
-
-    #[test]
-    fn blueprint_lookup_overrides_and_falls_back_to_checkdown() {
-        // Trip aces vs a weak pair on a dry board.
-        let board = [make_card(12, 0), make_card(11, 1), make_card(7, 2), make_card(2, 3), make_card(0, 0)];
-        let gs = river_state([make_card(12, 1), make_card(12, 2)], [make_card(5, 1), make_card(0, 1)], board, 10);
-
-        let checkdown = CheckdownLeafEval::new();
-
-        // A blueprint table that overrides exactly this leaf with a (made-up)
-        // value, keyed by a constant so we control the hit.
-        let mut values = HashMap::new();
-        values.insert(42u64, vec![3.0, -3.0]);
-        let hit = BlueprintLeafEval::new(values, |_gs: &GameState| 42, &checkdown);
-        assert_eq!(hit.evaluate(&gs, &[]), vec![3.0, -3.0], "stored blueprint value is used");
-
-        // A table that never matches ⇒ falls back to the check-down baseline.
-        let miss = BlueprintLeafEval::new(HashMap::new(), |_gs: &GameState| 0, &checkdown);
-        assert_eq!(
-            miss.evaluate(&gs, &[]),
-            checkdown.evaluate(&gs, &[]),
-            "missing leaf falls back to check-down, not failure"
-        );
     }
 
     #[test]
@@ -439,34 +308,6 @@ mod tests {
         let cw = multi.continuations(&weak, &[]);
         let best_weak = (0..cw.len()).max_by(|&a, &b| cw[a][0].partial_cmp(&cw[b][0]).unwrap()).unwrap();
         assert_eq!(best_weak, 0, "weak hand prefers the smallest pot (normal)");
-    }
-
-    #[test]
-    fn blueprint_k_table_is_used_and_falls_back_to_k_continuations() {
-        let board = [make_card(12, 0), make_card(11, 1), make_card(7, 2), make_card(2, 3), make_card(0, 0)];
-        let gs = river_state([make_card(12, 1), make_card(12, 2)], [make_card(5, 1), make_card(0, 1)], board, 10);
-        let checkdown = CheckdownLeafEval::new();
-
-        // A K = 3 continuation table that overrides exactly this leaf.
-        let mut table: HashMap<u64, Vec<Vec<f64>>> = HashMap::new();
-        table.insert(7u64, vec![vec![1.0, -1.0], vec![2.0, -2.0], vec![-3.0, 3.0]]);
-        let hit = BlueprintLeafEval::with_continuations(table, 3, |_g: &GameState| 7, &checkdown);
-        assert_eq!(hit.num_continuations(), 3);
-        assert_eq!(
-            hit.continuations(&gs, &[]),
-            vec![vec![1.0, -1.0], vec![2.0, -2.0], vec![-3.0, 3.0]],
-            "stored K continuations are used"
-        );
-        assert_eq!(hit.evaluate(&gs, &[]), vec![1.0, -1.0], "evaluate == continuation 0");
-
-        // A miss must still yield exactly K vectors (the fallback's value under
-        // every choice), so the chooser node has a stable action count.
-        let miss = BlueprintLeafEval::with_continuations(HashMap::new(), 3, |_g: &GameState| 0, &checkdown);
-        let conts = miss.continuations(&gs, &[]);
-        assert_eq!(conts.len(), 3, "miss normalizes to K continuations");
-        for c in &conts {
-            assert_eq!(*c, checkdown.evaluate(&gs, &[]), "each falls back to check-down");
-        }
     }
 
     #[test]

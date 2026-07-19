@@ -48,23 +48,10 @@ pub fn river_equity(hole: [u8; 2], board: [u8; 5]) -> f64 {
     (win as f64 + 0.5 * tie as f64) / total as f64
 }
 
-/// Lower-triangular index of a hole pair `{a, b}` over the 52 cards into
-/// `0..1326` (order-independent).
-pub fn combo_index(a: u8, b: u8) -> usize {
-    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
-    (hi as usize) * (hi as usize - 1) / 2 + lo as usize
-}
-
-/// Inverse of [`combo_index`]: the `(lo, hi)` cards (`lo < hi`) for a combo index
-/// in `0..1326`.
-pub fn combo_cards(index: usize) -> [u8; 2] {
-    let mut hi = 1usize;
-    while (hi + 1) * hi / 2 <= index {
-        hi += 1;
-    }
-    let lo = index - hi * (hi - 1) / 2;
-    [lo as u8, hi as u8]
-}
+// The canonical combo bijection (one crate-wide ordering — see `util::combos`
+// for why there must be exactly one); re-exported here because the sweeps
+// below define and consume it.
+pub use crate::util::combos::{combo_cards, combo_index};
 
 /// Exact equity-vs-random for **every** hole combo on a complete `board`, in one
 /// O(n log n) sweep instead of an O(n²) enumeration per hand.
@@ -538,7 +525,7 @@ pub fn board_runout_cfvs(board: [u8; 5], opp_reach: &[f64; 1326], half_pot: f64,
 /// running [`board_equities`] over every runout.  Returned row-major: row
 /// `combo_index(a, b)` is a `bins`-bucket histogram summing to 1 (zeros for
 /// holes that use a board card).  This is the exact, low-noise replacement for
-/// the Monte-Carlo `ehs_histogram_mc` in the offline build.
+/// the Monte-Carlo rollouts the offline build originally used.
 pub fn board_histograms(board: &[u8], bins: usize) -> Vec<f32> {
     assert!((3..=5).contains(&board.len()), "board must have 3–5 cards");
     let mut used = 0u64;
@@ -760,61 +747,6 @@ pub fn ehs_histogram(hole: &[u8; 2], board: &[u8], bins: usize) -> Vec<f64> {
     hist
 }
 
-/// Monte-Carlo equity-distribution histogram for the flop and turn.
-///
-/// Exact [`ehs_histogram`] enumerates every runout — ~10⁶ showdowns per flop
-/// hand — which is too slow to evaluate for every canonical situation.  This
-/// samples `samples` random board completions instead (the showdown at each
-/// completion stays *exact* via [`river_equity`], so only the runout is
-/// approximated), drawing uniform units from `next_unit`.  On a complete board
-/// it defers to the exact histogram, since sampling would add only noise.
-///
-/// The result is the same potential-aware feature the clusterer consumes: a
-/// `bins`-bucket distribution of final equity that sums to 1.
-pub fn ehs_histogram_mc(
-    hole: &[u8; 2],
-    board: &[u8],
-    bins: usize,
-    samples: usize,
-    mut next_unit: impl FnMut() -> f64,
-) -> Vec<f64> {
-    assert!((3..=5).contains(&board.len()), "board must have 3–5 cards");
-    let need = 5 - board.len();
-    if need == 0 {
-        return ehs_histogram(hole, board, bins);
-    }
-
-    let mut used = 0u64;
-    for &c in hole.iter().chain(board.iter()) {
-        used |= 1 << c;
-    }
-    let mut deck: Vec<u8> = (0u8..52).filter(|c| used & (1 << c) == 0).collect();
-    let mut full = [0u8; 5];
-    full[..board.len()].copy_from_slice(board);
-
-    let mut hist = vec![0.0; bins];
-    for _ in 0..samples {
-        // Partial Fisher–Yates over the live deck yields a uniform `need`-subset
-        // each draw, regardless of the deck's running order.
-        let last = deck.len() - 1;
-        for k in 0..need {
-            let span = deck.len() - k;
-            let j = (k + (next_unit() * span as f64) as usize).min(last);
-            deck.swap(k, j);
-            full[board.len() + k] = deck[k];
-        }
-        let e = river_equity(*hole, full);
-        let bin = ((e * bins as f64) as usize).min(bins - 1);
-        hist[bin] += 1.0;
-    }
-    if samples > 0 {
-        for h in &mut hist {
-            *h /= samples as f64;
-        }
-    }
-    hist
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -988,45 +920,6 @@ mod tests {
         let sum: f64 = hist.iter().sum();
         assert!((sum - 1.0).abs() < 1e-9, "histogram should sum to 1, got {sum}");
         assert!(hist.iter().all(|&h| h >= 0.0));
-    }
-
-    /// A tiny deterministic unit source for the MC tests.
-    fn unit_stream(seed: u64) -> impl FnMut() -> f64 {
-        let mut s = seed | 1;
-        move || crate::util::rng::xorshift_next_unit(&mut s)
-    }
-
-    #[test]
-    fn mc_histogram_is_a_distribution_and_defers_on_river() {
-        // Turn board (4 cards): MC samples runouts and still sums to 1.
-        let turn = [make_card(12, 0), make_card(11, 1), make_card(7, 2), make_card(2, 3)];
-        let hole = [make_card(10, 0), make_card(10, 1)];
-        let h = ehs_histogram_mc(&hole, &turn, 20, 500, unit_stream(1));
-        assert_eq!(h.len(), 20);
-        assert!((h.iter().sum::<f64>() - 1.0).abs() < 1e-9);
-
-        // On a complete board MC must defer to the exact histogram exactly.
-        let river = dry_board();
-        let exact = ehs_histogram(&hole, &river, 20);
-        let mc = ehs_histogram_mc(&hole, &river, 20, 500, unit_stream(1));
-        assert_eq!(exact, mc, "river is exact; sampling must not change it");
-    }
-
-    #[test]
-    fn mc_histogram_mean_approximates_exact_ehs() {
-        // The MC histogram's mean equity must track the exact EHS within
-        // sampling error.  A turn board keeps the exact reference cheap (46
-        // runouts) while the MC path samples them.
-        let turn = [make_card(12, 0), make_card(11, 1), make_card(7, 2), make_card(2, 3)];
-        let hole = [make_card(10, 0), make_card(10, 1)];
-        let exact = ehs(&hole, &turn);
-
-        let bins = 50;
-        let h = ehs_histogram_mc(&hole, &turn, bins, 4_000, unit_stream(7));
-        // Bin-centre reconstruction of the mean.
-        let mc_mean: f64 =
-            h.iter().enumerate().map(|(i, &p)| p * (i as f64 + 0.5) / bins as f64).sum();
-        assert!((mc_mean - exact).abs() < 0.03, "MC mean {mc_mean} vs exact EHS {exact}");
     }
 
     // A coordinated, flushy board to exercise ties and flushes in the sweep.

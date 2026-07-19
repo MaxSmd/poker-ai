@@ -149,39 +149,38 @@ impl CapRule {
     }
 }
 
-/// Mirror of `BlueprintHoldem::capped_legal` (private there; the HU data-point
-/// test and the runtime cross-check gate the two staying in lock-step): at/over
-/// the cap drop the sized `Raise`s, but keep `AllIn` — it is absorbing, so it
-/// gives every raise war a terminating node.
+/// The betting-abstraction policy at a node.  The live rule **is**
+/// [`BlueprintHoldem::capped_legal_at`] — the estimator walks the exact policy
+/// the trainer plays, so the two cannot drift.  Only the deliberately frozen
+/// [`CapRule::Legacy`] variant keeps a local filter (it reproduces a historical
+/// behavior the game no longer has).
 fn capped_legal(gs: &GameState, street_raises: u8, raise_cap: u32, rule: CapRule) -> ActionList {
-    let full = legal_actions(gs);
-    if (street_raises as u32) < raise_cap {
-        return full;
-    }
-    let drop_allin = rule == CapRule::Legacy
-        && full.iter().any(|a| matches!(a, Action::Check | Action::Call));
-    let mut buf = [Action::Fold; 8];
-    let mut n = 0;
-    for &a in full.iter() {
-        let drop = matches!(a, Action::Raise(_)) || (matches!(a, Action::AllIn) && drop_allin);
-        if !drop {
-            buf[n] = a;
-            n += 1;
+    match rule {
+        CapRule::AllInAtCap => BlueprintHoldem::capped_legal_at(gs, street_raises, raise_cap),
+        CapRule::Legacy => {
+            let full = legal_actions(gs);
+            if (street_raises as u32) < raise_cap {
+                return full;
+            }
+            let drop_allin = full.iter().any(|a| matches!(a, Action::Check | Action::Call));
+            let mut buf = [Action::Fold; 8];
+            let mut n = 0;
+            for &a in full.iter() {
+                let drop =
+                    matches!(a, Action::Raise(_)) || (matches!(a, Action::AllIn) && drop_allin);
+                if !drop {
+                    buf[n] = a;
+                    n += 1;
+                }
+            }
+            ActionList::from_actions(&buf[..n])
         }
     }
-    ActionList::from_actions(&buf[..n])
 }
 
-/// Mirror of `BlueprintHoldem::next_raises`: reset on a street change, +1 when
-/// the bet level rose, unchanged otherwise.
+/// Street-raise bookkeeping — delegated to the game's own rule.
 fn next_raises(prev: u8, old_street: u8, old_bet: u32, gs: &GameState) -> u8 {
-    if gs.street != old_street {
-        0
-    } else if gs.current_bet > old_bet {
-        prev.saturating_add(1)
-    } else {
-        prev
-    }
+    BlueprintHoldem::next_raises(prev, old_street, old_bet, gs)
 }
 
 struct Walker {

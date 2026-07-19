@@ -29,14 +29,16 @@
 //! server `POKER_AI_CLUSTER_MEM_GB=8 cluster 0` builds all three streets full.
 //!
 //! Usage:
-//!   cluster [cap] [seed]
+//!   cluster [cap] [seed] [flop_k] [turn_k] [river_k] [--data=DIR]
 //!     cap   max canonical boards to process per street; 0 = full  (default 300)
 //!     seed  K-Means++ seed for flop/turn clustering                (default 1)
+//!     *_k   bucket counts per street (defaults 1500/1500/3000)
+//!     --data=DIR  output directory for the caches/maps (default `data/`)
 //!   env:
 //!     POKER_AI_CLUSTER_MEM_GB   per-street flat-cache budget in GB  (default 1.5)
 //!     POKER_AI_RIVER_OCHS       1/true → OCHS river feature (default scalar)
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use rayon::prelude::*;
@@ -131,8 +133,8 @@ fn board_features(
 }
 
 /// Build (a prefix of) a street's flat cache by sweeping canonical boards, then
-/// cluster and persist.
-fn build_street(name: &str, board_round: u8, k: usize, seed: u64, cap: usize) {
+/// cluster and persist into `dir`.
+fn build_street(name: &str, board_round: u8, k: usize, seed: u64, cap: usize, dir: &Path) {
     let river = board_round == 5;
     // River: scalar equity-vs-uniform (1 bin) by default, or the OCHS_K-dim
     // opponent-cluster feature when POKER_AI_RIVER_OCHS is set.
@@ -189,30 +191,38 @@ fn build_street(name: &str, board_round: u8, k: usize, seed: u64, cap: usize) {
 
     let k = k.min(cache.len().max(1));
     let map = BucketMap::from_cache(&cache, k, seed);
-    let dir = Path::new("data");
-    std::fs::create_dir_all(dir).expect("create data/");
+    std::fs::create_dir_all(dir).expect("create data directory");
     cache.save(dir.join(format!("{name}_equity.bin"))).expect("save cache");
-    map.save(dir.join(format!("{name}_buckets.bin"))).expect("save map");
+    let map_path = dir.join(format!("{name}_buckets.bin"));
+    map.save(&map_path).expect("save map");
     println!(
-        "  [{name}] {} buckets over {} situations -> data/{name}_buckets.bin ({:.1}s)\n",
+        "  [{name}] {} buckets over {} situations -> {} ({:.1}s)\n",
         map.num_buckets(),
         map.len(),
+        map_path.display(),
         start.elapsed().as_secs_f64()
     );
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let cap: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(300);
-    let seed: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
+    let dir: PathBuf = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--data="))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("data"));
+    // Positional args are the numeric ones; flags start with `--`.
+    let nums: Vec<&String> = args[1..].iter().filter(|a| !a.starts_with("--")).collect();
+    let cap: usize = nums.first().and_then(|s| s.parse().ok()).unwrap_or(300);
+    let seed: u64 = nums.get(1).and_then(|s| s.parse().ok()).unwrap_or(1);
     // Bucket targets: [flop] [turn] [river], same positional shape as
     // `memory_estimate` so the two tools stay in lockstep — check the
     // footprint there BEFORE spending the build time here.  Defaults bumped
     // from the original 500/500/800 plan minimum: river dominates node count
     // (~78%, Step 18/29 finding) so it gets the largest multiplier.
-    let flop_buckets: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(1500);
-    let turn_buckets: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1500);
-    let river_buckets: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(3000);
+    let flop_buckets: usize = nums.get(2).and_then(|s| s.parse().ok()).unwrap_or(1500);
+    let turn_buckets: usize = nums.get(3).and_then(|s| s.parse().ok()).unwrap_or(1500);
+    let river_buckets: usize = nums.get(4).and_then(|s| s.parse().ok()).unwrap_or(3000);
 
     let cap_str = if cap == 0 { "full".to_string() } else { cap.to_string() };
     println!(
@@ -220,8 +230,8 @@ fn main() {
          mem budget {:.1} GB/street, buckets flop={flop_buckets} turn={turn_buckets} river={river_buckets})",
         mem_budget_bytes() as f64 / 1e9
     );
-    build_street("flop", 3, flop_buckets, seed, cap);
-    build_street("turn", 4, turn_buckets, seed, cap);
-    build_street("river", 5, river_buckets, seed, cap);
+    build_street("flop", 3, flop_buckets, seed, cap, &dir);
+    build_street("turn", 4, turn_buckets, seed, cap, &dir);
+    build_street("river", 5, river_buckets, seed, cap, &dir);
     println!("Done. Load the *_buckets.bin maps into BlueprintHoldem::with_street_bucket.");
 }

@@ -18,7 +18,6 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use super::features::ehs_histogram;
 use super::hand_index::HandIndexer;
 
 /// A flat equity cache: one `bins`-bin histogram per dense canonical index.
@@ -105,35 +104,6 @@ impl EquityCache {
         self.data[i * self.bins..][..self.bins].copy_from_slice(&histogram);
     }
 
-    /// Compute and store the equity histogram for a situation, but only if its
-    /// slot is empty.  Returns `true` if work was done.  The canonical dedup that
-    /// turns O(dealt) into O(canonical).
-    pub fn compute_if_absent(&mut self, hole: &[u8; 2], board: &[u8]) -> bool {
-        let bins = self.bins;
-        self.compute_if_absent_with(hole, board, || {
-            ehs_histogram(hole, board, bins).iter().map(|&x| x as f32).collect()
-        })
-    }
-
-    /// Like [`compute_if_absent`](Self::compute_if_absent) but the histogram is
-    /// produced by `make`, called only on a miss (lets the caller pick the
-    /// feature — MC for flop/turn, exact for river — while keeping the dedup).
-    pub fn compute_if_absent_with(
-        &mut self,
-        hole: &[u8; 2],
-        board: &[u8],
-        make: impl FnOnce() -> Vec<f32>,
-    ) -> bool {
-        let i = self.slot(hole, board);
-        if !self.data[i * self.bins].is_nan() {
-            return false;
-        }
-        let hist = make();
-        debug_assert_eq!(hist.len(), self.bins, "histogram length must match `bins`");
-        self.data[i * self.bins..][..self.bins].copy_from_slice(&hist);
-        true
-    }
-
     /// Iterate `(slot index, histogram)` over the **filled** slots — the input to
     /// clustering.
     pub fn iter(&self) -> impl Iterator<Item = (usize, &[f32])> {
@@ -172,17 +142,16 @@ mod tests {
         let mut cache = EquityCache::new(10, &[2, 3]);
         let hole = [make_card(12, 0), make_card(11, 0)]; // A♠K♠
         let board = [make_card(5, 0), make_card(9, 1), make_card(2, 2)];
+        cache.insert(&hole, &board, vec![0.1; 10]);
 
-        assert!(cache.compute_if_absent(&hole, &board), "first compute does work");
-
-        // The same situation with suits rotated by one is isomorphic.
+        // The same situation with suits rotated by one is isomorphic: it must
+        // land in (and read from) the same canonical slot.
         let rot = |c: u8| make_card(rank_of(c), (suit_of(c) + 1) % 4);
         let hole2 = [rot(hole[0]), rot(hole[1])];
         let board2: Vec<u8> = board.iter().map(|&c| rot(c)).collect();
-        assert!(!cache.compute_if_absent(&hole2, &board2), "isomorphic situation is a cache hit");
 
         assert_eq!(cache.len(), 1, "both situations share one canonical slot");
-        assert!(cache.get(&hole, &board).is_some());
+        assert!(cache.get(&hole2, &board2).is_some(), "isomorphic situation is a cache hit");
         assert_eq!(cache.get(&hole, &board), cache.get(&hole2, &board2));
     }
 

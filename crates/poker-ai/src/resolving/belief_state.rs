@@ -13,30 +13,11 @@
 //! probability by the likelihood that the opponent would take that action with
 //! that hand (read from the blueprint), then renormalize.
 
-/// Number of distinct two-card combinations: `C(52, 2)`.
-pub const NUM_COMBOS: usize = 1326;
-
-/// The `i`-th two-card combination in canonical `(a < b)` order.
-pub fn combo_cards(index: usize) -> [u8; 2] {
-    let mut i = index;
-    for a in 0u8..52 {
-        let span = 51 - a as usize; // number of b > a
-        if i < span {
-            return [a, a + 1 + i as u8];
-        }
-        i -= span;
-    }
-    panic!("combo index {index} out of range 0..{NUM_COMBOS}");
-}
-
-/// Index of the combination `{a, b}` (order-independent) in `0..NUM_COMBOS`.
-pub fn combo_index(c0: u8, c1: u8) -> usize {
-    let (a, b) = if c0 < c1 { (c0, c1) } else { (c1, c0) };
-    // Combos with a smaller first card come first: Σ_{x=0}^{a-1}(51-x) + (b-a-1).
-    let (a, b) = (a as usize, b as usize);
-    let before = a * 51 - a * a.saturating_sub(1) / 2;
-    before + (b - a - 1)
-}
+// The canonical combo bijection (this module once carried its own first-card-
+// major ordering; that duplicate caused the silent misindexing bug recorded in
+// `util::combos` and is gone — `BeliefState.probs` is indexed by the one
+// crate-wide ordering).
+pub use crate::util::combos::{combo_cards, combo_index, NUM_COMBOS};
 
 /// Belief distribution over one opponent's hole cards.
 #[derive(Clone, Debug)]
@@ -127,20 +108,6 @@ impl BeliefState {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn combo_index_and_cards_round_trip() {
-        let mut seen = 0;
-        for a in 0u8..52 {
-            for b in (a + 1)..52 {
-                let i = combo_index(a, b);
-                assert_eq!(combo_cards(i), [a, b], "round trip at ({a},{b})");
-                assert_eq!(combo_index(b, a), i, "order-independent");
-                seen += 1;
-            }
-        }
-        assert_eq!(seen, NUM_COMBOS);
-    }
 
     #[test]
     fn uniform_sums_to_one() {

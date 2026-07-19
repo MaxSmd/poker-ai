@@ -391,7 +391,7 @@ impl Bot {
         }
         let mut mask = vec![1.0; NUM_COMBOS];
         for (i, m) in mask.iter_mut().enumerate() {
-            let [a, b] = crate::resolving::belief_state::combo_cards(i);
+            let [a, b] = combo_cards(i);
             if a == hs.my_hole[0] || a == hs.my_hole[1] || b == hs.my_hole[0] || b == hs.my_hole[1] {
                 *m = 0.0;
             }

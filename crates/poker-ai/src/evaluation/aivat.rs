@@ -24,6 +24,12 @@
 //! values (an approximate baseline behind the same structure) — the estimator
 //! stays unbiased with any baseline; only the variance reduction depends on
 //! baseline quality.  That extension is left for when a real blueprint exists.
+//!
+//! No production path calls this module: it is kept as the **conceptual oracle**
+//! for [`crate::play::luck`], which is exactly this estimator restricted to
+//! chance-node corrections with the check-down value function — the restriction
+//! that makes it computable in a live match.  Read this file to see what the
+//! luck adjustment approximates (and what its skipped terms would add).
 
 use crate::games::Game;
 use crate::solver::best_response::Strategy;

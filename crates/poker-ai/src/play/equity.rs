@@ -11,9 +11,8 @@
 //! war, where the bet faced is large relative to the stacks behind and the
 //! all-in approximation is close.
 //!
-//! Reach vectors here are in `features::combo_index` ordering, NOT
-//! `belief_state`'s — the two are different bijections and [`board_cfvs`]
-//! requires the former.  Conversion goes through [`BeliefState::prob`].
+//! Reach vectors use the crate-wide combo ordering (`util::combos`, shared by
+//! [`board_cfvs`] and [`BeliefState`]).
 
 use poker_core::state::NO_CARD;
 
@@ -136,7 +135,7 @@ mod tests {
         let mut b = BeliefState::uniform();
         let mut mask = vec![1.0; NUM_COMBOS];
         for (i, m) in mask.iter_mut().enumerate() {
-            let [a, c] = crate::resolving::belief_state::combo_cards(i);
+            let [a, c] = combo_cards(i);
             if a == hole[0] || a == hole[1] || c == hole[0] || c == hole[1] {
                 *m = 0.0;
             }
