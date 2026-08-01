@@ -5,7 +5,7 @@ edition = "2021"
 
 [[bin]]
 name = "train"
-path = "src/bin/train.rs"
+path = "src/bin/train/main.rs"
 
 [[bin]]
 name = "benchmark"

@@ -1,0 +1,304 @@
+//! The playing agent: blueprint policy + belief tracking + postflop re-solving.
+//!
+//! Decision architecture (Pluribus-style split, sized to what a single machine
+//! can compute in real time at 200 bb):
+//!
+//! * **Preflop** — play directly from the trained blueprint: translate the real
+//!   hand into the abstract game ([`AbstractHand`]), look up the average
+//!   strategy at the info key, purify + sample.
+//! * **Flop / turn / river** — full-range re-solve of the *actual* public state
+//!   with the vectorized public-tree CFR: the resolve root carries the real pot
+//!   and stacks (off-tree bets included, so translation distortion vanishes
+//!   exactly where the money is deepest), our range and the opponent's range are
+//!   carried Bayes updates of the blueprint (`P(observed abstract action | hand)`
+//!   at every prior decision), and the resolved root distribution is played
+//!   directly in real chips.  A **river** resolve is exact to showdown; a
+//!   **turn** resolve deals the river as an explicit chance node and solves the
+//!   real river betting below it (exact to showdown, no leaf model — the
+//!   default; `turn_full_river = false` falls back to the K-continuation
+//!   check-down cut); a **flop** resolve cuts at the undealt turn with the
+//!   opponent choosing among K continuations at the leaf (finding #1) so the
+//!   resolve is robust to post-leaf betting the check-down ignores.  Turn/flop
+//!   resolves are far costlier than river ones and are opt-in.
+//! * **Continual re-solving** (DeepStack-style, on by default) — every resolve
+//!   extracts the opponent's per-hand counterfactual values under the emitted
+//!   strategy; the next resolve in the same hand is constrained by the CFV
+//!   gadget (per-hand Follow/Terminate), so the opponent cannot profit from our
+//!   strategy being recomputed between decisions.
+//!
+//! Both ranges are maintained per hand; the opponent's is additionally
+//! filtered by card removal (board + our own hole cards).
+
+mod decide;
+#[cfg(test)]
+mod tests;
+
+use crate::games::blueprint::BlueprintHoldem;
+use crate::play::policy::CompactPolicy;
+use crate::play::protocol::{parse_action, Event, Parsed};
+use crate::play::tracker::{AbstractHand, MapOutcome};
+use crate::resolving::belief_state::{combo_cards, BeliefState, NUM_COMBOS};
+
+/// Tunables for the playing agent.
+#[derive(Clone, Debug)]
+pub struct BotConfig {
+    /// Re-solve river decisions (recommended); otherwise blueprint throughout.
+    pub resolve_river: bool,
+    /// Re-solve turn decisions.  Each depth-cut leaf averages 44 river runouts,
+    /// so this is materially slower than a river resolve — off by default.
+    pub resolve_turn: bool,
+    /// Re-solve flop decisions.  Each depth-cut leaf averages C(45,2)=990
+    /// turn+river runouts, an order of magnitude slower again — intended for
+    /// small-sample testing, off by default.
+    pub resolve_flop: bool,
+    /// CFR⁺ iterations per river resolve.
+    pub river_iters: u64,
+    /// CFR⁺ iterations per turn/flop resolve — kept lower than `river_iters`
+    /// because runout leaves make each iteration far costlier.
+    pub turn_iters: u64,
+    /// Raise cap inside a resolve (bounds the public tree; used at every street).
+    pub river_cap: u32,
+    /// Rest-of-hand pot scales for the turn/flop depth-limit continuation choice
+    /// (finding #1): the opponent picks among these at each runout leaf, so the
+    /// resolve is robust to the post-leaf betting a plain check-down ignores.
+    /// `scales[0]` should be `0.0`; `[0.0]` is a single check-down (no chooser).
+    pub continuations: Vec<f64>,
+    /// Turn resolves deal the river as an explicit chance node and solve the
+    /// **real river betting** — exact to showdown, no leaf model at all
+    /// (default).  Off = cut at the reveal with the K-continuation check-down
+    /// leaf (`continuations`), ~48× cheaper per iteration; flop resolves
+    /// always use the continuation cut either way.
+    pub turn_full_river: bool,
+    /// Continual re-solving (DeepStack-style): carry the opponent's
+    /// counterfactual values from each resolve and constrain the next one
+    /// with the CFV gadget, so the opponent cannot profit from our strategy
+    /// being recomputed between decisions.  The hand's first resolve is the
+    /// unconstrained bootstrap.
+    pub continual: bool,
+    /// Purification: drop actions below this probability, renormalize, then
+    /// sample (`0.0` = sample the raw mixed strategy).
+    pub purify: f64,
+    /// Seed for the agent's action sampling and bet-mapping randomization.
+    pub seed: u64,
+}
+
+impl Default for BotConfig {
+    fn default() -> Self {
+        Self {
+            resolve_river: true,
+            resolve_turn: false,
+            resolve_flop: false,
+            river_iters: 1_500,
+            turn_iters: 500,
+            river_cap: 3,
+            continuations: vec![0.0, 0.75, 1.5, 3.0],
+            turn_full_river: true,
+            continual: true,
+            purify: 0.1,
+            seed: 1,
+        }
+    }
+}
+
+/// Per-hand state.
+pub struct HandState {
+    /// Slumbot position (0 = big blind, 1 = small blind).
+    my_pos: u8,
+    /// Engine seat (0 = small blind / button, 1 = big blind) = `1 − my_pos`.
+    my_seat: usize,
+    my_hole: [u8; 2],
+    hand: AbstractHand,
+    /// Blueprint-consistent hand distributions, engine-seat indexed.
+    ranges: [BeliefState; 2],
+    /// Events already consumed from the (cumulative) action string.
+    processed: usize,
+    /// Board cards already applied to the abstract state.
+    board_seen: usize,
+    /// Our next echoed event was already applied at decision time:
+    /// `Some(Some(i))` = applied index `i`; `Some(None)` = deliberately skipped
+    /// (no abstract node existed).  `None` = nothing pending.
+    pending_self: Option<Option<u8>>,
+    /// Continual re-solving: the opponent's per-hand counterfactual values
+    /// extracted from our previous resolve this hand (bb, `features`
+    /// combo order).  The next resolve is gadget-constrained by these, so the
+    /// opponent cannot profit from our strategy being recomputed between
+    /// decisions; refreshed after every resolve.  `None` until the hand's
+    /// first (bootstrap) resolve.
+    carried_cfvs: Option<Box<[f64; NUM_COMBOS]>>,
+}
+
+/// The playing agent. One instance plays many hands (per-hand state lives in
+/// [`HandState`]); it owns the abstract game and the blueprint policy.
+pub struct Bot {
+    game: BlueprintHoldem,
+    policy: CompactPolicy,
+    cfg: BotConfig,
+    rng: u64,
+}
+
+impl Bot {
+    pub fn new(game: BlueprintHoldem, policy: CompactPolicy, cfg: BotConfig) -> Self {
+        let rng = cfg.seed | 1;
+        Self { game, policy, cfg, rng }
+    }
+
+    /// xorshift64* uniform in `[0, 1)`.
+    fn unit(&mut self) -> f64 {
+        self.rng ^= self.rng >> 12;
+        self.rng ^= self.rng << 25;
+        self.rng ^= self.rng >> 27;
+        (self.rng.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// Begin a hand as `client_pos` (Slumbot convention) holding `hole`.
+    pub fn start_hand(&mut self, client_pos: u8, hole: [u8; 2]) -> HandState {
+        let my_seat = 1 - client_pos as usize;
+        let mut ranges = [BeliefState::uniform(), BeliefState::uniform()];
+        // The opponent can never hold our cards — filter them out up front.
+        let mut mask = vec![1.0; NUM_COMBOS];
+        for (i, m) in mask.iter_mut().enumerate() {
+            let [a, b] = combo_cards(i);
+            if a == hole[0] || a == hole[1] || b == hole[0] || b == hole[1] {
+                *m = 0.0;
+            }
+        }
+        ranges[1 - my_seat].update(&mask);
+        HandState {
+            my_pos: client_pos,
+            my_seat,
+            my_hole: hole,
+            hand: AbstractHand::new(&self.game, my_seat, hole),
+            ranges,
+            processed: 0,
+            board_seen: 0,
+            pending_self: None,
+            carried_cfvs: None,
+        }
+    }
+
+    /// Consume the server's cumulative view (`action` string + `board` in
+    /// engine encoding) and produce our next move as a wire increment
+    /// (`"k" | "c" | "f" | "b<N>"`).  Call only when it is our turn.
+    pub fn act(&mut self, hs: &mut HandState, action_str: &str, board: &[u8]) -> Result<String, String> {
+        let parsed = parse_action(action_str)?;
+        self.sync(hs, &parsed, board);
+
+        if parsed.next_pos != hs.my_pos as i8 {
+            return Err(format!(
+                "act() called but next to act is {} (we are {})",
+                parsed.next_pos, hs.my_pos
+            ));
+        }
+
+        let mv = if self.should_resolve(parsed.street, board) {
+            self.decide_resolve(hs, &parsed, board)
+        } else {
+            self.decide_blueprint(hs, &parsed, board)
+        };
+        Ok(mv.to_incr())
+    }
+
+    /// Whether to re-solve this street, given the enabled flags and a board with
+    /// the right number of revealed cards for the street (a defensive guard —
+    /// the resolve root synthesis assumes the board matches the street).
+    fn should_resolve(&self, street: u8, board: &[u8]) -> bool {
+        match street {
+            3 => self.cfg.resolve_river && board.len() == 5,
+            2 => self.cfg.resolve_turn && board.len() == 4,
+            1 => self.cfg.resolve_flop && board.len() == 3,
+            _ => false, // preflop is always blueprint
+        }
+    }
+
+    /// Bring the abstract state, board, and ranges up to date with the
+    /// server's cumulative view (also used at hand end to observe the final
+    /// actions, though ranges then no longer matter).
+    pub fn sync(&mut self, hs: &mut HandState, parsed: &Parsed, board: &[u8]) {
+        if board.len() != hs.board_seen {
+            hs.hand.set_board(&self.game, board, hs.my_seat);
+            hs.board_seen = board.len();
+            // Card removal: hands overlapping the revealed board are dead.
+            // Doing this at every reveal (not just at the river resolve) is
+            // load-bearing — the likelihood loop must never compute a key for
+            // a combo that shares a card with the board.
+            for r in &mut hs.ranges {
+                r.remove_board(board);
+            }
+        }
+        let events: Vec<Event> = parsed.events[hs.processed..].to_vec();
+        for ev in events {
+            hs.processed += 1;
+            self.consume(hs, ev);
+        }
+    }
+
+    /// Fold one observed event into the abstract state and the actor's range.
+    fn consume(&mut self, hs: &mut HandState, ev: Event) {
+        let seat = 1 - ev.pos as usize;
+
+        // Our own echoed action: already applied (or deliberately skipped) at
+        // decision time.
+        if ev.pos == hs.my_pos {
+            if let Some(pending) = hs.pending_self.take() {
+                let _ = pending; // applied (or skipped) when we decided
+                return;
+            }
+        }
+
+        // Desync guard: only translate events the abstract game has a node for.
+        if !hs.hand.expects(&self.game, seat, ev.street) {
+            return;
+        }
+
+        let mut rng = self.rng;
+        let mut unit = || {
+            rng ^= rng >> 12;
+            rng ^= rng << 25;
+            rng ^= rng >> 27;
+            (rng.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mapped = hs.hand.map_real(
+            &self.game,
+            ev.kind,
+            ev.pot_before as f64,
+            ev.bet_before as f64,
+            &mut unit,
+        );
+        self.rng = rng;
+
+        if let MapOutcome::Index(idx) = mapped {
+            self.update_range(hs, seat, idx);
+            hs.hand.apply(&self.game, idx);
+        }
+    }
+
+    /// Bayes update of `seat`'s range from its observed abstract action at the
+    /// *current* (pre-action) abstract node: multiply each hand's probability
+    /// by the blueprint's likelihood of the action with that hand.
+    fn update_range(&self, hs: &mut HandState, seat: usize, action_index: u8) {
+        let n = hs.hand.actions(&self.game).len();
+        // Combos sharing a card with the visible board must never reach the
+        // hand indexer (a duplicated card yields a garbage canonical index).
+        // They carry zero range mass after card removal; this mask is the
+        // defensive second line.
+        let gs = hs.hand.gs(&self.game);
+        let mut board_mask = 0u64;
+        for &c in &gs.board[..gs.board_cards_count()] {
+            board_mask |= 1 << c;
+        }
+        let mut likelihood = vec![1.0; NUM_COMBOS];
+        for (i, l) in likelihood.iter_mut().enumerate() {
+            if hs.ranges[seat].probs[i] <= 0.0 {
+                continue; // dead hand: skip the (costly) key computation
+            }
+            let [a, b] = combo_cards(i);
+            if board_mask & (1 << a) != 0 || board_mask & (1 << b) != 0 {
+                *l = 0.0;
+                continue;
+            }
+            let key = hs.hand.key_with_hole(&self.game, [a, b]);
+            *l = self.policy.probs_or_uniform(key, n)[action_index as usize];
+        }
+        hs.ranges[seat].update(&likelihood);
+    }
+}

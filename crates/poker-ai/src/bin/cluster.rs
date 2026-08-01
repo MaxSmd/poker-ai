@@ -49,6 +49,7 @@ use poker_ai::abstraction::features::{
     board_equities, board_histograms, board_ochs, combo_index, ochs_opponent_clusters, OCHS_K,
 };
 use poker_ai::abstraction::hand_index::HandIndexer;
+use poker_ai::util::cli::validate_flags;
 
 /// Histogram resolution for flop/turn (plan: 50-bin equity histograms).
 const BINS: usize = 50;
@@ -206,6 +207,9 @@ fn build_street(name: &str, board_round: u8, k: usize, seed: u64, cap: usize, di
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // A full build is hours of work; a typo'd flag must fail before it starts.
+    // Positionals: [cap] [seed] [flop_k] [turn_k] [river_k].
+    validate_flags(&args, 1, &["data"], 5);
     let dir: PathBuf = args
         .iter()
         .find_map(|a| a.strip_prefix("--data="))

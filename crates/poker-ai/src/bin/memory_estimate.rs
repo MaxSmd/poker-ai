@@ -49,6 +49,7 @@ use std::time::Instant;
 use poker_ai::abstraction::bucket_map::BucketMap;
 use poker_ai::games::blueprint::BlueprintHoldem;
 use poker_ai::games::IndexedGame;
+use poker_ai::util::cli::validate_flags;
 use poker_core::action::{Action, ActionList};
 use poker_core::legal_actions;
 use poker_core::state::{GameState, MAX_PLAYERS, NO_CARD};
@@ -333,6 +334,10 @@ fn cross_check_hu(dir: &Path, limit: usize, rule: CapRule) {
 }
 
 fn main() {
+    // No flags here — everything is positional bucket counts or an env var, so
+    // anything flag-shaped is a mistake (likely meant for `train`/`cluster`).
+    let argv: Vec<String> = std::env::args().collect();
+    validate_flags(&argv, 1, &[], 3);
     let args: Vec<u64> = std::env::args().skip(1).filter_map(|a| a.parse().ok()).collect();
     let buckets = [
         169u64,

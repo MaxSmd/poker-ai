@@ -47,6 +47,7 @@ use poker_ai::play::luck::luck_adjustment;
 use poker_ai::play::protocol::{parse_action, BIG_BLIND};
 use poker_ai::play::slumbot::SlumbotClient;
 use poker_ai::play::{Bot, BotConfig, CompactPolicy};
+use poker_ai::util::cli::validate_flags;
 use poker_core::action::Action;
 use poker_core::make_card;
 use poker_core::state::NO_CARD;
@@ -58,29 +59,14 @@ fn flag<T: std::str::FromStr>(args: &[String], name: &str) -> Option<T> {
     args.iter().find_map(|a| a.strip_prefix(&format!("--{name}="))).and_then(|v| v.parse().ok())
 }
 
-/// Reject unknown flags and stray positionals.  Every flag here takes its value
-/// with `=`, so a bare `--log-hands out.jsonl` would otherwise drop the path on
-/// the floor and log somewhere else entirely.
+/// Reject unknown flags and stray positionals (shared with the other binaries),
+/// plus the one value-bearing flag that would silently misbehave: a bare
+/// `--log-hands out.jsonl` drops the path on the floor and logs elsewhere.
 fn validate(args: &[String], allowed: &[&str], positionals: usize) {
-    let mut seen_positional = 0;
-    for a in &args[2..] {
-        let Some(body) = a.strip_prefix("--") else {
-            seen_positional += 1;
-            if seen_positional > positionals {
-                eprintln!("unexpected argument `{a}` (flags take their value as --name=value)");
-                std::process::exit(2);
-            }
-            continue;
-        };
-        let name = body.split('=').next().unwrap_or("");
-        if !allowed.contains(&name) {
-            eprintln!("unknown flag `--{name}`; expected one of: {}", allowed.join(", "));
-            std::process::exit(2);
-        }
-        if name == "log-hands" && !body.contains('=') {
-            eprintln!("--log-hands needs a path: --log-hands=data/hands.jsonl");
-            std::process::exit(2);
-        }
+    validate_flags(args, 2, allowed, positionals);
+    if args.iter().any(|a| a == "--log-hands") {
+        eprintln!("--log-hands needs a path: --log-hands=data/hands.jsonl");
+        std::process::exit(2);
     }
 }
 
