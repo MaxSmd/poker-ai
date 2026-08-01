@@ -27,7 +27,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use super::cfr::Variant;
+use crate::solver::variant::Variant;
 use super::pruning::PruningConfig;
 
 use crate::games::Game;

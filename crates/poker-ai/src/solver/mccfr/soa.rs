@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use super::parallel::{record_baseline, record_strategy_delta, record_traverser_delta, splitmix, Delta};
 use super::BASELINE_RATE;
 use crate::games::{CursorGame, IndexedGame};
-use crate::solver::cfr::Variant;
+use crate::solver::variant::Variant;
 use crate::solver::lean_table::LeanTable;
 use crate::solver::regret_table::{RegretStore, RegretTable};
 use crate::util::rng::{sample_index, xorshift_next_unit};
@@ -186,7 +186,7 @@ impl<G: IndexedGame, S: RegretStore> SoaMccfr<G, S> {
 // store is serial-only until it earns those (benchmark first).
 impl<G: IndexedGame> SoaMccfr<G, RegretTable> {
     /// Lock-free atomic training over `threads` OS threads — the many-core
-    /// path (see [`super::atomic`] for the design and what it trades away).
+    /// path (see `super::atomic` for the design and what it trades away).
     /// Workers claim iteration numbers from a shared counter and CAS directly
     /// into the flat table: no batches, no merge, near-linear scaling.
     /// **Not bit-deterministic across runs** (thread interleaving changes
@@ -213,7 +213,7 @@ impl<G: IndexedGame> SoaMccfr<G, RegretTable> {
         self.iterations += iters;
     }
 
-    /// Mini-batch parallel training (mirrors [`Mccfr::train_parallel_fast`]),
+    /// Mini-batch parallel training (mirrors [`train_parallel_fast`](super::Mccfr::train_parallel_fast)),
     /// merging index-keyed deltas — including the baseline — in iteration order.
     pub fn train_parallel(&mut self, total_iters: u64, batch: u64)
     where

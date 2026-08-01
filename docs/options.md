@@ -16,12 +16,12 @@ blueprint; switch to the lean store only when RAM is the binding constraint.**
 
 | Solver | Use when | Benefits | Drawbacks |
 |---|---|---|---|
-| `solver::cfr::Cfr` (full traversal) | Toy/validation games with enumerable chance (Kuhn, Leduc, curated-deal NLHE) | Exact, zero variance — the correctness oracle every sampled result is validated against | Visits the whole tree every iteration; intractable beyond toy games |
+| `validation::solver::full_cfr::Cfr` (full traversal) | Toy/validation games with enumerable chance (Kuhn, Leduc, curated-deal NLHE) | Exact, zero variance — the correctness oracle every sampled result is validated against | Visits the whole tree every iteration; intractable beyond toy games |
 | `solver::mccfr::Mccfr` (external-sampling, HashMap store) | Sampled games without a dense index: uncapped betting trees, partial-coverage abstractions, quick experiments | No precomputed layout needed (mints keys on first visit); carries every refinement (baseline / optimistic / RBP) | ~350 B per info set (5 heap `Vec`s per node) — ~15× the SoA store; HashMap lookups on the hot path |
 | `solver::mccfr::SoaMccfr` (flat store) | Production blueprint training on an `IndexedGame` (finite raise cap + full-coverage bucket maps) | 32 B/info set for 2 actions (f32 regrets/baselines, **f64 strategy sums** — exact averaging past 10^15 visits); array indexing instead of hashing; checkpoint = contiguous arrays; the only path with atomic training | Requires the dense index up front (full-coverage abstraction); no optimistic/RBP (inert on the games it targets) |
 | `solver::mccfr::LeanMccfr` (quantized store) | RAM-bound runs only (deep-stack 6-max, very fine abstractions) | **2.7× fewer accumulator bytes** (12 vs 32 B/info set for 2 actions) at equal wall time and equal convergence **[measured: push/fold 1M iters — lean −0.006 bb vs f32 0.051 bb exploitability]** | Must pair with `Discount::LINEAR` (see §2); serial-only so far (no parallel/atomic path); fixed-point ranges sized for bb-scale utilities |
-| `solver::predictive::PredictiveSolver` (CFR+) | Subgame re-solving under a per-decision time budget | Strong **last-iterate** (the deployable output in a 2–5 s resolve) **[measured: Leduc 2k iters — CFR+ last-iterate 0.007 beats vanilla average 0.011; subgame @2k: 0.0055 vs DCFR 0.0294 bb]** | Full-traversal only (subgames are small enough); alternating updates required — simultaneous RM+ converges far worse |
-| `solver::best_response` | Measuring, not training | Exact exploitability (NashConv/2) on enumerable games | Enumerable chance only; use `evaluation::local_br` otherwise |
+| `validation::solver::predictive::PredictiveSolver` (CFR+) | Subgame re-solving under a per-decision time budget | Strong **last-iterate** (the deployable output in a 2–5 s resolve) **[measured: Leduc 2k iters — CFR+ last-iterate 0.007 beats vanilla average 0.011; subgame @2k: 0.0055 vs DCFR 0.0294 bb]** | Full-traversal only (subgames are small enough); alternating updates required — simultaneous RM+ converges far worse |
+| `validation::solver::best_response` | Measuring, not training | Exact exploitability (NashConv/2) on enumerable games | Enumerable chance only; use `validation::evaluation::local_br` otherwise |
 
 ## 2. Discount schedules (`Variant` / `Discount`)
 
@@ -62,8 +62,8 @@ differ by the same Monte-Carlo noise, ~0.05 mean at 1M iterations).
 
 | Game | Role |
 |---|---|
-| `games::kuhn` / `games::leduc` | Known-solution gates (value −1/18; 288 info sets, −0.0856) — every solver feature must converge here first |
-| `games::nlhe` (curated 4-deal HU) | Proves solver-over-real-engine wiring with enumerable chance |
+| `validation::games::kuhn` / `validation::games::leduc` | Known-solution gates (value −1/18; 288 info sets, −0.0856) — every solver feature must converge here first |
+| `validation::games::nlhe` (curated 4-deal HU) | Proves solver-over-real-engine wiring with enumerable chance |
 | `games::push_fold` | First *converging* real-mechanics blueprint (338 info sets, known Nash shove charts) — the standing benchmark game for store/path experiments |
 | `games::blueprint::BlueprintHoldem` | The real target: sampled deals, per-street card buckets, raise-capped betting, optional dense indexing |
 
@@ -123,7 +123,7 @@ resets the magnitude.
 | `with_warm_start` (blueprint-seeded regrets) | Every resolve | Enormous head start **[measured: 3 iters — cold 3.27 bb vs warm 0.0048 bb]** | Warm-start `scale` must track pot size or it washes out |
 | `CheckdownLeafEval` | Local testing; fallback | Exact all-in-equity leaves, no artifacts needed | Assumes check-down — blind to future betting leverage |
 | `MultiContinuationLeaf` (K=4 pot-scale continuations) | Depth-limited resolves | The depth-limited-solving fix: opponent picks among K continuations **[measured: K-aware resolve 0.003 bb vs 1.31 bb exploitable in the K=4 game — ~400×]** | Constructed continuations, not blueprint-derived (a blueprint-value-table backend was tried and dropped: those values don't factorize inside vectorized CFR — production instead deals the river as explicit chance, §9b) |
-| `resolving::gadget` + `continual` (CFV re-solving) | Multi-street play | Provable safety (opponent held to carried CFVs); warm re-entry **[measured: ~2× fewer iters from a coarse carry, up to ~1000× on re-entry]** | Explicit-deal enumeration — fine for narrowed ranges |
+| `validation::resolving::gadget` + `continual` (CFV re-solving) | Multi-street play | Provable safety (opponent held to carried CFVs); warm re-entry **[measured: ~2× fewer iters from a coarse carry, up to ~1000× on re-entry]** | Explicit-deal enumeration — fine for narrowed ranges |
 | `resolving::vector_cfr` | Full-range (1326×1326) river resolves | Public-tree vectorization **[measured: ~1.1M-deal equivalent in ~1.3 s; agrees with the explicit oracle to 0.0001 bb]** | Complete-board subgames only; depth-limit leaves panic rather than mis-score |
 
 ## 9b. Live play (`play slumbot`, `src/play/`)
@@ -147,10 +147,10 @@ resets the magnitude.
 |---|---|---|
 | `best_response::exploitability` | Enumerable games — the exact gate | Doesn't exist for sampled games |
 | `evaluation::exploitability::push_fold_exploitability` | Push/fold benchmarks | Decoupled estimator (removes max-over-noise bias); reads slightly negative within noise near Nash |
-| `evaluation::local_br` (sampled BR) | Non-enumerable games `vector_br` can't drive (it is `BlueprintHoldem`-specific) — e.g. future multiway | Lower bound; needs large sample counts to be meaningful (its in-loop `--expl` trainer flag was removed for exactly that reason); commit argmax per *info set*, never per node (clairvoyance trap) |
+| `validation::evaluation::local_br` (sampled BR) | Non-enumerable games `vector_br` can't drive (it is `BlueprintHoldem`-specific) — e.g. future multiway | Lower bound; needs large sample counts to be meaningful (its in-loop `--expl` trainer flag was removed for exactly that reason); commit argmax per *info set*, never per node (clairvoyance trap) |
 | `evaluation::vector_br` (`play expl`) | **The blueprint quality metric**: abstract-game BR — betting/ranges exact, flops + turn/river Monte-Carlo (`--board-samples`, default 2). Exact turn/river enumeration (`--board-samples=0`) is refused above 6 bb: the deep tree × 48 × 44 runouts does not finish | Sampling makes the BR-max mildly upward-biased; use a fixed seed so old-vs-new A/Bs share the bias. Abstract-game number, not full-NLHE exploitability |
 | `play::luck` (luck-adjusted scoring, always on in `play slumbot`) | Match A/Bs | Unbiased AIVAT-style chance correction; adjusted bb/100 CIs shrink with pot-swing luck removed |
-| `evaluation::aivat` | Conceptual oracle for `play::luck` (validated on enumerable games) | ~3× tighter stderr **[measured on Leduc: 0.0080 vs 0.0247]**, unbiased |
+| `validation::evaluation::aivat` | Conceptual oracle for `play::luck` (validated on enumerable games) | ~3× tighter stderr **[measured on Leduc: 0.0080 vs 0.0247]**, unbiased |
 
 ## 11. CLI & environment quick reference
 

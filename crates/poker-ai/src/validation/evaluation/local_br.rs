@@ -1,7 +1,7 @@
 //! Sampled best response — exploitability for games whose chance space is too
 //! large to enumerate (Lisý & Bowling, the LBR family).
 //!
-//! Exact best response ([`crate::solver::best_response`]) enumerates the whole
+//! Exact best response ([`crate::validation::solver::best_response`]) enumerates the whole
 //! tree, including every deal — impossible once chance is a full 52-card deal.
 //! This estimator samples chance but is careful about the subtlety that makes
 //! best response under imperfect information non-trivial: the responder must
@@ -183,9 +183,10 @@ pub fn sampled_exploitability<G: Game>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::games::leduc::Leduc;
-    use crate::solver::best_response::exploitability as exact_exploitability;
-    use crate::solver::cfr::{Cfr, Variant};
+    use crate::validation::games::leduc::Leduc;
+    use crate::validation::solver::best_response::exploitability as exact_exploitability;
+    use crate::solver::variant::Variant;
+use crate::validation::solver::full_cfr::Cfr;
     use crate::solver::dcfr::Discount;
 
     #[test]

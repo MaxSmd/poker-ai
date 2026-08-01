@@ -29,7 +29,7 @@
 //! The seed is only meaningful if the blueprint is expressed over the *same*
 //! information sets the subgame exposes (same `info_key`).  In the full system
 //! the subgame is built to match the blueprint's abstraction, so this holds by
-//! construction; [`crate::solver::predictive::PredictiveSolver::warm_start`]
+//! construction; [`crate::validation::solver::predictive::PredictiveSolver::warm_start`]
 //! defensively ignores any key whose action count disagrees.
 
 use std::collections::HashMap;
@@ -42,7 +42,7 @@ pub const DEFAULT_SCALE: f64 = 1.0;
 /// warm-start regrets for a predictive subgame solver: `Z(a) = π(a) · scale`.
 ///
 /// Pass the result to
-/// [`PredictiveSolver::warm_start`](crate::solver::predictive::PredictiveSolver::warm_start)
+/// [`PredictiveSolver::warm_start`](crate::validation::solver::predictive::PredictiveSolver::warm_start)
 /// before training.
 pub fn warm_start_regrets(
     blueprint: &HashMap<u64, Vec<f64>>,

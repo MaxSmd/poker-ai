@@ -1,11 +1,11 @@
 //! Sampled, card-abstracted heads-up NLHE — the real blueprint target.
 //!
-//! The curated-deal bridge ([`super::nlhe`]) proved the wiring by enumerating a
+//! The curated-deal bridge ([`crate::validation::games::nlhe`]) proved the wiring by enumerating a
 //! handful of concrete deals.  A blueprint cannot enumerate: the chance space is
 //! every hole-card and board combination, ~10^9 deals before the betting tree
 //! even begins.  This module closes the two gaps the bridge left open:
 //!
-//!  1. **Sampled chance.**  [`Game::sample_chance`] deals a fresh random board
+//!  1. **Sampled chance.**  [`Game::sample_chance`](crate::games::Game::sample_chance) deals a fresh random board
 //!     and both hands by partial Fisher–Yates over a 52-card deck, so the
 //!     solver never materializes the outcome list.  [`is_chance_enumerable`]
 //!     returns `false`, which routes external-sampling MCCFR onto that path
@@ -20,7 +20,7 @@
 //!     with no loaded abstraction falls back to its suit-canonical key (correct,
 //!     just unabstracted).
 //!
-//! [`is_chance_enumerable`]: Game::is_chance_enumerable
+//! [`is_chance_enumerable`]: crate::games::Game::is_chance_enumerable
 
 mod indexing;
 mod keys;
@@ -140,7 +140,7 @@ impl BlueprintHoldem {
         self
     }
 
-    /// Build the dense info-set [`Indexing`] so the game can drive the flat SoA
+    /// Build the dense info-set `Indexing` so the game can drive the flat SoA
     /// regret store ([`crate::games::IndexedGame`] / [`crate::solver::mccfr::SoaMccfr`])
     /// — the ~10×-smaller blueprint store the memory budget assumes (finding #4).
     ///
@@ -241,7 +241,7 @@ impl BlueprintHoldem {
     /// Construct a play node from concrete cards: both hole pairs plus the
     /// board known so far (`NO_CARD` for unrevealed cards), with no action
     /// history.  The entry point for play-time tracking of a real hand; advance
-    /// it with [`Game::apply`] using indices into [`actions`](Self::actions).
+    /// it with [`Game::apply`](crate::games::Game::apply) using indices into [`actions`](Self::actions).
     pub fn play_state(&self, holes: [[u8; 2]; 2], board: [u8; 5]) -> BlueprintState {
         let mut all = [[NO_CARD; 2]; MAX_PLAYERS];
         all[0] = holes[0];
@@ -252,7 +252,7 @@ impl BlueprintHoldem {
     }
 
     /// The capped legal actions at a play node — the very list whose indices
-    /// [`Game::apply`] takes and the info-key history records.
+    /// [`Game::apply`](crate::games::Game::apply) takes and the info-key history records.
     pub fn actions(&self, state: &BlueprintState) -> ActionList {
         let gs = state.gs.as_ref().expect("actions at a play node");
         self.capped_legal(gs, state.street_raises)

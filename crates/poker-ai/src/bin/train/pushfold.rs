@@ -10,7 +10,7 @@ use std::time::Instant;
 use poker_ai::abstraction::canonical::preflop_index;
 use poker_ai::evaluation::exploitability::push_fold_exploitability;
 use poker_ai::games::push_fold::PushFoldHoldem;
-use poker_ai::solver::cfr::Variant;
+use poker_ai::solver::variant::Variant;
 use poker_ai::solver::dcfr::Discount;
 use poker_ai::solver::mccfr::{Mccfr, SoaMccfr};
 

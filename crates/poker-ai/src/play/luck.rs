@@ -2,7 +2,7 @@
 //! (Burch et al. 2018, restricted to chance events) computed per hand once
 //! both hole cards are known (Slumbot reveals its cards after every hand).
 //! The full estimator (chance + evaluated-player corrections, exact baseline)
-//! lives in [`crate::evaluation::aivat`], validated on the enumerable games;
+//! lives in [`crate::validation::evaluation::aivat`], validated on the enumerable games;
 //! this module is its live-match restriction — see there for the derivation.
 //!
 //! At each board reveal the pot is fixed and the reveal is uniform over the

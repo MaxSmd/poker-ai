@@ -31,10 +31,10 @@ use poker_core::state::{GameState, NO_CARD};
 use crate::abstraction::features::combo_index;
 use crate::games::Game;
 use crate::resolving::belief_state::BeliefState;
-use crate::resolving::cfv::node_value;
-use crate::resolving::leaf_eval::LeafEvaluator;
-use crate::resolving::subgame::{Subgame, SubgameNode};
-use crate::solver::predictive::PredictiveSolver;
+use crate::validation::resolving::cfv::node_value;
+use crate::validation::resolving::leaf_eval::LeafEvaluator;
+use crate::validation::resolving::subgame::{Subgame, SubgameNode};
+use crate::validation::solver::predictive::PredictiveSolver;
 use crate::util::hash::fnv1a;
 
 /// Opponent gadget action: enter the subgame.
@@ -290,7 +290,7 @@ pub struct ReSolved {
 }
 
 /// Gadget-constrained subgame solver — the safe re-solving entry point, mirroring
-/// [`crate::resolving::subgame::SubgameSolver`] but constrained by carried CFVs.
+/// [`crate::validation::resolving::subgame::SubgameSolver`] but constrained by carried CFVs.
 #[derive(Default)]
 pub struct ReSolver {
     warm_start: Option<HashMap<u64, Vec<f64>>>,
@@ -302,7 +302,7 @@ impl ReSolver {
     }
 
     /// Warm-start the (predictive) solver's regrets — typically the previous
-    /// resolve's strategy converted via [`crate::resolving::warm_start`].
+    /// resolve's strategy converted via [`crate::validation::resolving::warm_start`].
     pub fn with_warm_start(mut self, seed_regrets: HashMap<u64, Vec<f64>>) -> Self {
         self.warm_start = Some(seed_regrets);
         self
@@ -335,10 +335,10 @@ impl ReSolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resolving::leaf_eval::CheckdownLeafEval;
-    use crate::resolving::cfv::opponent_cfvs;
-    use crate::resolving::subgame::{Subgame, SubgameSolver};
-    use crate::solver::best_response::exploitability;
+    use crate::validation::resolving::leaf_eval::CheckdownLeafEval;
+    use crate::validation::resolving::cfv::opponent_cfvs;
+    use crate::validation::resolving::subgame::{Subgame, SubgameSolver};
+    use crate::validation::solver::best_response::exploitability;
     use poker_core::action::Action;
     use poker_core::legal_actions;
     use poker_core::make_card;

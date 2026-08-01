@@ -66,7 +66,7 @@ impl BlueprintHoldem {
     }
 
     /// Fold an already-computed card `bucket` into the info key — the hashing
-    /// kernel of [`key_for_cards`](Self::key_for_cards), public so bulk walkers
+    /// kernel of `key_for_cards`, public so bulk walkers
     /// (`evaluation::vector_br`) can hoist the per-hand bucket computation out
     /// of the per-node loop and still land on identical blueprint keys.
     pub fn key_from_bucket(&self, player: usize, visible: usize, bucket: u64, history: &[u8]) -> u64 {

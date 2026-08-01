@@ -24,7 +24,7 @@ Storage is a flat structure-of-arrays of `f32` (arithmetic in `f64`). The
 `poker-core` engine pre-deals board cards, which also supports public chance
 sampling.
 
-**Subgame resolver** (`solver/predictive.rs`): full-traversal **CFR⁺ / RM⁺**
+**Subgame resolver** (`validation/solver/predictive.rs`): full-traversal **CFR⁺ / RM⁺**
 last-iterate, used for depth-limited real-time re-solving where the near-2p0s
 regime makes it converge fastest per second. Falls back to DCFR for multiway
 subgames.
@@ -36,5 +36,7 @@ subgames.
 3. Heads-up NLHE
 4. 6-player NLHE blueprint
 
-The same full-traversal `solver/cfr.rs` core is the correctness oracle that
-validates Kuhn/Leduc before the sampled variants are layered on.
+The same full-traversal `validation/solver/full_cfr.rs` core is the correctness
+oracle that validates Kuhn/Leduc before the sampled variants are layered on.
+Everything under `validation/` is oracle code and never links into a shipped
+binary; see the README's production-vs-validation section.

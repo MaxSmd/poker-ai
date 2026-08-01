@@ -23,17 +23,8 @@
 
 use std::collections::HashMap;
 
-use super::dcfr::Discount;
 use crate::games::Game;
-
-/// Which regret-update regime the solver uses.
-#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
-pub enum Variant {
-    /// Undiscounted textbook CFR.
-    Vanilla,
-    /// Discounted CFR with the given `(α, β, γ)` schedule.
-    Dcfr(Discount),
-}
+use crate::solver::variant::Variant;
 
 /// Per-information-set accumulators.
 #[derive(Clone, Debug)]

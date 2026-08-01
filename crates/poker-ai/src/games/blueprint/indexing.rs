@@ -23,7 +23,7 @@ use crate::util::hash::Fnv1a;
 /// reach, and a dense info-set index is simply `sequence_offset + card_bucket`,
 /// where the card bucket ranges over `0..buckets_for(street)`.  This partitions
 /// information sets **identically** to the `HashMap` key
-/// [`info_key_for`](BlueprintHoldem::info_key_for) (which keys on
+/// `info_key_for` (which keys on
 /// `player + visible + bucket + history`, and player/visible are themselves pure
 /// functions of the history) — proven by `indexed_partition_matches_info_key`.
 pub(super) struct Indexing {
@@ -151,7 +151,7 @@ impl BlueprintHoldem {
     /// Reconstruct the `HashMap` info key for a dense index, so an SoA-trained
     /// strategy exports to the **same** `HashMap<u64, _>` artifact as the
     /// `HashMap`-solver path (identical bytes — see
-    /// [`info_key_for`](BlueprintHoldem::info_key_for)).
+    /// `info_key_for`).
     pub fn info_key_at(&self, index: usize) -> u64 {
         let idx = self.indexing();
         // The node owning this index is the last whose block starts at/below it.

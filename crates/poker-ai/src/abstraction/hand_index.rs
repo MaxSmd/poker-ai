@@ -22,7 +22,7 @@
 //!  * **Suits are rank-independent.**  Each suit's cards occupy ranks `0..13`
 //!    with no cross-suit conflict (same rank in two suits = two distinct cards),
 //!    so a suit's "rank pattern" — which ranks it holds in each round — is ranked
-//!    on its own with the [combinatorial number system](colex), giving a
+//!    on its own with the combinatorial number system (colex), giving a
 //!    `suit_index` in `0..suit_size`.
 //!  * **Only the multiset of suit patterns matters.**  Relabeling suits permutes
 //!    them, so the canonical form sorts the suits.  Suits are grouped by their

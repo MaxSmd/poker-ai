@@ -1,7 +1,7 @@
 //! Info-key construction for the vectorized solver.
 //!
 //! The emitted keys must be **byte-identical** to the explicit-deal
-//! [`Subgame::info_key`](crate::resolving::subgame), because that oracle scores
+//! [`Subgame::info_key`](crate::validation::resolving::subgame), because that oracle scores
 //! this solver's output — so the hashing lives in one place, here.
 
 use poker_core::state::NO_CARD;
@@ -13,7 +13,7 @@ pub(super) const MARKER_NONE: u8 = 0;
 pub(super) const MARKER_CONTINUATION: u8 = 0xFE;
 pub(super) const MARKER_GADGET: u8 = 0xA6;
 
-/// The key under which [`VectorResolved::strategy`] stores a hand's
+/// The key under which [`VectorResolved::strategy`](super::VectorResolved::strategy) stores a hand's
 /// distribution (the explicit `Subgame::info_key`).  `hole` must be sorted
 /// ascending; `history` is the action-index path from the resolve root
 /// (empty at the root itself).  Betting nodes only — continuation-choice nodes
@@ -22,7 +22,7 @@ pub fn subgame_info_key(player: usize, hole: [u8; 2], board: &[u8; 5], history: 
     info_key(player, hole, board, history, MARKER_NONE)
 }
 
-/// Reproduce [`Subgame::info_key`](crate::resolving::subgame): FNV-1a of
+/// Reproduce [`Subgame::info_key`](crate::validation::resolving::subgame): FNV-1a of
 /// `player`, the (sorted) hole, the visible board, a separator, then the action
 /// history.  `combo_cards` already returns `a < b`, matching the sort there.
 /// A nonzero `marker` byte is appended so a depth-limit continuation choice

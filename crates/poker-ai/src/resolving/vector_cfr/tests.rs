@@ -6,9 +6,9 @@
 use super::keys::MARKER_CONTINUATION;
 use super::node::{valid_reach, NodeKind};
 use super::*;
-use crate::resolving::leaf_eval::CheckdownLeafEval;
-use crate::resolving::subgame::Subgame;
-use crate::solver::best_response::{best_response_value, exploitability, profile_value};
+use crate::validation::resolving::leaf_eval::CheckdownLeafEval;
+use crate::validation::resolving::subgame::Subgame;
+use crate::validation::solver::best_response::{best_response_value, exploitability, profile_value};
 use poker_core::action::Action;
 use poker_core::make_card;
 use poker_core::state::MAX_PLAYERS;
@@ -169,7 +169,7 @@ fn vectorized_multi_continuation_is_more_robust_than_single() {
     // check-down.  This is the depth-limited-solving headline, and it also
     // proves the vectorized chooser nodes key-match the oracle's (else the K=4
     // resolve's continuation policy would be ignored and buy nothing).
-    use crate::resolving::leaf_eval::MultiContinuationLeaf;
+    use crate::validation::resolving::leaf_eval::MultiContinuationLeaf;
     let beliefs = duel_ranges();
     let scales = vec![0.0, 0.75, 1.5, 3.0]; // == MultiContinuationLeaf default
     let root = || public_root_at(turn_board(), 20, 2);

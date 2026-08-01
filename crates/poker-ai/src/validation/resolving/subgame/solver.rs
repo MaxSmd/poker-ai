@@ -14,9 +14,10 @@ use poker_core::state::GameState;
 
 use super::Subgame;
 use crate::resolving::belief_state::BeliefState;
-use crate::resolving::leaf_eval::LeafEvaluator;
-use crate::solver::cfr::{Cfr, Variant};
-use crate::solver::predictive::PredictiveSolver;
+use crate::validation::resolving::leaf_eval::LeafEvaluator;
+use crate::solver::variant::Variant;
+use crate::validation::solver::full_cfr::Cfr;
+use crate::validation::solver::predictive::PredictiveSolver;
 
 /// Resolved subgame output.
 pub struct Resolved {
@@ -55,7 +56,7 @@ pub struct SubgameSolver {
     /// Regret minimizer used to resolve.
     pub kind: SolverKind,
     /// Optional blueprint warm-start (predictive only): seed regrets so the first
-    /// iterate is the blueprint instead of uniform.  See [`crate::resolving::warm_start`].
+    /// iterate is the blueprint instead of uniform.  See [`crate::validation::resolving::warm_start`].
     warm_start: Option<HashMap<u64, Vec<f64>>>,
 }
 

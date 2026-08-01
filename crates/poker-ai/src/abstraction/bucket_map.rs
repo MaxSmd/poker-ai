@@ -9,7 +9,7 @@
 //!
 //! It is produced by clustering the filled [`EquityCache`] slots
 //! ([`super::clustering`]).  Unfilled slots (a partial/prefix build) carry the
-//! [`UNASSIGNED`] sentinel, so [`bucket`](BucketMap::bucket) returns `None` there.
+//! `UNASSIGNED` sentinel, so [`bucket`](BucketMap::bucket) returns `None` there.
 
 use std::io;
 use std::path::Path;

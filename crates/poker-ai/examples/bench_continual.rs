@@ -19,12 +19,12 @@
 use std::time::Instant;
 
 use poker_ai::resolving::belief_state::BeliefState;
-use poker_ai::resolving::cfv::opponent_cfvs;
-use poker_ai::resolving::gadget::{GadgetGame, ReSolver};
-use poker_ai::resolving::leaf_eval::CheckdownLeafEval;
-use poker_ai::resolving::subgame::{Subgame, SubgameSolver};
-use poker_ai::resolving::warm_start::{warm_start_regrets, DEFAULT_SCALE};
-use poker_ai::solver::best_response::best_response_value;
+use poker_ai::validation::resolving::cfv::opponent_cfvs;
+use poker_ai::validation::resolving::gadget::{GadgetGame, ReSolver};
+use poker_ai::validation::resolving::leaf_eval::CheckdownLeafEval;
+use poker_ai::validation::resolving::subgame::{Subgame, SubgameSolver};
+use poker_ai::validation::resolving::warm_start::{warm_start_regrets, DEFAULT_SCALE};
+use poker_ai::validation::solver::best_response::best_response_value;
 use poker_core::action::Action;
 use poker_core::legal_actions;
 use poker_core::make_card;

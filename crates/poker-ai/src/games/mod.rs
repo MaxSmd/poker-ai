@@ -1,21 +1,22 @@
-//! Small, exactly-solvable extensive-form games used to validate the solver.
+//! The game-tree interface, and the production games behind it.
 //!
-//! The validation protocol is explicit: the blueprint solver
-//! must be proven correct on games with known equilibria — Kuhn and Leduc —
-//! *before* it is trusted on full No-Limit Hold'em.  A bug in a sampled 6-max
-//! MCCFR loop manifests as "convergence is weird", not a crash, so the only way
-//! to trust the solver is to first watch it reproduce a known exact solution.
+//! Every solver in this crate is generic over these traits, so the same code
+//! that trains the shipped blueprint is the code proven correct on the toy
+//! games in [`crate::validation::games`].  That shared abstraction is the point:
+//! validation transfers only because nothing about the solver changes between
+//! them.
 //!
-//! These games live behind the [`Game`] trait so that the *same* CFR and
-//! best-response code that validates here is the code that later drives the
-//! real game tree.  They are validation fixtures, not part of the production
-//! NLHE path, which is why they sit in their own module rather than under
-//! `abstraction` or `solver`.
+//! * [`blueprint::BlueprintHoldem`] — abstracted heads-up NLHE; what the
+//!   blueprint is trained on.
+//! * [`push_fold::PushFoldHoldem`] — the no-postflop subset, which converges
+//!   without a card abstraction.
+//!
+//! Three traits, in increasing order of what the game promises the solver:
+//! [`Game`] (clone-based, enumerable chance — the exact solvers need this),
+//! [`CursorGame`] (mutate-and-undo traversal, sampled chance — the hot path),
+//! and [`IndexedGame`] (a dense info-set index, which unlocks flat SoA storage).
 
 pub mod blueprint;
-pub mod kuhn;
-pub mod leduc;
-pub mod nlhe;
 pub mod push_fold;
 
 /// A two-player, zero-sum, perfect-recall extensive-form game with explicit

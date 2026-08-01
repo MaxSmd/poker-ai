@@ -16,11 +16,15 @@ See [../poker-ai-plan-v3.md](../poker-ai-plan-v3.md) for the full design rationa
    VR-MCCFR baselines, optional optimistic updates and regret-based pruning,
    stored in a flat `f32` SoA regret table. Validated on Kuhn/Leduc against the
    full-traversal CFR oracle.
-3. **Evaluation** (`evaluation/`) — exact best-response exploitability where
-   chance is enumerable, plus Local Best Response (LBR), AIVAT, and self-play.
-4. **Resolving** (`resolving/`) — depth-limited real-time subgame solving with a
-   predictive (CFR⁺) solver, belief-state tracking, pluggable leaf evaluators,
-   and continual re-solving made safe by a CFV gadget.
+3. **Evaluation** (`evaluation/`) — vectorized abstract-game best response and
+   push/fold exploitability, the two metrics cheap enough to run in the loop.
+4. **Resolving** (`resolving/`) — belief-state tracking and the vectorized
+   public-tree solver the live bot re-solves with.
+5. **Validation** (`validation/`) — the oracles all of the above are gated
+   against, and the only part of the tree that never ships: Kuhn/Leduc/curated
+   NLHE, full-traversal CFR, exact best response, Local Best Response, AIVAT,
+   and the explicit-deal re-solving stack (predictive CFR⁺ subgames, leaf
+   evaluators, CFV gadget, continual re-solving).
 
 ## Key Design Decisions
 

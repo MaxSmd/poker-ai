@@ -3,7 +3,7 @@
 //! Resolving turns the public state at the resolve root into a *subgame* and
 //! solves it from scratch within a time budget, so the bot can answer bet sizes
 //! the blueprint never abstracted.  This models the subgame as a [`Game`] and
-//! hands it to the CFR⁺ core ([`PredictiveSolver`]):
+//! hands it to the CFR⁺ core ([`PredictiveSolver`](crate::validation::solver::predictive::PredictiveSolver)):
 //!
 //!  * **Chance** = the deal of both players' hole cards from their belief ranges
 //!    ([`BeliefState`]), with card removal — i.e. the standard *range vs range*
@@ -16,7 +16,7 @@
 //!    subgame has no depth cut and is solved exactly to showdown.
 //!
 //! Because the range-vs-range chance is *enumerable*, the resolved strategy can
-//! be checked with the exact best response in [`crate::solver::best_response`]
+//! be checked with the exact best response in [`crate::validation::solver::best_response`]
 //! — the validation anchor used in the tests.
 //!
 //! Scale note: enumerating `range × range` deals is tractable for the small
@@ -33,7 +33,7 @@ use poker_core::state::{GameState, NO_CARD};
 
 use crate::games::Game;
 use crate::resolving::belief_state::BeliefState;
-use crate::resolving::leaf_eval::LeafEvaluator;
+use crate::validation::resolving::leaf_eval::LeafEvaluator;
 use crate::util::hash::fnv1a;
 
 pub use solver::{Resolved, SolverKind, SubgameSolver};
@@ -96,7 +96,7 @@ impl SubgameNode {
     /// Build the initial play node for a deal: `template` with the two players'
     /// hole cards set (`holes[p]` to player `p`).  This is the deal-rooted state
     /// the [`Subgame`] places under its chance root — exposed so the re-solving
-    /// gadget ([`crate::resolving::gadget`]) can root its Follow subtree on the
+    /// gadget ([`crate::validation::resolving::gadget`]) can root its Follow subtree on the
     /// same betting tree.
     pub fn deal(template: &GameState, holes: [[u8; 2]; 2]) -> Self {
         let mut gs = template.clone();
@@ -165,7 +165,7 @@ impl<'a> Subgame<'a> {
     /// Build a **play-only context** rooted at `template` — the same betting
     /// tree, leaf evaluation, and `info_key` behaviour as [`Self::new`], but with
     /// no enumerated deals (`chance_outcomes` is unused).  The re-solving gadget
-    /// ([`crate::resolving::gadget`]) drives its own chance and delegates each
+    /// ([`crate::validation::resolving::gadget`]) drives its own chance and delegates each
     /// play node's [`Game`] methods to this context, so gadget play info sets
     /// share the exact keyspace of a plain [`Subgame`] resolve.
     pub fn play_context(template: &GameState, leaf_eval: &'a dyn LeafEvaluator) -> Self {

@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use super::parallel::splitmix;
 use crate::games::{CursorGame, IndexedGame};
-use crate::solver::cfr::Variant;
+use crate::solver::variant::Variant;
 use crate::solver::regret_table::RegretTable;
 use crate::util::rng::{sample_index, xorshift_next_unit};
 

@@ -98,7 +98,7 @@ pub fn board_equities(board: [u8; 5], out: &mut [f32; 1326]) {
 /// the 1326×1326 pairwise showdown.  **Card removal (blockers) is automatic**:
 /// the `below[a]/below[b]` / `card[a]/card[b]` subtractions drop every opponent
 /// combo that shares a card with the hero (or the board), so a one-hot
-/// `opp_reach` reproduces [`hand_vs_hand_equity`] and a uniform one reproduces
+/// `opp_reach` reproduces [`hand_vs_hand_equity`](super::hand_vs_hand_equity) and a uniform one reproduces
 /// `board_equities`.  Hero combos that use a board card are left `0.0`.
 pub fn board_cfvs(board: [u8; 5], opp_reach: &[f64; 1326], half_pot: f64, out: &mut [f64; 1326]) {
     out.fill(0.0);
@@ -217,7 +217,7 @@ pub struct PreparedRunout {
 
 impl PreparedRunout {
     /// Pre-sort every board completion of an incomplete `board` (trailing slots
-    /// [`NO_CARD`]): 4 real cards ⇒ the 48 river runouts (turn); 3 real cards ⇒
+    /// [`NO_CARD`](poker_core::state::NO_CARD)): 4 real cards ⇒ the 48 river runouts (turn); 3 real cards ⇒
     /// the 1176 turn+river runouts (flop).  Panics otherwise (a complete or
     /// under-specified board is not a depth-cut leaf board).
     pub fn new(board: [u8; 5]) -> Self {
@@ -286,7 +286,7 @@ impl PreparedRunout {
 /// the check-down leaf value for **turn** (one-card) and **flop** (two-card)
 /// subgame resolving.
 ///
-/// `board` holds the known cards with trailing [`NO_CARD`] slots; `opp_reach` is
+/// `board` holds the known cards with trailing [`NO_CARD`](poker_core::state::NO_CARD) slots; `opp_reach` is
 /// the opponent range in [`combo_index`] ordering, `half_pot` the stake at
 /// showdown (bb).  For each board completion the exact showdown CFV
 /// [`board_cfvs`] is accumulated, then divided by the number of completions a
@@ -295,7 +295,7 @@ impl PreparedRunout {
 /// (`board_cfvs` never writes a blocked hero combo), so summing over *all*
 /// completions and dividing by that count is exact: it reproduces
 /// `Σ_g π(g)·(eq(h,g) − ½)·pot`, the value the explicit
-/// [`CheckdownLeafEval`](crate::resolving::leaf_eval) oracle scores there.
+/// [`CheckdownLeafEval`](crate::validation::resolving::leaf_eval) oracle scores there.
 ///
 /// This convenience wrapper rebuilds the sort each call; the hot resolve path
 /// builds a [`PreparedRunout`] once and calls [`PreparedRunout::evaluate`].

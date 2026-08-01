@@ -31,7 +31,7 @@
 //! (NashConv / 2) is zero, so a correct solver must drive it below any small ε.
 //! This is validation protocol step 1.
 
-use super::Game;
+use crate::games::Game;
 
 /// Action index for check / fold.
 const CHECK_FOLD: usize = 0;
@@ -160,8 +160,9 @@ impl Game for Kuhn {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::solver::best_response::{exploitability, profile_value};
-    use crate::solver::cfr::{Cfr, Variant};
+    use crate::validation::solver::best_response::{exploitability, profile_value};
+    use crate::solver::variant::Variant;
+use crate::validation::solver::full_cfr::Cfr;
     use crate::solver::dcfr::Discount;
 
     #[test]

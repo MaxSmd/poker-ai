@@ -40,7 +40,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::cfr::Variant;
+use super::variant::Variant;
 use super::regret_table::RegretStore;
 use crate::util::rng::xorshift_next_unit;
 

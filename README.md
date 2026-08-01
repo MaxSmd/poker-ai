@@ -163,7 +163,8 @@ Flags: `--iters=N` (resolve iterations), `--river-cap=N`, `--purify=X`
 (drop sub-X action probabilities), `--seed=N`, `--no-resolve`,
 `--token=`/`--username=`/`--password=` — see the header of `src/bin/play.rs`.
 
-The rest of the resolving stack (`crates/poker-ai/src/resolving/`) — CFV-gadget
+The rest of the resolving stack (`crates/poker-ai/src/validation/resolving/`,
+the explicit-deal oracle the vectorized solver is gated against) — CFV-gadget
 continual re-solving, blueprint warm-starting, multi-valued leaf continuations,
 full-river turn resolves — is implemented and tested; turn/flop play-time
 resolving is wired into the bot but off by default (`--resolve-turn`
@@ -174,9 +175,9 @@ resolving is wired into the bot but off by default (`--resolve-turn`
 - `play expl`: vectorized abstract-game best response — the blueprint quality
   metric (`evaluation/vector_br.rs`)
 - `evaluation/exploitability.rs`: exact-style push/fold exploitability (mbb/g)
-- `evaluation/local_br.rs`: sampled best response, generic over `Game` — the
-  tool for future non-`BlueprintHoldem` (e.g. multiway) games
-- `evaluation/aivat.rs`: AIVAT variance-reduced match evaluation (the
+- `validation/evaluation/local_br.rs`: sampled best response, generic over
+  `Game` — the tool for future non-`BlueprintHoldem` (e.g. multiway) games
+- `validation/evaluation/aivat.rs`: AIVAT variance-reduced match evaluation (the
   conceptual oracle behind `play/luck.rs`'s live luck adjustment)
 - `examples/`: bucket inspector, OCHS-vs-scalar benchmark, continual-resolving
   benchmark
@@ -187,13 +188,40 @@ resolving is wired into the bot but off by default (`--resolve-turn`
 crates/poker-core/          game engine (state, actions, evaluator, undo)
 crates/poker-ai/src/
   abstraction/              hand indexing, equity features, clustering, buckets
-  games/                    Game/CursorGame/IndexedGame traits; Kuhn, Leduc,
-                            push/fold, BlueprintHoldem
-  solver/                   CFR, DCFR, MCCFR (+SoA store), CFR+, pruning
-  resolving/                subgame, gadget, continual re-solving, vector CFR
-  evaluation/               exploitability, LBR, AIVAT, vectorized BR
+  games/                    Game/CursorGame/IndexedGame traits; push/fold,
+                            BlueprintHoldem
+  solver/                   MCCFR (+SoA/atomic stores), DCFR, pruning, variant
+  resolving/                belief tracking, vectorized public-tree CFR
+  evaluation/               push/fold exploitability, vectorized BR
+  play/                     the live bot, protocol, Slumbot client, tracker
+  util/                     combo bijection, hashing, RNG, CLI validation
+  validation/               ORACLES — nothing here ships (see below)
+    games/                  Kuhn, Leduc, curated-deal NLHE
+    solver/                 full-traversal CFR, exact BR, predictive CFR+
+    resolving/              explicit-deal subgame, gadget, continual, leaf eval
+    evaluation/             AIVAT, sampled local BR
   bin/                      train, cluster, memory_estimate, benchmark, play
 docs/                       architecture & design notes
 scripts/                    W&B wrapper, analysis helpers
 data/                       generated artifacts (gitignored)
 ```
+
+### Production vs. validation
+
+Everything under `validation/` exists **only to check the code above it**, and
+none of it links into the `train`, `cluster` or `play` binaries. That split is
+what makes "does this ship?" answerable from the path alone — production is
+written for scale (flat SoA storage, quantized tables, sampled traversal,
+vectorized public trees), validation is written to be obviously correct (full
+tree walks, `HashMap` storage, explicit per-deal enumeration) and is allowed to
+be arbitrarily slow. Each optimization is admitted only once it reproduces its
+slow twin's answer; `src/validation/mod.rs` lists the pairings. The property is
+checkable:
+
+```sh
+cargo build --release
+nm -C target/release/train | grep -c 'poker_ai::validation::'   # expect 0
+```
+
+Dependencies run one way — validation imports production, never the reverse
+(production references it only from `#[cfg(test)]` blocks and doc links).

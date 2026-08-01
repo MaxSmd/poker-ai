@@ -2,7 +2,7 @@
 //!
 //! Continual re-solving (DeepStack) carries the opponent's **counterfactual
 //! values** (CFVs) forward from one resolve to the next: they become the
-//! constraints the [re-solving gadget](crate::resolving::gadget) holds the
+//! constraints the [re-solving gadget](crate::validation::resolving::gadget) holds the
 //! opponent to, and the quantity the next street is warm-started from.  This
 //! module computes them from a resolved [`Subgame`].
 //!
@@ -19,11 +19,11 @@ use std::collections::HashMap;
 use crate::abstraction::features::combo_index;
 use crate::games::Game;
 use crate::resolving::belief_state::NUM_COMBOS;
-use crate::resolving::subgame::Subgame;
+use crate::validation::resolving::subgame::Subgame;
 
 /// Expected utility of `player` from `node` when both players follow `strategy`
 /// (uniform at any information set `strategy` does not cover).  The per-node
-/// generalization of [`crate::solver::best_response::profile_value`] — usable
+/// generalization of [`crate::validation::solver::best_response::profile_value`] — usable
 /// from any subtree root, over any [`Game`] (the plain subgame *or* the gadget).
 pub(crate) fn node_value<G: Game>(
     game: &G,
@@ -60,7 +60,7 @@ pub(crate) fn node_value<G: Game>(
 /// Values are in big blinds (the subgame's utility unit).
 ///
 /// Carry these forward to constrain the next resolve's gadget and to warm-start
-/// it (see [`crate::resolving::continual`]).
+/// it (see [`crate::validation::resolving::continual`]).
 pub fn opponent_cfvs(
     subgame: &Subgame,
     strategy: &HashMap<u64, Vec<f64>>,
@@ -81,9 +81,9 @@ pub fn opponent_cfvs(
 mod tests {
     use super::*;
     use crate::resolving::belief_state::BeliefState;
-    use crate::resolving::leaf_eval::CheckdownLeafEval;
-    use crate::resolving::subgame::{SubgameSolver, Subgame};
-    use crate::solver::best_response::profile_value;
+    use crate::validation::resolving::leaf_eval::CheckdownLeafEval;
+    use crate::validation::resolving::subgame::{SubgameSolver, Subgame};
+    use crate::validation::solver::best_response::profile_value;
     use poker_core::make_card;
     use poker_core::legal_actions;
     use poker_core::action::Action;

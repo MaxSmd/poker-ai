@@ -10,7 +10,7 @@ use std::path::Path;
 
 use poker_ai::abstraction::bucket_map::BucketMap;
 use poker_ai::games::blueprint::BlueprintHoldem;
-use poker_ai::solver::cfr::Variant;
+use poker_ai::solver::variant::Variant;
 use poker_ai::solver::dcfr::Discount;
 use poker_ai::solver::mccfr::Mccfr;
 

@@ -1,6 +1,6 @@
 //! Vectorized range-vs-range subgame solving (finding #2).
 //!
-//! The explicit-deal [`Subgame`](crate::resolving::subgame::Subgame) enumerates
+//! The explicit-deal [`Subgame`](crate::validation::resolving::subgame::Subgame) enumerates
 //! every `(h0, h1)` pair as a chance child — up to 1326×1326 ≈ 1.76 M
 //! traversals.  The **public-tree** formulation here walks the shared betting
 //! tree *once* and carries a length-[`NUM_COMBOS`] counterfactual-value vector
@@ -15,7 +15,7 @@
 //! The explicit-deal `Subgame` stays the **correctness oracle**: this solver
 //! emits its average strategy under the *same* `info_key` (player + hand +
 //! board + history), so
-//! [`exploitability`](crate::solver::best_response::exploitability) scores the
+//! [`exploitability`](crate::validation::solver::best_response::exploitability) scores the
 //! vectorized result inside the explicit game and the two must agree.
 //!
 //! **Scope.** This solves *complete-board* (river) subgames — exactly the
@@ -48,7 +48,7 @@ use node::{NodeKind, NodeStore};
 
 pub use keys::subgame_info_key;
 
-/// A solved vectorized subgame (mirrors [`Resolved`](crate::resolving::subgame::Resolved)).
+/// A solved vectorized subgame (mirrors [`Resolved`](crate::validation::resolving::subgame::Resolved)).
 pub struct VectorResolved {
     /// Average strategy keyed by the explicit `Subgame::info_key` (hand + history)
     /// so it validates against the explicit-deal oracle.
@@ -93,7 +93,7 @@ pub struct VectorCfr {
     /// Rest-of-hand pot scales for the depth-limit continuation choice (finding
     /// #1); `[0.0]` (length 1) is the plain single check-down (no chooser node).
     /// `scales[0]` should be `0.0` (the normal continuation).  Mirrors
-    /// [`MultiContinuationLeaf`](crate::resolving::leaf_eval).
+    /// [`MultiContinuationLeaf`](crate::validation::resolving::leaf_eval).
     scales: Vec<f64>,
     /// The fixed continuation chooser — the opponent of the resolve-root actor,
     /// whose post-leaf adaptation the resolve must be robust to (only used when
@@ -140,7 +140,7 @@ impl VectorCfr {
     }
 
     /// The general constructor.  With `full_river` (turn roots only), a turn
-    /// street close deals the river as an explicit [`NodeKind::Chance`] and
+    /// street close deals the river as an explicit `NodeKind::Chance` and
     /// solves the **real river betting** below it — no leaf model at all on
     /// that boundary — instead of cutting with a check-down / continuation
     /// leaf.  All-in run-outs (no betting left) stay exact check-downs, and a

@@ -8,7 +8,7 @@
 //!
 //! * **betting** — exact: every abstract line is enumerated;
 //! * **ranges** — exact: all 1326×1326 hand pairs via reach vectors, card
-//!   removal by blocker-corrected sweeps ([`PreparedShowdown`]) at showdowns
+//!   removal by blocker-corrected sweeps ([`PreparedShowdown`](crate::abstraction::features::PreparedShowdown)) at showdowns
 //!   and inclusion–exclusion at folds;
 //! * **flops** — Monte-Carlo: a sampled flop set stands in for all C(52,3),
 //!   scaled by `|F| · C(48,3)/C(52,3)`;

@@ -18,7 +18,7 @@ use rayon::prelude::*;
 use super::parallel::{record_strategy_delta, record_traverser_delta, splitmix, Delta};
 use super::{Mccfr, Node};
 use crate::games::{CursorGame, Game};
-use crate::solver::cfr::Variant;
+use crate::solver::variant::Variant;
 use crate::util::rng::{sample_index, xorshift_next_unit};
 
 impl<G: Game + CursorGame> Mccfr<G> {

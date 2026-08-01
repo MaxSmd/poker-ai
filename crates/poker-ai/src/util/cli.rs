@@ -88,6 +88,7 @@ mod tests {
     fn rejects_a_space_separated_flag_value() {
         let exe = std::env::current_exe().expect("test binary path");
         let out = std::process::Command::new(exe)
+            .env(CHILD_VAR, "1")
             .args([
                 "--exact",
                 "util::cli::tests::space_separated_child",
@@ -104,10 +105,23 @@ mod tests {
         );
     }
 
-    /// The child of [`rejects_a_space_separated_flag_value`]; exits(2) by design.
+    /// Set by [`rejects_a_space_separated_flag_value`] on the child it spawns.
+    ///
+    /// The guard matters: `process::exit` from a test kills the whole harness,
+    /// aborting every test still queued.  `#[ignore]` alone does not contain
+    /// that — `cargo test -- --ignored` (how the heavy oracle gates are run)
+    /// would execute this helper for real and take the run down with it.  So the
+    /// child is inert unless explicitly summoned.
+    const CHILD_VAR: &str = "POKER_AI_CLI_EXIT_CHILD";
+
+    /// The child of [`rejects_a_space_separated_flag_value`]; exits(2) by design
+    /// when summoned via [`CHILD_VAR`], and is a no-op otherwise.
     #[test]
     #[ignore = "subprocess helper: exits the process on purpose"]
     fn space_separated_child() {
+        if std::env::var_os(CHILD_VAR).is_none() {
+            return;
+        }
         let args = argv(&["cluster", "2", "1", "--data", "/tmp/x"]);
         validate_flags(&args, 1, &["data"], 5);
     }

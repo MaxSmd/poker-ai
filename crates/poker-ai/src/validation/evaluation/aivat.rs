@@ -25,14 +25,15 @@
 //! stays unbiased with any baseline; only the variance reduction depends on
 //! baseline quality.  That extension is left for when a real blueprint exists.
 //!
-//! No production path calls this module: it is kept as the **conceptual oracle**
+//! No production path calls this module (nothing under [`crate::validation`]
+//! ships — see that module's header): it is kept as the **conceptual oracle**
 //! for [`crate::play::luck`], which is exactly this estimator restricted to
 //! chance-node corrections with the check-down value function — the restriction
 //! that makes it computable in a live match.  Read this file to see what the
 //! luck adjustment approximates (and what its skipped terms would add).
 
 use crate::games::Game;
-use crate::solver::best_response::Strategy;
+use crate::validation::solver::best_response::Strategy;
 use crate::util::rng::{sample_index as sample, xorshift_next_unit as next_unit};
 
 /// Strategy probabilities at a state (uniform if the info set is unseen), the
@@ -165,10 +166,11 @@ pub fn aivat_value<G: Game>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::games::kuhn::Kuhn;
-    use crate::games::leduc::Leduc;
-    use crate::solver::best_response::profile_value;
-    use crate::solver::cfr::{Cfr, Variant};
+    use crate::validation::games::kuhn::Kuhn;
+    use crate::validation::games::leduc::Leduc;
+    use crate::validation::solver::best_response::profile_value;
+    use crate::solver::variant::Variant;
+use crate::validation::solver::full_cfr::Cfr;
 
     fn kuhn_equilibrium() -> Strategy {
         let mut s = Cfr::new(Kuhn, Variant::Vanilla);

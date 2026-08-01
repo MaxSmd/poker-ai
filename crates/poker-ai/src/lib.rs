@@ -5,3 +5,4 @@ pub mod play;
 pub mod resolving;
 pub mod solver;
 pub mod util;
+pub mod validation;

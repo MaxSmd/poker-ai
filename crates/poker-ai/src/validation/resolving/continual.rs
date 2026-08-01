@@ -4,7 +4,7 @@
 //! style), continual re-solving **carries the opponent's counterfactual values
 //! forward** (DeepStack style): the first decision bootstraps with a plain
 //! range-vs-range resolve; every subsequent decision is a gadget-constrained
-//! resolve ([`crate::resolving::gadget`]) anchored on the carried CFVs and
+//! resolve ([`crate::validation::resolving::gadget`]) anchored on the carried CFVs and
 //! **warm-started** from the previous strategy.  Each resolve refreshes the
 //! carried CFVs for the next.
 //!
@@ -26,11 +26,11 @@ use std::collections::HashMap;
 use poker_core::state::GameState;
 
 use crate::resolving::belief_state::BeliefState;
-use crate::resolving::cfv::opponent_cfvs;
-use crate::resolving::gadget::ReSolver;
-use crate::resolving::leaf_eval::LeafEvaluator;
-use crate::resolving::subgame::{Subgame, SubgameSolver};
-use crate::resolving::warm_start::{warm_start_regrets, DEFAULT_SCALE};
+use crate::validation::resolving::cfv::opponent_cfvs;
+use crate::validation::resolving::gadget::ReSolver;
+use crate::validation::resolving::leaf_eval::LeafEvaluator;
+use crate::validation::resolving::subgame::{Subgame, SubgameSolver};
+use crate::validation::resolving::warm_start::{warm_start_regrets, DEFAULT_SCALE};
 
 /// State carried between resolves in a continual re-solving session.
 pub struct ContinualState {
@@ -72,7 +72,7 @@ impl ContinualState {
 pub struct ContinualResolver {
     /// Iterations per resolve.
     pub iters: u64,
-    /// Blueprint/warm-start confidence (see [`crate::resolving::warm_start`]).
+    /// Blueprint/warm-start confidence (see [`crate::validation::resolving::warm_start`]).
     pub warm_start_scale: f64,
 }
 
@@ -122,9 +122,9 @@ impl ContinualResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resolving::gadget::GadgetGame;
-    use crate::resolving::leaf_eval::CheckdownLeafEval;
-    use crate::solver::best_response::best_response_value;
+    use crate::validation::resolving::gadget::GadgetGame;
+    use crate::validation::resolving::leaf_eval::CheckdownLeafEval;
+    use crate::validation::solver::best_response::best_response_value;
     use poker_core::action::Action;
     use poker_core::legal_actions;
     use poker_core::make_card;

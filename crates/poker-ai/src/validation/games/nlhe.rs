@@ -25,7 +25,7 @@
 use poker_core::state::{GameState, MAX_PLAYERS, NO_CARD};
 use poker_core::{legal_actions, make_card};
 
-use super::Game;
+use crate::games::Game;
 use crate::util::hash::fnv1a;
 
 /// One concrete heads-up deal: both players' hole cards and the full board.
@@ -172,8 +172,9 @@ impl Game for HeadsUpHoldem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::solver::best_response::exploitability;
-    use crate::solver::cfr::{Cfr, Variant};
+    use crate::validation::solver::best_response::exploitability;
+    use crate::solver::variant::Variant;
+use crate::validation::solver::full_cfr::Cfr;
     use crate::solver::dcfr::Discount;
     use crate::solver::mccfr::Mccfr;
 

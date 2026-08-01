@@ -119,7 +119,7 @@ impl NodeStore {
     /// CFR⁺ / RM⁺ update for this node's player: add the instantaneous
     /// counterfactual regret `child_p[a] − v_p` and **floor the accumulated regret
     /// at 0**, then accumulate the linearly-weighted (`weight = t`) reach-weighted
-    /// strategy.  This mirrors [`PredictiveSolver`](crate::solver::predictive),
+    /// strategy.  This mirrors [`PredictiveSolver`](crate::validation::solver::predictive),
     /// which the resolver defaults to: RM⁺'s non-negativity keeps low-reach
     /// information sets responsive (DCFR's signed, discounted regret froze them at
     /// uniform once the opponent's strategy went pure — exploitable off-path).

@@ -96,7 +96,7 @@ impl<G: Game> PredictiveSolver<G> {
     ///
     /// Keys must be in the subgame's own `info_key` space — i.e. the blueprint
     /// must be expressed over the same information sets the subgame exposes (see
-    /// [`crate::resolving::warm_start`]).  A seed whose action count does not match
+    /// [`crate::validation::resolving::warm_start`]).  A seed whose action count does not match
     /// the subgame's at that key is ignored, since it cannot be the same info set.
     pub fn warm_start(&mut self, seed_regrets: HashMap<u64, Vec<f64>>) {
         for (key, regret) in seed_regrets {
@@ -214,10 +214,11 @@ impl<G: Game> PredictiveSolver<G> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::games::kuhn::{Kuhn, GAME_VALUE_P0};
-    use crate::games::leduc::Leduc;
-    use crate::solver::best_response::{exploitability, profile_value};
-    use crate::solver::cfr::{Cfr, Variant};
+    use crate::validation::games::kuhn::{Kuhn, GAME_VALUE_P0};
+    use crate::validation::games::leduc::Leduc;
+    use crate::validation::solver::best_response::{exploitability, profile_value};
+    use crate::solver::variant::Variant;
+use crate::validation::solver::full_cfr::Cfr;
 
     #[test]
     fn converges_on_kuhn() {

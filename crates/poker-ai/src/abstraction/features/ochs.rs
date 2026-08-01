@@ -106,10 +106,10 @@ pub fn ochs_opponent_clusters() -> [u8; PREFLOP_CLASSES] {
 /// opponent for a given hero is reported as the neutral `0.5`.
 ///
 /// One O(n log n) rank-sort + sweep fills all [`OCHS_K`] equities for all 1081
-/// holes at once — the same tier sweep as [`board_equities`], but carrying a
+/// holes at once — the same tier sweep as [`board_equities`](super::board_equities), but carrying a
 /// per-cluster weaker/tied/total tally instead of a single one.  The
 /// combo-weighted average of the K cluster equities equals the
-/// [`board_equities`] equity-vs-uniform, since the clusters partition the
+/// [`board_equities`](super::board_equities) equity-vs-uniform, since the clusters partition the
 /// opponents (asserted in tests).
 pub fn board_ochs(
     board: [u8; 5],

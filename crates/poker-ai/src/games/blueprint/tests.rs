@@ -8,7 +8,7 @@ use poker_core::{make_card, rank_of, suit_of};
 // call directly (the cursor path is exercised through `Mccfr::train_fast`).
 use crate::games::Game;
 
-use crate::solver::cfr::Variant;
+use crate::solver::variant::Variant;
 use crate::solver::dcfr::Discount;
 use crate::solver::mccfr::Mccfr;
 
@@ -244,7 +244,7 @@ fn indexed_preflop_only_partition_and_key_round_trip() {
 #[test]
 #[ignore]
 fn atomic_scaling_benchmark() {
-    use crate::solver::cfr::Variant;
+    use crate::solver::variant::Variant;
     use crate::solver::dcfr::Discount;
     use crate::solver::mccfr::SoaMccfr;
     use std::time::Instant;

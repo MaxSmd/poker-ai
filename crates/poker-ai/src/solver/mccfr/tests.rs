@@ -1,9 +1,9 @@
     use super::*;
     use crate::games::blueprint::BlueprintHoldem;
-    use crate::games::kuhn::{Kuhn, GAME_VALUE_P0};
-    use crate::games::leduc::Leduc;
+    use crate::validation::games::kuhn::{Kuhn, GAME_VALUE_P0};
+    use crate::validation::games::leduc::Leduc;
     use crate::games::push_fold::PushFoldHoldem;
-    use crate::solver::best_response::{exploitability, profile_value};
+    use crate::validation::solver::best_response::{exploitability, profile_value};
     use crate::solver::dcfr::Discount;
 
     #[test]

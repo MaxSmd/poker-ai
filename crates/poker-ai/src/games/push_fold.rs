@@ -293,7 +293,7 @@ impl super::IndexedGame for PushFoldHoldem {
 mod tests {
     use super::*;
     use crate::abstraction::canonical::preflop_index;
-    use crate::solver::cfr::Variant;
+    use crate::solver::variant::Variant;
     use crate::solver::dcfr::Discount;
     use crate::solver::mccfr::{LeanMccfr, Mccfr, SoaMccfr};
     use crate::solver::regret_table::RegretStore;

@@ -11,7 +11,7 @@ use rayon::prelude::*;
 
 use super::{Mccfr, Node, BASELINE_RATE};
 use crate::games::Game;
-use crate::solver::cfr::Variant;
+use crate::solver::variant::Variant;
 use crate::util::rng::{sample_index, xorshift_next_unit};
 
 impl<G: Game> Mccfr<G> {

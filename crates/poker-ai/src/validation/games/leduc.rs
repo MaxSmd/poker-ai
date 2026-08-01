@@ -25,7 +25,7 @@
 //! equilibrium is computable exactly, so the test is again "drive exploitability
 //! below ε" (validation protocol step 2).
 
-use super::Game;
+use crate::games::Game;
 
 /// `action 0` — fold (only when facing a bet).
 const FOLD: u8 = 0;
@@ -285,8 +285,9 @@ impl Game for Leduc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::solver::best_response::{exploitability, profile_value};
-    use crate::solver::cfr::{Cfr, Variant};
+    use crate::validation::solver::best_response::{exploitability, profile_value};
+    use crate::solver::variant::Variant;
+use crate::validation::solver::full_cfr::Cfr;
     use crate::solver::dcfr::Discount;
 
     /// Known game value to player 0 for standard 2-player Leduc.

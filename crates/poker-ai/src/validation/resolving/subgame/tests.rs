@@ -4,9 +4,9 @@
 //! response over a real, small, fully-enumerable subgame.
 
 use super::*;
-use crate::resolving::leaf_eval::CheckdownLeafEval;
-use crate::resolving::warm_start::warm_start_regrets;
-use crate::solver::best_response::exploitability;
+use crate::validation::resolving::leaf_eval::CheckdownLeafEval;
+use crate::validation::resolving::warm_start::warm_start_regrets;
+use crate::validation::solver::best_response::exploitability;
 use poker_core::action::Action;
 use poker_core::make_card;
 use poker_core::state::MAX_PLAYERS;
@@ -326,7 +326,7 @@ fn multi_valued_leaf_inserts_a_chooser_node_and_stays_zero_sum() {
     // a continuation node (K actions, owned by the chooser) must exist.
     let root = public_root(turn_board_with_hole_room(), 20, 2);
     let (b0, b1) = duel_ranges();
-    let leaf = crate::resolving::leaf_eval::MultiContinuationLeaf::new();
+    let leaf = crate::validation::resolving::leaf_eval::MultiContinuationLeaf::new();
     let sg = Subgame::new(root.clone(), &[b0, b1], &leaf);
     let chooser = 1 - root.current_player();
 
@@ -367,7 +367,7 @@ fn multi_continuation_resolve_is_more_robust_than_single() {
     let iters = 4_000;
     let root = || public_root(turn_board_with_hole_room(), 20, 2);
 
-    let multi = crate::resolving::leaf_eval::MultiContinuationLeaf::new();
+    let multi = crate::validation::resolving::leaf_eval::MultiContinuationLeaf::new();
     let single = CheckdownLeafEval::new(); // == multi's continuation 0
 
     // A: resolved aware of the K = 4 choice.  B: resolved assuming one.

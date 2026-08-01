@@ -27,7 +27,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use super::cfr::Variant;
+use super::variant::Variant;
 
 /// EMA learning rate for the VR-MCCFR baseline (mirrors `mccfr::BASELINE_RATE`).
 const BASELINE_RATE: f64 = 0.1;
