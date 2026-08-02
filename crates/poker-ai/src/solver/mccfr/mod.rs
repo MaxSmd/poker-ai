@@ -31,6 +31,7 @@ use crate::solver::variant::Variant;
 use super::pruning::PruningConfig;
 
 use crate::games::Game;
+use crate::solver::MAX_ACTIONS;
 use crate::util::rng::{sample_index, xorshift_next_unit};
 
 /// EMA learning rate for the running baseline.  A single value per
@@ -48,35 +49,61 @@ struct Node {
     /// perspective.  Used as a control variate at sampled (opponent) nodes.
     baseline: Vec<f64>,
     /// Previous iteration's instantaneous regret per action — the optimistic
-    /// (Farina et al.) momentum term `R += 2·rₜ − r_{t−1}`.  Zero unless
+    /// (Farina et al.) momentum term `R += 2·rₜ − r_{t−1}`.  **Empty** unless
     /// optimistic updates are enabled.
     prev_inst: Vec<f64>,
     /// Consecutive iterations this action's cumulative regret has been below the
-    /// RBP threshold θ (Regret-Based Pruning).  Zero unless pruning is enabled.
+    /// RBP threshold θ (Regret-Based Pruning).  **Empty** unless pruning is
+    /// enabled.
     consec_below: Vec<u32>,
 }
 
 impl Node {
-    fn new(num_actions: usize) -> Self {
+    /// `optimistic` / `pruning` allocate their feature accumulators only when
+    /// the corresponding feature is on — mirroring
+    /// [`RegretTable::with_layout`](crate::solver::regret_table::RegretTable::with_layout),
+    /// so a run pays for them only if it uses them.  RBP in particular is inert
+    /// under the production discount schedule (see [`Self::with_pruning`]), and
+    /// an inert feature should cost nothing.
+    fn new(num_actions: usize, optimistic: bool, pruning: bool) -> Self {
         Self {
             regret_sum: vec![0.0; num_actions],
             strategy_sum: vec![0.0; num_actions],
             baseline: vec![0.0; num_actions],
-            prev_inst: vec![0.0; num_actions],
-            consec_below: vec![0; num_actions],
+            prev_inst: if optimistic { vec![0.0; num_actions] } else { Vec::new() },
+            consec_below: if pruning { vec![0; num_actions] } else { Vec::new() },
         }
     }
 
-    /// Regret-matching current strategy.
-    fn strategy(&self) -> Vec<f64> {
-        let positive: Vec<f64> = self.regret_sum.iter().map(|&r| r.max(0.0)).collect();
-        let total: f64 = positive.iter().sum();
+    /// Regret-matching current strategy into a **stack** buffer; returns the
+    /// action count.  Every traversal calls this once per node visit — at the
+    /// blueprint's ~10¹² visits an allocating form is not a rounding error — so
+    /// the hot paths use this and [`Self::strategy`] is left for export.
+    fn strategy_into(&self, out: &mut [f64; MAX_ACTIONS]) -> usize {
         let n = self.regret_sum.len();
-        if total > 0.0 {
-            positive.iter().map(|&p| p / total).collect()
-        } else {
-            vec![1.0 / n as f64; n]
+        assert!(n <= MAX_ACTIONS, "info set has {n} actions, over the {MAX_ACTIONS} cap");
+        let mut total = 0.0;
+        for (o, &r) in out.iter_mut().zip(&self.regret_sum) {
+            let p = r.max(0.0);
+            *o = p;
+            total += p;
         }
+        if total > 0.0 {
+            for o in out.iter_mut().take(n) {
+                *o /= total;
+            }
+        } else {
+            out[..n].fill(1.0 / n as f64);
+        }
+        n
+    }
+
+    /// Allocating [`Self::strategy_into`], for the export paths (the deployable
+    /// strategy maps, the parallel path's start-of-batch snapshot).
+    fn strategy(&self) -> Vec<f64> {
+        let mut buf = [0.0; MAX_ACTIONS];
+        let n = self.strategy_into(&mut buf);
+        buf[..n].to_vec()
     }
 }
 
@@ -145,6 +172,15 @@ impl<G: Game> Mccfr<G> {
     /// whose regret stays below θ for K consecutive iterations stop being
     /// traversed, with a periodic full-refresh traversal as the safeguard (see
     /// [`super::pruning`]).
+    ///
+    /// **Check
+    /// [`Variant::accumulates_negative_regret`](crate::solver::variant::Variant::accumulates_negative_regret)
+    /// first.**  Under DCFR with `β = 0` — the production schedule — negative
+    /// regret is halved every iteration and never reaches θ, so pruning is
+    /// measurably inert.  This is not rejected here (the solver stays correct,
+    /// and the streak accumulators are the only cost, allocated only when
+    /// pruning is on), but a caller enabling it in that regime is buying
+    /// nothing.
     pub fn with_pruning(mut self, config: PruningConfig, total_iters: u64) -> Self {
         let start = (config.start_fraction * total_iters as f64) as u64;
         self.pruning = Some((config, start));
@@ -319,69 +355,77 @@ impl<G: Game> Mccfr<G> {
         let player = self.game.current_player(state);
         let key = self.game.info_key(state);
         let num_actions = self.game.num_actions(state);
-        let strategy = self.nodes.entry(key).or_insert_with(|| Node::new(num_actions)).strategy();
+        let (optimistic, pruning) = (self.use_optimistic, self.pruning.is_some());
+        let mut strategy = [0.0f64; MAX_ACTIONS];
+        self.nodes
+            .entry(key)
+            .or_insert_with(|| Node::new(num_actions, optimistic, pruning))
+            .strategy_into(&mut strategy);
 
         if player == traverser {
-            let consec = self.pruned_streaks(key, t);
-
-            // Explore every (non-pruned) action; accumulate sampled regret.
-            let mut util = vec![0.0; num_actions];
-            let mut traversed = vec![true; num_actions];
+            // A pruned action has deeply negative regret ⇒ ~zero regret-matching
+            // probability, so it contributes ~nothing to node_value; its subtree
+            // is left untraversed and its regret frozen.
+            let pruned = self.pruned_mask(key, t);
+            let mut util = [0.0f64; MAX_ACTIONS];
+            let mut traversed = 0u8;
             let mut node_value = 0.0;
             for a in 0..num_actions {
-                let pruned = match (&consec, self.pruning) {
-                    (Some(cb), Some((cfg, _))) => cfg.should_prune(cb[a]),
-                    _ => false,
-                };
-                if pruned {
-                    // A pruned action has deeply negative regret ⇒ ~zero
-                    // regret-matching probability, so it contributes ~nothing to
-                    // node_value; its subtree is left untraversed.
-                    traversed[a] = false;
+                if pruned & (1 << a) != 0 {
                     continue;
                 }
+                traversed |= 1 << a;
                 let child = self.game.apply(state, a);
                 util[a] = self.traverse(&child, traverser, t);
                 node_value += strategy[a] * util[a];
             }
-            self.update_regret(key, t, &util, node_value, &traversed);
-            self.refresh_traverser_baseline(key, traverser, &util, &traversed);
+            let util = &util[..num_actions];
+            self.update_regret(key, t, util, node_value, traversed);
+            self.refresh_traverser_baseline(key, traverser, util, traversed);
             node_value
         } else {
+            let strategy = &strategy[..num_actions];
             // Opponent: accumulate average strategy, then sample one action.
-            self.update_strategy(key, t, &strategy);
-            let a = self.sample(&strategy);
+            self.update_strategy(key, t, strategy);
+            let a = self.sample(strategy);
             let child = self.game.apply(state, a);
             let v_child = self.traverse(&child, traverser, t);
-            self.corrected_opponent_value_serial(key, &strategy, a, v_child, traverser)
+            self.corrected_opponent_value_serial(key, strategy, a, v_child, traverser)
         }
     }
 
-    /// RBP gate: on a normal (non-refresh) iteration past the warm-up, the
-    /// per-action below-θ streaks that decide pruning at this node; `None`
-    /// disables pruning for this visit (a refresh iteration prunes nothing,
-    /// re-touching every branch).  Shared by the clone and cursor traversals.
-    fn pruned_streaks(&self, key: u64, t: u64) -> Option<Vec<u32>> {
-        let (cfg, start) = self.pruning?;
-        if t > start && !cfg.is_refresh_iteration(t) {
-            self.nodes.get(&key).map(|n| n.consec_below.clone())
-        } else {
-            None
+    /// RBP gate: the bitmask of actions pruning skips at this node this
+    /// iteration, `0` meaning "traverse everything".  Pruning off, the warm-up
+    /// period, and a scheduled refresh iteration all return `0`, so every branch
+    /// is re-touched.  Shared by the clone and cursor traversals; reads the
+    /// streaks in place rather than cloning them.
+    fn pruned_mask(&self, key: u64, t: u64) -> u8 {
+        let Some((cfg, start)) = self.pruning else { return 0 };
+        if t <= start || cfg.is_refresh_iteration(t) {
+            return 0;
         }
+        let Some(node) = self.nodes.get(&key) else { return 0 };
+        let mut mask = 0u8;
+        for (a, &streak) in node.consec_below.iter().enumerate() {
+            if cfg.should_prune(streak) {
+                mask |= 1 << a;
+            }
+        }
+        mask
     }
 
     /// Refresh the traverser's per-action baseline toward this iteration's
-    /// sampled utilities, in player-0 perspective — only for traversed actions
-    /// (a pruned action's util is not sampled).  Shared by the clone and cursor
-    /// traversals; a no-op with the baseline off.
-    fn refresh_traverser_baseline(&mut self, key: u64, traverser: usize, util: &[f64], traversed: &[bool]) {
+    /// sampled utilities, in player-0 perspective — only for actions set in the
+    /// `traversed` bitmask (a pruned action's util is not sampled).  Shared by
+    /// the clone and cursor traversals; a no-op with the baseline off.
+    fn refresh_traverser_baseline(&mut self, key: u64, traverser: usize, util: &[f64], traversed: u8) {
         if !self.use_baseline {
             return;
         }
         let sgn = Self::sign(traverser);
         let node = self.nodes.get_mut(&key).expect("inserted in traverse");
         for (a, &u) in util.iter().enumerate() {
-            if traversed[a] {
+            if traversed & (1 << a) != 0 {
                 node.baseline[a] += BASELINE_RATE * (sgn * u - node.baseline[a]);
             }
         }
@@ -444,11 +488,11 @@ impl<G: Game> Mccfr<G> {
     /// External sampling already accounts for counterfactual reach, so the
     /// instantaneous regret is simply `util[a] - node_value` (no reach factor).
     ///
-    /// `traversed[a]` is false for actions RBP skipped this iteration: their
-    /// regret is frozen (no update, no discount), but their below-θ streak keeps
-    /// advancing so they stay pruned.  With optimistic updates on, the increment
-    /// is the predictive `2·rₜ − r_{t−1}` instead of `rₜ`.
-    fn update_regret(&mut self, key: u64, t: u64, util: &[f64], node_value: f64, traversed: &[bool]) {
+    /// A bit clear in `traversed` marks an action RBP skipped this iteration:
+    /// its regret is frozen (no update, no discount), but its below-θ streak
+    /// keeps advancing so it stays pruned.  With optimistic updates on, the
+    /// increment is the predictive `2·rₜ − r_{t−1}` instead of `rₜ`.
+    fn update_regret(&mut self, key: u64, t: u64, util: &[f64], node_value: f64, traversed: u8) {
         let optimistic = self.use_optimistic;
         let pruning = self.pruning.map(|(cfg, _)| cfg);
         let (pos, neg) = match self.variant {
@@ -458,15 +502,24 @@ impl<G: Game> Mccfr<G> {
         let discount = matches!(self.variant, Variant::Dcfr(_));
 
         let node = self.nodes.get_mut(&key).expect("inserted in traverse");
-        for a in 0..node.regret_sum.len() {
-            if traversed[a] {
-                let inst = util[a] - node_value;
+        debug_assert_eq!(util.len(), node.regret_sum.len(), "one utility per action");
+        for (a, &u) in util.iter().enumerate() {
+            if traversed & (1 << a) != 0 {
+                let inst = u - node_value;
+                // `prev_inst` only exists when optimistic updates are on, so the
+                // momentum term is read *and* rolled forward under that flag.
+                let increment = if optimistic {
+                    let predictive = 2.0 * inst - node.prev_inst[a];
+                    node.prev_inst[a] = inst;
+                    predictive
+                } else {
+                    inst
+                };
                 let r = &mut node.regret_sum[a];
                 if discount {
                     *r *= if *r > 0.0 { pos } else { neg };
                 }
-                *r += if optimistic { 2.0 * inst - node.prev_inst[a] } else { inst };
-                node.prev_inst[a] = inst;
+                *r += increment;
             }
             // Maintain the RBP below-θ streak from the (possibly frozen) regret.
             if let Some(cfg) = pruning {

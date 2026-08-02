@@ -58,9 +58,12 @@ impl<G: IndexedGame, S: RegretStore> SoaMccfr<G, S> {
         Self { game, variant, use_baseline: false, table, rng: seed | 1, iterations: 0, nodes_visited: 0 }
     }
 
-    /// Enable the VR-MCCFR baseline (control variate).
+    /// Enable the VR-MCCFR baseline (control variate).  Stores that keep the
+    /// baseline optional (the quantized [`LeanTable`]) allocate it here, so a
+    /// run without control variates never carries the array.
     pub fn with_baseline(mut self) -> Self {
         self.use_baseline = true;
+        self.table.enable_baseline();
         self
     }
 

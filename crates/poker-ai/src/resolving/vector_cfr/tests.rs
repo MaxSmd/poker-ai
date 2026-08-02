@@ -219,33 +219,6 @@ fn vectorized_flop_resolve_agrees_with_explicit_oracle() {
 }
 
 #[test]
-#[ignore = "throughput demonstration; run with --ignored"]
-fn turn_full_range_solve_is_fast() {
-    // The runout table is built once and shared, so a full-range turn resolve
-    // (both ranges the whole 1081-combo grid) solves at a play-viable rate —
-    // NOT the per-iteration evaluate+sort the naive runout would cost.
-    use std::time::Instant;
-    let mut b0 = BeliefState::uniform();
-    let mut b1 = BeliefState::uniform();
-    b0.remove_board(&turn_board());
-    b1.remove_board(&turn_board());
-
-    let root = public_root_at(turn_board(), 20, 2);
-    let build = Instant::now();
-    let mut solver = VectorCfr::new(&root, &[b0, b1]);
-    let build_ms = build.elapsed().as_millis();
-    let solve = Instant::now();
-    solver.run(500);
-    let solve_ms = solve.elapsed().as_millis();
-    let resolved = solver.into_resolved();
-    println!(
-        "turn full-range resolve: {} public nodes, {} info sets — build {build_ms} ms, 500 iters {solve_ms} ms",
-        resolved.public_nodes, resolved.info_sets
-    );
-    assert!(resolved.info_sets > 1000, "full ranges yield many per-hand info sets");
-}
-
-#[test]
 fn single_hand_each_is_solved() {
     // One hand per player ⇒ no reach mixing; a clean check of the core
     // recursion against the explicit oracle (which solves this trivially).

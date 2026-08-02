@@ -393,37 +393,6 @@
         strategies_equal(&clone.average_strategy(), &fast.average_strategy());
     }
 
-    /// Throughput of the cursor fast path vs the clone-based path on the
-    /// blueprint (deep trees ⇒ the clone-per-node undo-stack allocation hurts
-    /// most).  Prints nodes/sec for both; the fast path must not be slower.  Run
-    /// in release to get a meaningful number:
-    ///   cargo test -p poker-ai --release -- --ignored cursor_fast_path_is_faster --nocapture
-    #[test]
-    #[ignore]
-    fn cursor_fast_path_is_faster() {
-        use std::time::Instant;
-        let iters = 200_000;
-
-        let mut clone = Mccfr::with_seed(BlueprintHoldem::new(40, 2, 1, 0), Variant::Dcfr(Discount::RECOMMENDED), 1);
-        let t0 = Instant::now();
-        clone.train(iters);
-        let clone_s = t0.elapsed().as_secs_f64();
-
-        let mut fast = Mccfr::with_seed(BlueprintHoldem::new(40, 2, 1, 0), Variant::Dcfr(Discount::RECOMMENDED), 1);
-        let t0 = Instant::now();
-        fast.train_fast(iters);
-        let fast_s = t0.elapsed().as_secs_f64();
-
-        // Same work either way (bit-identical), so nodes/sec is a fair ratio.
-        assert_eq!(clone.nodes_visited(), fast.nodes_visited());
-        let nodes = clone.nodes_visited() as f64;
-        println!(
-            "blueprint {iters} iters: clone {:.2}s ({:.0} nodes/s) vs cursor {:.2}s ({:.0} nodes/s) — {:.2}x",
-            clone_s, nodes / clone_s, fast_s, nodes / fast_s, clone_s / fast_s
-        );
-        assert!(fast_s <= clone_s * 1.05, "cursor path should not be slower (clone {clone_s:.2}s, fast {fast_s:.2}s)");
-    }
-
     /// MCCFR converges on Leduc too — slower and noisier than full traversal, so
     /// run on demand:  cargo test -p poker-ai --release -- --ignored mccfr
     #[test]
@@ -435,29 +404,3 @@
         assert!(expl < 0.05, "Leduc MCCFR exploitability {expl} should be < 0.05");
     }
 
-    /// RBP θ/K sensitivity on Leduc: across a small sweep, pruning should keep
-    /// exploitability low while cutting node visits.  On demand (slow):
-    ///   cargo test -p poker-ai --release -- --ignored rbp_sensitivity
-    #[test]
-    #[ignore]
-    fn rbp_sensitivity_on_leduc() {
-        let total = 400_000;
-        let mut plain = Mccfr::with_seed(Leduc, Variant::Dcfr(Discount::RECOMMENDED), 3);
-        plain.train(total);
-        let plain_expl = exploitability(&Leduc, &plain.average_strategy());
-        let plain_nodes = plain.nodes_visited();
-        println!("plain: expl={plain_expl:.5}, nodes={plain_nodes}");
-
-        for &(theta, k) in &[(-50.0, 50u32), (-100.0, 100), (-300.0, 200)] {
-            let cfg = PruningConfig { theta, k, start_fraction: 0.2, refresh_interval: 10_000 };
-            let mut s = Mccfr::with_seed(Leduc, Variant::Dcfr(Discount::RECOMMENDED), 3)
-                .with_pruning(cfg, total);
-            s.train(total);
-            let expl = exploitability(&Leduc, &s.average_strategy());
-            let nodes = s.nodes_visited();
-            println!("θ={theta} K={k}: expl={expl:.5}, nodes={nodes} ({:.1}% of plain)",
-                100.0 * nodes as f64 / plain_nodes as f64);
-            assert!(expl < 0.05, "θ={theta} K={k} stayed converged ({expl})");
-            assert!(nodes <= plain_nodes, "pruning should not increase node visits");
-        }
-    }

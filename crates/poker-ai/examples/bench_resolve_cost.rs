@@ -52,7 +52,10 @@ fn bench(label: &str, mut solver: VectorCfr, target_iters: u64) {
     let build = Instant::now();
     let build_s = build.elapsed().as_secs_f64();
     let nodes = solver.public_node_count();
-    const PROBE: u64 = 4;
+    // Enough probe iterations that the per-iteration figure is stable: at 4 the
+    // river arm swung 14–21 ms/iter run to run, which is wider than most of the
+    // differences worth measuring here.
+    const PROBE: u64 = 20;
     let t = Instant::now();
     solver.run(PROBE);
     let per_iter = t.elapsed().as_secs_f64() / PROBE as f64;
@@ -72,8 +75,19 @@ fn main() {
     let flop = [card(12, 0), card(11, 1), card(7, 2), NO_CARD, NO_CARD];
     let ranges = [BeliefState::uniform(), BeliefState::uniform()];
 
+    // The full-river and flop arms build tens of thousands of decision nodes,
+    // each carrying two `1326 × actions` accumulator arrays — several GB of
+    // resident stores.  That is a finding about those modes, but it also means
+    // the benchmark cannot run on a small machine, so those arms are opt-in.
+    let heavy = std::env::args().any(|a| a == "all");
+
     println!("Resolve cost at 200bb (blinds {SB}/{BB}), raise cap 3, full 1326-hand ranges.");
-    println!("VectorCfr is SINGLE-THREADED — these are one-core timings.\n");
+    println!("VectorCfr is SINGLE-THREADED — these are one-core timings.");
+    if heavy {
+        println!("Running the HEAVY arms too — expect several GB of RSS.\n");
+    } else {
+        println!("Light arms only; pass `all` for the multi-GB full-river/flop modes.\n");
+    }
 
     let r = public_root_at(river, 3);
     bench("river (exact, 1500 it)", VectorCfr::new_capped(&r, &ranges, 3), 1500);
@@ -84,6 +98,9 @@ fn main() {
         VectorCfr::new_capped_multi(&t, &ranges, 3, vec![0.0, 0.75, 1.5, 3.0]),
         500,
     );
+    if !heavy {
+        return;
+    }
     bench(
         "turn FULL-RIVER (500 it)  [default]",
         VectorCfr::new_full(&t, &ranges, 3, vec![0.0], true),

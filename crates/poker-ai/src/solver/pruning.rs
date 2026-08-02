@@ -18,6 +18,25 @@
 //! Pruning is enabled only after `start_fraction` of training (the first 20%),
 //! giving regrets time to settle before any branch is frozen.
 //!
+//! ## When RBP can fire at all
+//!
+//! **RBP does nothing under the production discount schedule, and that is a
+//! property of the regime, not of (θ, K).**  DCFR scales accumulated negative
+//! regret by `β/(β+1)` every iteration, so at `β = 0`
+//! ([`Discount::RECOMMENDED`](crate::solver::dcfr::Discount::RECOMMENDED)) it is
+//! halved each iteration and stays pinned near zero — it never reaches a θ deep
+//! enough to prune safely.  `examples/bench_rbp.rs` measures this on Leduc and
+//! reports "INERT — pruning never fired" for every swept `(θ, K)` under that
+//! schedule.
+//!
+//! So RBP is kept, not deleted, but it is **gated to the regimes where it
+//! fires**: vanilla CFR and DCFR with `β > 0` (e.g. Linear CFR), which
+//! [`Variant::accumulates_negative_regret`](crate::solver::variant::Variant::accumulates_negative_regret)
+//! answers.  Enabling it elsewhere is not an error — the solver stays correct —
+//! but it buys nothing, so callers should check the predicate rather than pay
+//! for a flag that silently does nothing.  Its accumulators are allocated only
+//! when pruning is on, so an unused RBP now costs no memory either.
+//!
 //! ## Interaction safeguards
 //!
 //! Pruning interacts with both optimistic updates and the VR-MCCFR baseline: a

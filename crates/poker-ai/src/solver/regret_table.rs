@@ -57,6 +57,13 @@ pub trait RegretStore: Serialize + Sized {
     fn num_actions(&self, info_set: usize) -> usize;
     /// Ever updated (any strategy mass) — gates export of unreached slots.
     fn is_visited(&self, info_set: usize) -> bool;
+    /// Allocate the VR-MCCFR baseline accumulator, if this store keeps it
+    /// optional.  Called by
+    /// [`SoaMccfr::with_baseline`](crate::solver::mccfr::SoaMccfr::with_baseline)
+    /// — the flag is a builder step, so the table cannot know at `build` time
+    /// whether control variates will be used.  Stores whose baseline is always
+    /// resident do nothing.
+    fn enable_baseline(&mut self) {}
     fn bytes_per_info_set(&self) -> usize;
     /// Regret-matching current strategy, written into `out`.
     fn strategy_into(&self, info_set: usize, out: &mut Vec<f64>);

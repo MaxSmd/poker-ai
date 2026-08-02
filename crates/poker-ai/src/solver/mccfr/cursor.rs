@@ -12,6 +12,14 @@
 //! They reuse every regret/strategy/baseline helper unchanged and are
 //! **bit-identical** to the clone-based path for a fixed seed (proven by the
 //! `*_matches_clone_*` tests).
+//!
+//! The name is now literal.  It originally described only the eliminated
+//! `GameState` clone, while the traverser still allocated four `Vec`s per
+//! decision node — the regret-matched strategy (two, inside `Node::strategy`),
+//! the per-action utilities, and the traversed flags — plus a fifth cloning the
+//! RBP streaks.  All five are gone: `[f64; MAX_ACTIONS]` stack buffers and a
+//! `u8` traversed bitmask, the same shape the atomic trainer already used.  On
+//! the blueprint's ~10¹² node visits that is not a rounding error.
 
 use rayon::prelude::*;
 
@@ -19,6 +27,7 @@ use super::parallel::{record_strategy_delta, record_traverser_delta, splitmix, D
 use super::{Mccfr, Node};
 use crate::games::{CursorGame, Game};
 use crate::solver::variant::Variant;
+use crate::solver::MAX_ACTIONS;
 use crate::util::rng::{sample_index, xorshift_next_unit};
 
 impl<G: Game + CursorGame> Mccfr<G> {
@@ -70,38 +79,40 @@ impl<G: Game + CursorGame> Mccfr<G> {
         let actions = CursorGame::legal(&self.game, cursor);
         let acts = actions.as_ref();
         let num_actions = acts.len();
-        let strategy = self.nodes.entry(key).or_insert_with(|| Node::new(num_actions)).strategy();
+        let (optimistic, pruning) = (self.use_optimistic, self.pruning.is_some());
+        let mut strategy = [0.0f64; MAX_ACTIONS];
+        self.nodes
+            .entry(key)
+            .or_insert_with(|| Node::new(num_actions, optimistic, pruning))
+            .strategy_into(&mut strategy);
 
         if player == traverser {
-            let consec = self.pruned_streaks(key, t);
-
-            let mut util = vec![0.0; num_actions];
-            let mut traversed = vec![true; num_actions];
+            let pruned = self.pruned_mask(key, t);
+            let mut util = [0.0f64; MAX_ACTIONS];
+            let mut traversed = 0u8;
             let mut node_value = 0.0;
             for a in 0..num_actions {
-                let pruned = match (&consec, self.pruning) {
-                    (Some(cb), Some((cfg, _))) => cfg.should_prune(cb[a]),
-                    _ => false,
-                };
-                if pruned {
-                    traversed[a] = false;
+                if pruned & (1 << a) != 0 {
                     continue;
                 }
+                traversed |= 1 << a;
                 CursorGame::apply(&self.game, cursor, a, acts[a]);
                 util[a] = self.traverse_cursor(cursor, traverser, t);
                 CursorGame::undo(&self.game, cursor);
                 node_value += strategy[a] * util[a];
             }
-            self.update_regret(key, t, &util, node_value, &traversed);
-            self.refresh_traverser_baseline(key, traverser, &util, &traversed);
+            let util = &util[..num_actions];
+            self.update_regret(key, t, util, node_value, traversed);
+            self.refresh_traverser_baseline(key, traverser, util, traversed);
             node_value
         } else {
-            self.update_strategy(key, t, &strategy);
-            let a = self.sample(&strategy);
+            let strategy = &strategy[..num_actions];
+            self.update_strategy(key, t, strategy);
+            let a = self.sample(strategy);
             CursorGame::apply(&self.game, cursor, a, acts[a]);
             let v_child = self.traverse_cursor(cursor, traverser, t);
             CursorGame::undo(&self.game, cursor);
-            self.corrected_opponent_value_serial(key, &strategy, a, v_child, traverser)
+            self.corrected_opponent_value_serial(key, strategy, a, v_child, traverser)
         }
     }
 

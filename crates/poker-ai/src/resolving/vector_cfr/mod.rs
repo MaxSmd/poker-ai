@@ -105,6 +105,9 @@ pub struct VectorCfr {
     /// Carried opponent CFVs (bb, per opponent hand in `features::combo_index`
     /// order) when this is a gadget-constrained continual resolve.
     carried: Option<Box<[f64; NUM_COMBOS]>>,
+    /// Recycled per-hand traversal buffers — see [`solve::Scratch`].  Held on
+    /// the solver (not per `run` call) so the pool stays warm across iterations.
+    scratch: solve::Scratch,
     t: u64,
 }
 
@@ -203,6 +206,7 @@ impl VectorCfr {
             chooser,
             inner_root: 0,
             carried: None,
+            scratch: solve::Scratch::default(),
             t: 0,
         };
         // A complete-board root shares one prepared showdown; incomplete roots

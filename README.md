@@ -19,13 +19,37 @@ cases, measured benefits, and drawbacks**, and [docs/](docs/) for deep dives
 ## Build & test
 
 ```bash
-cargo build --release
-cargo test                          # fast suite (~1 min, optimized test profile)
-cargo test --release -- --ignored   # heavy gates: full enumerations, convergence runs
+./check.sh          # fast lane: build, clippy, 254 tests            (~2 min)
+./check.sh gates    # heavy lane: the 14 oracle gates                (~10 min)
+./check.sh all      # both
 ```
+
+Run the fast lane before you stop for a session — it catches the whole "didn't
+compile / obvious breakage" class. Run the gates after touching a solver,
+abstraction or resolving path: those are what prove the fast production code
+still agrees with its slow oracle (see [Production vs. validation](#production-vs-validation)).
+
+The gates run at 2 threads under background QoS, because several allocate a few
+hundred MB and four at once pushes an 8 GB laptop into swap. `NICE=0 ./check.sh
+gates` runs at full speed on a machine that can take it.
 
 Everything is deterministic per seed: solvers, clustering, and the parallel
 training paths all reproduce bit-identical results for a fixed `(seed, batch)`.
+
+**Benchmarks are not tests** and deliberately aren't in either lane — they
+measure speed, which has no pass/fail and flakes on a throttled machine. Run
+them by hand on an idle box:
+
+```bash
+cargo run --release --example bench_train_paths     # MCCFR path throughput, parallel scaling
+cargo run --release --example bench_rbp             # RBP theta/K sensitivity
+cargo run --release --example bench_resolve_cost    # per-decision resolve cost by mode
+                                                    #   (add `-- all` for the multi-GB
+                                                    #    full-river / flop arms)
+cargo run --release --example bench_ochs            # OCHS vs scalar river feature
+cargo run --release --example bench_continual       # continual re-solving / warm start
+cargo run --release --example inspect_buckets       # what a bucket actually contains
+```
 
 ## Quick start: a converging blueprint in 20 seconds
 
@@ -40,7 +64,7 @@ MCCFR (3M iterations, ~20 s), prints the 13×13 SB shove chart plus a measured
 exploitability (mbb/hand), and persists the strategy to
 `data/blueprint_pushfold.bin`. Flags: `--optimistic`, `--rbp`,
 `--parallel[=BATCH]`, `--soa`, `--resume`, `--chunk=N`, `--expl-every=N`,
-`--data=DIR` (see `train --help` header in `src/bin/train.rs`).
+`--data=DIR` (see `train` header in `src/bin/train/main.rs`).
 
 ## Training the headline model (heads-up NLHE blueprint)
 
@@ -206,6 +230,7 @@ scripts/                    W&B wrapper, analysis helpers
 data/                       generated artifacts (gitignored)
 ```
 
+<a name="production-vs-validation"></a>
 ### Production vs. validation
 
 Everything under `validation/` exists **only to check the code above it**, and

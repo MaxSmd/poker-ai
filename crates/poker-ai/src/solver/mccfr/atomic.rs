@@ -37,13 +37,10 @@ use super::parallel::splitmix;
 use crate::games::{CursorGame, IndexedGame};
 use crate::solver::variant::Variant;
 use crate::solver::regret_table::RegretTable;
+use crate::solver::MAX_ACTIONS;
 use crate::util::rng::{sample_index, xorshift_next_unit};
 
 use super::BASELINE_RATE;
-
-/// Widest action fan-out the stack buffers support (the engine's `ActionList`
-/// caps at 8; asserted against the table layout before training starts).
-pub(super) const MAX_ACTIONS: usize = 8;
 
 /// Shared atomic view over the three flat accumulator arrays.  Constructed
 /// from an exclusive borrow of the table; all access goes through per-slot

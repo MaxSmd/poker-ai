@@ -20,7 +20,8 @@ use crate::{data_dir, emit_metric, parse_cadence, pushfold_pruning, RunConfig, B
 /// Build a (fresh, untrained) solver with `cfg` applied.
 fn build_solver(stack: u32, seed: u64, iters: u64, cfg: RunConfig) -> Mccfr<PushFoldHoldem> {
     let game = PushFoldHoldem::new(stack, BIG_BLIND, SMALL_BLIND, 0);
-    let mut solver = Mccfr::with_seed(game, Variant::Dcfr(Discount::RECOMMENDED), seed);
+    let variant = Variant::Dcfr(Discount::RECOMMENDED);
+    let mut solver = Mccfr::with_seed(game, variant, seed);
     // The parallel path can't use the serial-only refinements, so only enable
     // the baseline / optimistic / RBP stack on the serial path.
     if cfg.parallel_batch.is_none() {
@@ -29,6 +30,15 @@ fn build_solver(stack: u32, seed: u64, iters: u64, cfg: RunConfig) -> Mccfr<Push
             solver = solver.with_optimistic();
         }
         if cfg.rbp {
+            // Say so rather than let the flag look like it did something: β=0
+            // keeps negative regret near zero, so no branch ever reaches θ.
+            if !variant.accumulates_negative_regret() {
+                eprintln!(
+                    "warning: --rbp is inert under DCFR β=0 (the default schedule) — negative \n\
+                     regret is halved every iteration and never reaches θ, so nothing is pruned. \n\
+                     RBP needs vanilla CFR or β>0 (see solver::pruning)."
+                );
+            }
             solver = solver.with_pruning(pushfold_pruning(), iters);
         }
     }

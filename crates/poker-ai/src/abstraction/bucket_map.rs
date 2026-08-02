@@ -111,13 +111,20 @@ impl BucketMap {
         Self { num_buckets, indexer: HandIndexer::new(rounds), buckets: Vec::new() }
     }
 
-    /// A **test** full-coverage map assigning every canonical situation bucket
-    /// `index % k` — a cheap deterministic abstraction with total coverage, so
-    /// the dense SoA index has no out-of-set situations.  The flat slot table is
-    /// the full indexer size (cheap for the flop, large for turn/river — use in
-    /// `#[ignore]`d release tests for those).
-    #[cfg(test)]
-    pub(crate) fn full_coverage_mod(rounds: &[u8], k: u16) -> Self {
+    /// A **fixture**, not an abstraction: assigns every canonical situation
+    /// bucket `index % k`.
+    ///
+    /// Strategically meaningless — it groups hands by index arithmetic, so a
+    /// solver trained on it learns nothing.  What it provides is *total
+    /// coverage*, which is the property the dense SoA index needs: every
+    /// situation must map into the set, or `info_set_index` finds a hole.  That
+    /// makes it the right stand-in for measuring index and training-path
+    /// mechanics without first building a real 10-hour abstraction.
+    ///
+    /// Public because the benchmarks in `examples/` need it too, not only the
+    /// in-crate gates.  The flat slot table is the full indexer size — cheap for
+    /// the flop, ~280 MB for turn/river, so release builds only.
+    pub fn full_coverage_mod(rounds: &[u8], k: u16) -> Self {
         let indexer = HandIndexer::new(rounds);
         let size = indexer.size() as usize;
         let buckets = (0..size).map(|i| (i as u16) % k).collect();

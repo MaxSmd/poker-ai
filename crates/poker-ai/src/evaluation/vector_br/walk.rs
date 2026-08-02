@@ -254,6 +254,7 @@ impl<'a> Ctx<'a> {
                 // shrinking with more samples (documented on the CLI).
                 let prefix = card_mask(&gs.board[..revealed]);
                 let live: Vec<u8> = (0..52u8).filter(|&c| prefix & (1 << c) == 0).collect();
+                let live_len = live.len();
                 let cards: Vec<u8> = if self.board_samples == 0 || self.board_samples >= live.len() {
                     live
                 } else {
@@ -269,7 +270,7 @@ impl<'a> Ctx<'a> {
                     pool.truncate(self.board_samples);
                     pool
                 };
-                let div = cards.len() as f64;
+                let div = cards.len() as f64 * consistent_rate(live_len);
                 let mut out = vec![0.0f64; COMBOS];
                 for &c in &cards {
                     gs.board[revealed] = c;
@@ -360,6 +361,31 @@ impl<'a> Ctx<'a> {
     }
 }
 
+/// Fraction of a turn/river reveal's `live_len` branches that are consistent
+/// with a *pair* of hands: `(live_len − 4) / live_len`.
+///
+/// The chance layer above enumerates every card not on the board, but for a
+/// given (hero, opponent) pair only `live_len − 4` of those branches carry
+/// value — the two colliding with the hero are skipped when accumulating, and
+/// the two colliding with the opponent were zeroed by [`masked_reach`].  The
+/// numerator is therefore a 45-term (turn) or 44-term (river) sum, and it must
+/// be divided by 45 or 44 rather than by the 49 or 48 branches walked.
+///
+/// **This has been wrong once.**  Dividing by the enumerated count instead
+/// shrinks every chance node by this rate, compounding down the tree, and the
+/// BR reads systematically low — the whole metric, quietly, with no crash.  The
+/// scalar oracle catches it, but that gate costs an hour; the unit tests below
+/// cost nothing, so check the arithmetic here first.
+///
+/// This is the turn/river twin of [`FLOP_CONSISTENT_RATE`](super::FLOP_CONSISTENT_RATE),
+/// which applies the identical correction one street earlier.  In sampled mode
+/// it is also the expected fraction of the `k` draws that land consistent, so
+/// one expression serves both and the sampled estimator stays anchored to the
+/// exact one.
+fn consistent_rate(live_len: usize) -> f64 {
+    (live_len - 4) as f64 / live_len as f64
+}
+
 /// Bitmask of `cards`.
 pub(super) fn card_mask(cards: &[u8]) -> u64 {
     cards.iter().fold(0u64, |m, &c| m | 1 << c)
@@ -391,4 +417,42 @@ fn masked_reach(reach: &[f64], cards: &[u8], combo: &[[u8; 2]]) -> Vec<f64> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact-enumeration divisors, pinned to the values the scalar oracle
+    /// independently uses.  A turn reveal walks 52−3 = 49 cards but only 45 are
+    /// consistent with a given pair; a river reveal walks 48 and 44 are.
+    #[test]
+    fn exact_divisors_are_the_per_pair_consistent_counts() {
+        let turn_live = 52 - 3;
+        let river_live = 52 - 4;
+        assert_eq!(turn_live as f64 * consistent_rate(turn_live), 45.0);
+        assert_eq!(river_live as f64 * consistent_rate(river_live), 44.0);
+    }
+
+    /// Sampling `k` cards must scale the same way, so a sampled BR stays
+    /// anchored to the exact one instead of drifting by the rate above.
+    #[test]
+    fn sampled_divisor_scales_with_the_same_rate() {
+        let live = 49;
+        for k in [1usize, 3, 8, 49] {
+            let div = k as f64 * consistent_rate(live);
+            assert!(
+                (div - k as f64 * 45.0 / 49.0).abs() < 1e-12,
+                "k={k} divisor must be the expected consistent-draw count"
+            );
+        }
+    }
+
+    /// The rate is strictly below 1 and rises toward it as the deck grows —
+    /// the property that makes omitting it a silent *downward* bias.
+    #[test]
+    fn rate_is_below_one_and_increases_with_deck_size() {
+        assert!(consistent_rate(49) < 1.0);
+        assert!(consistent_rate(49) > consistent_rate(48));
+    }
 }

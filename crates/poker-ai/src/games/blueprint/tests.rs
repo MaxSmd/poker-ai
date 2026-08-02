@@ -230,60 +230,6 @@ fn indexed_preflop_only_partition_and_key_round_trip() {
     assert!(by_key.len() > 100, "should see many distinct starting-hand classes");
 }
 
-/// Full post-flop coverage: builds the turn/river full-coverage maps (~280 MB)
-/// so the dense index has no out-of-set situation.  Confirms the dense index
-/// partitions information sets identically to the `HashMap` key on every
-/// street, that `info_key_at` inverts it, and that the SoA solver trains over
-/// the indexed full game to valid distributions.
-///   cargo test -p poker-ai --release -- --ignored indexed_blueprint_postflop_and_soa
-/// Throughput comparison of the three SoA training paths on a realistic
-/// indexed blueprint tree (20 bb, cap-2) — the parallel-scaling
-/// deliverable.  Prints nodes/s per configuration; the assertions are a
-/// loose sanity ordering so a busy machine cannot flake the test.
-///   cargo test -p poker-ai --release -- --ignored --nocapture atomic_scaling
-#[test]
-#[ignore]
-fn atomic_scaling_benchmark() {
-    use crate::solver::variant::Variant;
-    use crate::solver::dcfr::Discount;
-    use crate::solver::mccfr::SoaMccfr;
-    use std::time::Instant;
-
-    let mk = || {
-        BlueprintHoldem::new(40, 2, 1, 0)
-            .with_raise_cap(2)
-            .with_street_bucket(0, BucketMap::full_coverage_mod(&[2, 3], 40))
-            .with_street_bucket(1, BucketMap::full_coverage_mod(&[2, 4], 40))
-            .with_street_bucket(2, BucketMap::full_coverage_mod(&[2, 5], 40))
-            .with_indexing()
-    };
-    let iters = 200_000u64;
-    let bench = |name: &str, f: &mut dyn FnMut(&mut SoaMccfr<BlueprintHoldem>)| -> f64 {
-        let mut s =
-            SoaMccfr::with_seed(mk(), Variant::Dcfr(Discount::RECOMMENDED), 1).with_baseline();
-        let t0 = Instant::now();
-        f(&mut s);
-        let secs = t0.elapsed().as_secs_f64();
-        let nps = s.nodes_visited() as f64 / secs;
-        println!("{name:>16}: {secs:6.2}s  {nps:>12.0} nodes/s");
-        nps
-    };
-
-    let serial = bench("serial", &mut |s| s.train(iters));
-    let parallel = bench("parallel(512)", &mut |s| s.train_parallel(iters, 512));
-    let mut atomic_best = 0.0f64;
-    for threads in [1usize, 2, 4, 8] {
-        let name = format!("atomic({threads})");
-        let nps = bench(&name, &mut |s| s.train_atomic(iters, threads));
-        atomic_best = atomic_best.max(nps);
-    }
-    assert!(atomic_best > serial, "atomic best {atomic_best} should beat serial {serial}");
-    assert!(
-        atomic_best > parallel,
-        "atomic best {atomic_best} should beat batched parallel {parallel}"
-    );
-}
-
 #[test]
 #[ignore]
 fn indexed_blueprint_postflop_and_soa() {

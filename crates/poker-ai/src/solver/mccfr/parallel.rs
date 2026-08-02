@@ -186,9 +186,11 @@ impl<G: Game> Mccfr<G> {
             Variant::Dcfr(d) => (d.positive_factor(t), d.negative_factor(t)),
         };
         let discount = matches!(self.variant, Variant::Dcfr(_));
+        let (optimistic, pruning) = (self.use_optimistic, self.pruning.is_some());
+        let new = |n: usize| move || Node::new(n, optimistic, pruning);
         self.nodes_visited += delta.nodes_visited;
         for (key, inst) in delta.regret_inst {
-            let node = self.nodes.entry(key).or_insert_with(|| Node::new(inst.len()));
+            let node = self.nodes.entry(key).or_insert_with(new(inst.len()));
             for (r, &i) in node.regret_sum.iter_mut().zip(&inst) {
                 if discount {
                     *r *= if *r > 0.0 { pos } else { neg };
@@ -197,7 +199,7 @@ impl<G: Game> Mccfr<G> {
             }
         }
         for (key, s) in delta.strat {
-            let node = self.nodes.entry(key).or_insert_with(|| Node::new(s.len()));
+            let node = self.nodes.entry(key).or_insert_with(new(s.len()));
             for (sum, &v) in node.strategy_sum.iter_mut().zip(&s) {
                 *sum += v;
             }
@@ -208,7 +210,7 @@ impl<G: Game> Mccfr<G> {
         if self.use_baseline {
             for (key, sums) in delta.baseline_sum {
                 let cnt = &delta.baseline_cnt[&key];
-                let node = self.nodes.entry(key).or_insert_with(|| Node::new(sums.len()));
+                let node = self.nodes.entry(key).or_insert_with(new(sums.len()));
                 for a in 0..node.baseline.len() {
                     if cnt[a] > 0 {
                         let mean = sums[a] / cnt[a] as f64;

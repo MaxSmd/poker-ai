@@ -42,6 +42,7 @@ use serde::{Deserialize, Serialize};
 
 use super::variant::Variant;
 use super::regret_table::RegretStore;
+use super::MAX_ACTIONS;
 use crate::util::rng::xorshift_next_unit;
 
 /// EMA learning rate for the VR-MCCFR baseline (mirrors `mccfr::BASELINE_RATE`).
@@ -57,12 +58,18 @@ const STRAT_SCALE: f64 = 64.0;
 const REGRET_SAT: f64 = 30_000.0;
 const STRAT_SAT: f64 = 60_000.0;
 
-/// Flat quantized accumulators: 6 bytes per (info set, action) vs the f32
-/// store's 12.  Same layout scheme (offsets + action counts) as `RegretTable`.
+/// Flat quantized accumulators: 6 bytes per (info set, action) with the
+/// VR-MCCFR baseline, **4 without**, vs the f32 store's 12/16.  Same layout
+/// scheme (offsets + action counts) as `RegretTable`.
 #[derive(Serialize, Deserialize)]
 pub struct LeanTable {
     regret: Vec<i16>,
     strategy_sum: Vec<u16>,
+    /// VR-MCCFR baseline — **empty unless
+    /// [`enable_baseline`](RegretStore::enable_baseline) was called.**  It is 2
+    /// of the 6 bytes per slot and only the control-variate paths read it, so a
+    /// run without baselines should not carry it; on this store that is a 33 %
+    /// cut of the thing the store exists to shrink.
     baseline: Vec<i16>,
     num_actions: Vec<u8>,
     offsets: Vec<u32>,
@@ -73,6 +80,14 @@ impl LeanTable {
     fn span(&self, info_set: usize) -> std::ops::Range<usize> {
         let start = self.offsets[info_set] as usize;
         start..start + self.num_actions[info_set] as usize
+    }
+
+    /// The baseline span, with a clear failure when control variates were never
+    /// enabled (an empty array would otherwise fail as an opaque slice range).
+    #[inline]
+    fn baseline_span(&self, info_set: usize) -> std::ops::Range<usize> {
+        debug_assert!(!self.baseline.is_empty(), "baseline read before `enable_baseline`");
+        self.span(info_set)
     }
 }
 
@@ -92,9 +107,15 @@ impl RegretStore for LeanTable {
         Self {
             regret: vec![0; total],
             strategy_sum: vec![0; total],
-            baseline: vec![0; total],
+            baseline: Vec::new(),
             num_actions,
             offsets,
+        }
+    }
+
+    fn enable_baseline(&mut self) {
+        if self.baseline.is_empty() {
+            self.baseline = vec![0; self.regret.len()];
         }
     }
 
@@ -111,9 +132,10 @@ impl RegretStore for LeanTable {
     }
 
     fn bytes_per_info_set(&self) -> usize {
-        let slots = self.regret.len();
+        // i16 regret + u16 strategy-sum, plus the i16 baseline when resident.
+        let per_slot = 2 + 2 + if self.baseline.is_empty() { 0 } else { 2 };
         let cap = self.capacity().max(1);
-        3 * 2 * (slots / cap)
+        per_slot * (self.regret.len() / cap)
     }
 
     fn strategy_into(&self, info_set: usize, out: &mut Vec<f64>) {
@@ -151,7 +173,8 @@ impl RegretStore for LeanTable {
 
         // Compute the updated fixed-point values in f64 (RTN), then store —
         // halving the whole info set first if any slot would saturate.
-        let mut new = [0.0f64; 8];
+        debug_assert!(regret.len() <= MAX_ACTIONS, "info set wider than the stack buffer");
+        let mut new = [0.0f64; MAX_ACTIONS];
         let mut peak = 0.0f64;
         for (a, (&r16, &u)) in regret.iter().zip(util).enumerate() {
             let mut r = r16 as f64 / REGRET_SCALE;
@@ -175,7 +198,8 @@ impl RegretStore for LeanTable {
         let span = self.span(info_set);
         let sums = &mut self.strategy_sum[span];
 
-        let mut new = [0.0f64; 8];
+        debug_assert!(sums.len() <= MAX_ACTIONS, "info set wider than the stack buffer");
+        let mut new = [0.0f64; MAX_ACTIONS];
         let mut peak = 0.0f64;
         for (a, (&s16, &p)) in sums.iter().zip(strategy).enumerate() {
             // Discount (RTN — a multiplicative step, no starvation risk), then
@@ -195,14 +219,15 @@ impl RegretStore for LeanTable {
     }
 
     fn baseline_pair(&self, info_set: usize, strategy: &[f64], chosen: usize) -> (f64, f64) {
-        let b = &self.baseline[self.span(info_set)];
+        let b = &self.baseline[self.baseline_span(info_set)];
         let exp = strategy.iter().zip(b).map(|(&p, &v)| p * v as f64 / BASELINE_SCALE).sum();
         (exp, b[chosen] as f64 / BASELINE_SCALE)
     }
 
     fn baseline_ema(&mut self, info_set: usize, a: usize, target: f64) {
         debug_assert!(a < self.num_actions[info_set] as usize);
-        let b = &mut self.baseline[self.offsets[info_set] as usize + a];
+        let slot = self.baseline_span(info_set).start + a;
+        let b = &mut self.baseline[slot];
         let cur = *b as f64 / BASELINE_SCALE;
         let next = cur + BASELINE_RATE * (target - cur);
         *b = (next * BASELINE_SCALE).round().clamp(i16::MIN as f64, i16::MAX as f64) as i16;
@@ -214,8 +239,12 @@ mod tests {
     use super::*;
     use crate::solver::dcfr::Discount;
 
+    /// Two info sets, three actions each, baseline resident (most tests here
+    /// exercise the accumulators; `baseline_is_optional` covers the lean form).
     fn table2() -> LeanTable {
-        LeanTable::build(2, &|_| 3)
+        let mut t = LeanTable::build(2, &|_| 3);
+        t.enable_baseline();
+        t
     }
 
     #[test]
@@ -278,5 +307,26 @@ mod tests {
         }
         assert!(t.is_visited(0));
         assert_eq!(t.bytes_per_info_set(), 18); // 3 arrays × 2 B × 3 actions
+    }
+
+    #[test]
+    fn baseline_is_optional() {
+        // A run without control variates must not carry the baseline array —
+        // it is 2 of the 6 bytes per slot, a third of the whole store.
+        let mut t = LeanTable::build(2, &|_| 3);
+        assert!(t.baseline.is_empty());
+        assert_eq!(t.bytes_per_info_set(), 12, "regret + strategy-sum only");
+        // Regret matching and averaging work unchanged without it.
+        t.add_regret(0, &[1.0, 3.0, -2.0], 0.0, 1, Variant::Vanilla);
+        let mut s = Vec::new();
+        t.strategy_into(0, &mut s);
+        assert!((s[0] - 0.25).abs() < 1e-9);
+
+        t.enable_baseline();
+        assert_eq!(t.bytes_per_info_set(), 18);
+        t.enable_baseline(); // idempotent — must not clear what is already there
+        t.baseline_ema(0, 1, 4.0);
+        t.enable_baseline();
+        assert!(t.baseline_pair(0, &[0.0, 1.0, 0.0], 1).1 != 0.0, "kept its value");
     }
 }
