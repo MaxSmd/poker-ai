@@ -16,8 +16,9 @@ see [summary.md](summary.md).
    key, dense `HandIndexer`, K-Means++ bucketing into per-street `BucketMap`s.
 2. **Blueprint solver** (`solver/`) — DCFR over external-sampling MCCFR with
    VR-MCCFR baselines, optional optimistic updates and regret-based pruning,
-   stored in a flat SoA regret table (`f32` regrets and baselines, `f64`
-   strategy sums — see [memory-budget.md](memory-budget.md)). Validated on
+   stored in a flat SoA regret table (`f32` throughout, the strategy sum
+   accumulated with stochastic rounding — see
+   [memory-budget.md](memory-budget.md)). Validated on
    Kuhn/Leduc against the full-traversal CFR oracle.
 3. **Evaluation** (`evaluation/`) — vectorized abstract-game best response and
    push/fold exploitability, the two metrics cheap enough to run in the loop.

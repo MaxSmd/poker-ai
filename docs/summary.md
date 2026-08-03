@@ -46,9 +46,9 @@ external-sampling MCCFR with a control-variate baseline for variance reduction,
 CFR⁺ with alternating regret-matching⁺ and linear averaging, optimistic /
 predictive regret updates, and regret-based pruning.
 
-**Storage & parallelism** — flat structure-of-arrays regret table (32 B per
-info set vs ~350 B on a hash map, f64 strategy sums for exact long-run
-averaging); two parallel training paths, a bit-reproducible mini-batch scheme
+**Storage & parallelism** — flat structure-of-arrays regret table (24 B per
+info set vs ~350 B on a hash map; all-`f32` accumulators, the strategy sum
+stochastically rounded so long-run averaging cannot freeze); two parallel training paths, a bit-reproducible mini-batch scheme
 and a lock-free atomic CAS scheme measured at **4.5×** the batched path;
 atomic checkpointing with resume.
 

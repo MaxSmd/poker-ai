@@ -108,9 +108,10 @@ cargo run --release --bin memory_estimate            # current bucket counts
 cargo run --release --bin memory_estimate -- 200 200 200   # what-if buckets
 ```
 
-Reference points: heads-up 200 bb cap-3 ≈ 299M info sets ≈ 14.5 GB;
-6-max 20 bb cap-2 ≈ 6.8B info sets ≈ 204 GB — see the tool's output for the
-full matrix before launching anything big.
+Reference points: heads-up 200 bb cap-3 ≈ 299M info sets ≈ 11 GB;
+6-max 20 bb cap-2 ≈ 6.8B info sets ≈ 161 GB — see the tool's output for the
+full matrix before launching anything big (it is the authority; these are the
+same reference points restated at the current 12 B/slot).
 
 ### 3. Train the blueprint (`train blueprint`)
 
@@ -126,9 +127,10 @@ cores — and everything it produced are in
 cite them from here; two copies drift.
 
 - `--cap=N` — betting abstraction: max raises per street (the tree-size lever)
-- `--soa` — flat structure-of-arrays regret store (16 B per (info set, action)
-  slot — 32 B/info set at 2 actions — vs ~350 B/info set on the HashMap path;
-  f64 strategy sums so long-run averaging stays exact, see
+- `--soa` — flat structure-of-arrays regret store (12 B per (info set, action)
+  slot — 24 B/info set at 2 actions — vs ~350 B/info set on the HashMap path;
+  all three accumulators `f32`, the strategy sum accumulated with stochastic
+  rounding so long-run averaging cannot freeze, see
   [docs/memory-budget.md](docs/memory-budget.md)). Needs the full-coverage
   abstraction from step 1.
 - `--atomic[=THREADS]` — lock-free atomic training (Pluribus-style in-place

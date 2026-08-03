@@ -60,9 +60,11 @@ use poker_core::state::{GameState, MAX_PLAYERS, NO_CARD};
 /// Match the trainer's blinds (`bin/train/main.rs`); stack(chips) = bb × BIG_BLIND.
 const BIG_BLIND: u32 = 2;
 const SMALL_BLIND: u32 = 1;
-/// Current store: f32 regret + f64 strategy-sum + f32 baseline per slot
-/// (the sum is f64 so long-run averaging cannot freeze below f32 precision).
-const BYTES_PER_SLOT: usize = 4 + 8 + 4;
+/// Current store: f32 regret + f32 strategy-sum + f32 baseline per slot.  The
+/// sum was `f64` — double the whole table — until stochastic rounding removed
+/// the reason (round-to-nearest freezes it past ~1.7e7 visits; see
+/// `solver::regret_table`).
+const BYTES_PER_SLOT: usize = 4 + 4 + 4;
 /// Per-info-set index overhead: `offsets` (u32) + `num_actions` (u8).
 const INDEX_BYTES_PER_INFOSET: usize = 4 + 1;
 /// Lean store (`LeanTable`, validated): `i16` regret + `u16` strategy-sum +
@@ -454,9 +456,9 @@ mod tests {
         let (info_sets, slots) = table_size(&m.counts, [169, 500, 500, 800]);
         assert_eq!(info_sets, 5_893_436);
         assert!(info_sets > old_info_sets, "keeping all-in at the cap adds nodes");
-        // 2.5 slots/info-set; 16 B/slot (f64 strategy sums) + 5 B index ≈ 0.265 GB.
+        // 2.5 slots/info-set; 12 B/slot + 5 B index ≈ 0.20 GB.
         let bytes = f32_bytes(info_sets, slots) as f64;
-        assert!((0.24e9..0.29e9).contains(&bytes), "got {}", fmt_bytes(bytes as u64));
+        assert!((0.18e9..0.22e9).contains(&bytes), "got {}", fmt_bytes(bytes as u64));
     }
 
     /// 6-max plumbing smoke test: micro stacks collapse the tree to a

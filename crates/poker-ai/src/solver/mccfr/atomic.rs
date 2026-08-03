@@ -36,18 +36,23 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use super::parallel::splitmix;
 use crate::games::{CursorGame, IndexedGame};
 use crate::solver::variant::Variant;
-use crate::solver::regret_table::RegretTable;
+use crate::solver::regret_table::{sr_add_with, RegretTable};
 use crate::solver::MAX_ACTIONS;
 use crate::util::rng::{sample_index, xorshift_next_unit};
 
 use super::BASELINE_RATE;
+
+/// Salt separating the stochastic-rounding stream from the sampling stream, so
+/// that changing the strategy-sum precision cannot perturb which trajectories a
+/// seed explores (see [`RegretStore::add_strategy`](crate::solver::regret_table::RegretStore::add_strategy)).
+pub(super) const SR_STREAM: u64 = 0x5352_524E_4447_3031;
 
 /// Shared atomic view over the three flat accumulator arrays.  Constructed
 /// from an exclusive borrow of the table; all access goes through per-slot
 /// `AtomicU32` (f32 bit-cast) operations.
 struct AtomicTable<'a> {
     regret: *mut f32,
-    strategy_sum: *mut f64,
+    strategy_sum: *mut f32,
     baseline: *mut f32,
     offsets: &'a [u32],
     num_actions: &'a [u8],
@@ -77,26 +82,6 @@ fn rmw(ptr: *mut f32, slot: usize, f: impl Fn(f32) -> f32) {
     let mut cur = a.load(Ordering::Relaxed);
     loop {
         let new = f(f32::from_bits(cur)).to_bits();
-        match a.compare_exchange_weak(cur, new, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return,
-            Err(seen) => cur = seen,
-        }
-    }
-}
-
-#[inline]
-fn atomic64_at(ptr: *mut f64, slot: usize) -> &'static AtomicU64 {
-    // Safety: same contract as `atomic_at`, for the f64 strategy-sum array.
-    unsafe { AtomicU64::from_ptr(ptr.add(slot).cast()) }
-}
-
-/// f64 counterpart of [`rmw`] for the strategy-sum array.
-#[inline]
-fn rmw64(ptr: *mut f64, slot: usize, f: impl Fn(f64) -> f64) {
-    let a = atomic64_at(ptr, slot);
-    let mut cur = a.load(Ordering::Relaxed);
-    loop {
-        let new = f(f64::from_bits(cur)).to_bits();
         match a.compare_exchange_weak(cur, new, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => return,
             Err(seen) => cur = seen,
@@ -150,12 +135,20 @@ impl AtomicTable<'_> {
     }
 
     /// The opponent's average-strategy accumulation (`weight · σ(a)` per slot,
-    /// into the exact `f64` sum).
+    /// stochastically rounded into the `f32` sum — see
+    /// [`sr_add_with`](crate::solver::regret_table::sr_add_with)).
+    ///
+    /// The uniform draw is taken **outside** the compare-and-swap, so a
+    /// contended retry re-rounds against the value it actually lost to rather
+    /// than burning a fresh draw; reusing one draw across retries is still
+    /// unbiased, because each attempt rounds its own exact sum.
     #[inline]
-    fn add_strategy(&self, index: usize, weight: f64, strategy: &[f64], n: usize) {
+    fn add_strategy(&self, index: usize, weight: f64, strategy: &[f64], n: usize, sr: &mut u64) {
         let (base, _) = self.span(index);
         for (a, &p) in strategy.iter().enumerate().take(n) {
-            rmw64(self.strategy_sum, base + a, |s| s + weight * p);
+            let inc = weight * p;
+            let u = xorshift_next_unit(sr);
+            rmw(self.strategy_sum, base + a, |s| sr_add_with(s, inc, u));
         }
     }
 
@@ -195,6 +188,7 @@ fn traverse<G: IndexedGame>(
     cursor: &mut G::Cursor,
     traverser: usize,
     rng: &mut u64,
+    sr: &mut u64,
     visited: &mut u64,
 ) -> f64 {
     *visited += 1;
@@ -204,7 +198,7 @@ fn traverse<G: IndexedGame>(
     }
     if CursorGame::is_chance(game, cursor) {
         CursorGame::sample_chance(game, cursor, || xorshift_next_unit(rng));
-        let v = traverse(ctx, cursor, traverser, rng, visited);
+        let v = traverse(ctx, cursor, traverser, rng, sr, visited);
         CursorGame::undo_chance(game, cursor);
         return v;
     }
@@ -223,7 +217,7 @@ fn traverse<G: IndexedGame>(
         let mut node_value = 0.0;
         for a in 0..num_actions {
             CursorGame::apply(game, cursor, a, acts[a]);
-            util[a] = traverse(ctx, cursor, traverser, rng, visited);
+            util[a] = traverse(ctx, cursor, traverser, rng, sr, visited);
             CursorGame::undo(game, cursor);
             node_value += strategy[a] * util[a];
         }
@@ -236,10 +230,10 @@ fn traverse<G: IndexedGame>(
         }
         node_value
     } else {
-        ctx.table.add_strategy(index, ctx.strategy_weight, &strategy, num_actions);
+        ctx.table.add_strategy(index, ctx.strategy_weight, &strategy, num_actions, sr);
         let a = sample_index(strategy[..num_actions].iter().copied(), xorshift_next_unit(rng));
         CursorGame::apply(game, cursor, a, acts[a]);
-        let v_child = traverse(ctx, cursor, traverser, rng, visited);
+        let v_child = traverse(ctx, cursor, traverser, rng, sr, visited);
         CursorGame::undo(game, cursor);
         if !ctx.use_baseline {
             return v_child;
@@ -321,8 +315,12 @@ pub(super) fn run_atomic<G: IndexedGame + Sync>(
                         strategy_weight,
                     };
                     let mut rng = splitmix(seed, t);
+                    // Rounding draws come from a stream of their own, so the
+                    // trajectories a seed explores do not depend on how the
+                    // strategy sum is stored.
+                    let mut sr = splitmix(seed ^ SR_STREAM, t);
                     for traverser in 0..players {
-                        traverse(&ctx, &mut cursor, traverser, &mut rng, &mut visited);
+                        traverse(&ctx, &mut cursor, traverser, &mut rng, &mut sr, &mut visited);
                     }
                 }
                 visited_total.fetch_add(visited, Ordering::Relaxed);

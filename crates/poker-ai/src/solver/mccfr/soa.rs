@@ -13,7 +13,7 @@ use super::BASELINE_RATE;
 use crate::games::{CursorGame, IndexedGame};
 use crate::solver::variant::Variant;
 use crate::solver::lean_table::LeanTable;
-use crate::solver::regret_table::{RegretStore, RegretTable};
+use crate::solver::regret_table::{sr_add, RegretStore, RegretTable};
 use crate::util::rng::{sample_index, xorshift_next_unit};
 
 // ── SoA (flat) blueprint solver ──────────────────────────────────────────────
@@ -34,6 +34,12 @@ pub struct SoaMccfr<G: IndexedGame, S: RegretStore = RegretTable> {
     use_baseline: bool,
     table: S,
     rng: u64,
+    /// Stochastic-rounding stream for the strategy sum, deliberately **separate
+    /// from `rng`**: both stores round their average-strategy accumulator, and
+    /// drawing those numbers from the sampling stream would make the set of
+    /// trajectories a seed explores depend on the storage precision — which
+    /// would have made the f64→f32 change impossible to A/B honestly.
+    sr_rng: u64,
     iterations: u64,
     nodes_visited: u64,
 }
@@ -55,7 +61,16 @@ impl<G: IndexedGame, S: RegretStore> SoaMccfr<G, S> {
     pub fn with_seed(game: G, variant: Variant, seed: u64) -> Self {
         let capacity = game.info_set_capacity();
         let table = S::build(capacity, &|i| game.actions_at(i));
-        Self { game, variant, use_baseline: false, table, rng: seed | 1, iterations: 0, nodes_visited: 0 }
+        Self {
+            game,
+            variant,
+            use_baseline: false,
+            table,
+            rng: seed | 1,
+            sr_rng: super::atomic::SR_STREAM ^ (seed | 1),
+            iterations: 0,
+            nodes_visited: 0,
+        }
     }
 
     /// Enable the VR-MCCFR baseline (control variate).  Stores that keep the
@@ -155,7 +170,7 @@ impl<G: IndexedGame, S: RegretStore> SoaMccfr<G, S> {
             }
             node_value
         } else {
-            self.table.add_strategy(index, &strategy, t, self.variant, &mut self.rng);
+            self.table.add_strategy(index, &strategy, t, self.variant, &mut self.sr_rng);
             let a = self.sample(&strategy);
             CursorGame::apply(&self.game, cursor, a, acts[a]);
             let v_child = self.traverse(cursor, traverser, t);
@@ -331,9 +346,10 @@ impl<G: IndexedGame> SoaMccfr<G, RegretTable> {
             }
         }
         for (key, s) in delta.strat {
+            let sr = &mut self.sr_rng;
             let ss = self.table.strategy_sum_mut(key as usize);
             for (sum, &v) in ss.iter_mut().zip(&s) {
-                *sum += v;
+                sr_add(sum, v, sr);
             }
         }
         if self.use_baseline {
@@ -353,10 +369,12 @@ impl<G: IndexedGame> SoaMccfr<G, RegretTable> {
     /// Write a resumable checkpoint (the flat table plus the small scalar config).
     pub fn save_checkpoint(&self, path: impl AsRef<Path>) -> io::Result<()> {
         let view = SoaCheckpointRef {
+            magic: SOA_CKPT_MAGIC,
             variant: &self.variant,
             use_baseline: self.use_baseline,
             table: &self.table,
             rng: self.rng,
+            sr_rng: self.sr_rng,
             iterations: self.iterations,
             nodes_visited: self.nodes_visited,
         };
@@ -376,37 +394,255 @@ impl<G: IndexedGame> SoaMccfr<G, RegretTable> {
 
     /// Restore from a checkpoint, re-supplying the game.  Streams from disk
     /// (no whole-file byte buffer — same rationale as the save path).
+    ///
+    /// Accepts **both** checkpoint layouts: the current one, and the pre-`f32`
+    /// one whose strategy sums were `f64` (see the `legacy` module below).  A
+    /// run interrupted under the old build resumes under this one, converted in
+    /// place.
     pub fn load_checkpoint(path: impl AsRef<Path>, game: G) -> io::Result<Self> {
-        let r = std::io::BufReader::new(std::fs::File::open(path)?);
-        let cp: SoaCheckpointOwned = bincode::deserialize_from(r).map_err(io::Error::other)?;
+        let path = path.as_ref();
+        let mut r = std::io::BufReader::new(std::fs::File::open(path)?);
+        // `peek_magic` consumes the marker, so what follows is exactly the
+        // body — which is why the read struct omits the `magic` field the
+        // write struct carries.
+        let cp = if peek_magic(&mut r)? == SOA_CKPT_MAGIC {
+            bincode::deserialize_from::<_, SoaCheckpointBody>(r).map_err(io::Error::other)?
+        } else {
+            let r = std::io::BufReader::new(std::fs::File::open(path)?);
+            legacy::load(r)?
+        };
         Ok(Self {
             game,
             variant: cp.variant,
             use_baseline: cp.use_baseline,
             table: cp.table,
             rng: cp.rng,
+            sr_rng: cp.sr_rng,
             iterations: cp.iterations,
             nodes_visited: cp.nodes_visited,
         })
     }
 }
 
+/// Marker at the head of a current-layout SoA checkpoint.  A pre-`f32`
+/// checkpoint starts with bincode's enum tag for `Variant` — a `u32` of 0 or 1
+/// — so the two are unambiguously distinguishable and an interrupted server run
+/// can be migrated instead of orphaned.
+const SOA_CKPT_MAGIC: u64 = 0x3241_4F53_524B_4F50; // "POKRSOA2", little-endian
+
+/// Read the leading `u64` without consuming it from the logical stream (the
+/// caller reopens the file for the branch it picks — checkpoints are large and
+/// streamed, so seeking beats buffering).
+fn peek_magic(r: &mut impl std::io::Read) -> io::Result<u64> {
+    let mut head = [0u8; 8];
+    match r.read_exact(&mut head) {
+        Ok(()) => Ok(u64::from_le_bytes(head)),
+        // A file too short to hold the marker is certainly not one.
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(0),
+        Err(e) => Err(e),
+    }
+}
+
 #[derive(Serialize)]
 struct SoaCheckpointRef<'a> {
+    magic: u64,
     variant: &'a Variant,
     use_baseline: bool,
     table: &'a RegretTable,
     rng: u64,
+    sr_rng: u64,
     iterations: u64,
     nodes_visited: u64,
 }
 
+/// The checkpoint after its marker: bincode writes fields back to back with no
+/// framing, so this is byte-for-byte the tail of [`SoaCheckpointRef`].
 #[derive(Deserialize)]
-struct SoaCheckpointOwned {
+struct SoaCheckpointBody {
     variant: Variant,
     use_baseline: bool,
     table: RegretTable,
     rng: u64,
+    sr_rng: u64,
     iterations: u64,
     nodes_visited: u64,
+}
+
+/// Reading the **pre-`f32`** checkpoint layout, whose strategy sums were `f64`.
+///
+/// bincode is not self-describing, so an old file cannot simply be handed to
+/// the current `Deserialize` — the field widths differ from `strategy_sum`
+/// onward and everything after it would be misread.  These mirrors reproduce
+/// the old layout exactly; loading one converts the sums to `f32` (a one-time
+/// round-to-nearest of an already-accumulated total, which preserves the
+/// within-info-set ratios that are the only thing the average depends on) and
+/// seeds the rounding stream from the run's own RNG so the resumed run stays
+/// deterministic.
+mod legacy {
+    use super::*;
+
+    #[derive(Deserialize)]
+    struct Table {
+        regret: Vec<f32>,
+        strategy_sum: Vec<f64>,
+        baseline: Vec<f32>,
+        prev_inst: Vec<f32>,
+        consec_below: Vec<u32>,
+        num_actions: Vec<u8>,
+        offsets: Vec<u32>,
+    }
+
+    #[derive(Deserialize)]
+    struct Checkpoint {
+        variant: Variant,
+        use_baseline: bool,
+        table: Table,
+        rng: u64,
+        iterations: u64,
+        nodes_visited: u64,
+    }
+
+    /// Serialize a table in the **old** layout — test-only, so the migration is
+    /// gated against bytes actually shaped like a pre-`f32` checkpoint rather
+    /// than against a hand-written assumption about them.
+    #[cfg(test)]
+    pub(super) fn write_v1(
+        w: impl std::io::Write,
+        variant: Variant,
+        use_baseline: bool,
+        table: &RegretTable,
+        rng: u64,
+        iterations: u64,
+        nodes_visited: u64,
+    ) -> io::Result<()> {
+        #[derive(Serialize)]
+        struct TableV1<'a> {
+            regret: &'a [f32],
+            strategy_sum: Vec<f64>,
+            baseline: &'a [f32],
+            prev_inst: &'a [f32],
+            consec_below: &'a [u32],
+            num_actions: &'a [u8],
+            offsets: &'a [u32],
+        }
+        #[derive(Serialize)]
+        struct CheckpointV1<'a> {
+            variant: Variant,
+            use_baseline: bool,
+            table: TableV1<'a>,
+            rng: u64,
+            iterations: u64,
+            nodes_visited: u64,
+        }
+        let parts = table.parts_for_test();
+        let view = CheckpointV1 {
+            variant,
+            use_baseline,
+            table: TableV1 {
+                regret: parts.0,
+                strategy_sum: parts.1.iter().map(|&x| x as f64).collect(),
+                baseline: parts.2,
+                prev_inst: parts.3,
+                consec_below: parts.4,
+                num_actions: parts.5,
+                offsets: parts.6,
+            },
+            rng,
+            iterations,
+            nodes_visited,
+        };
+        bincode::serialize_into(w, &view).map_err(io::Error::other)
+    }
+
+    pub(super) fn load(r: impl std::io::Read) -> io::Result<SoaCheckpointBody> {
+        let cp: Checkpoint = bincode::deserialize_from(r).map_err(io::Error::other)?;
+        let t = cp.table;
+        let table = RegretTable::from_parts(
+            t.regret,
+            t.strategy_sum.into_iter().map(|x| x as f32).collect(),
+            t.baseline,
+            t.prev_inst,
+            t.consec_below,
+            t.num_actions,
+            t.offsets,
+        );
+        Ok(SoaCheckpointBody {
+            variant: cp.variant,
+            use_baseline: cp.use_baseline,
+            table,
+            rng: cp.rng,
+            sr_rng: super::super::atomic::SR_STREAM ^ cp.rng,
+            iterations: cp.iterations,
+            nodes_visited: cp.nodes_visited,
+        })
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+    use crate::games::push_fold::PushFoldHoldem;
+    use crate::solver::dcfr::Discount;
+
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("soa_ckpt_{tag}_{}.bin", std::process::id()))
+    }
+
+    fn trained() -> SoaMccfr<PushFoldHoldem> {
+        let game = PushFoldHoldem::new(40, 2, 1, 0);
+        let mut s = SoaMccfr::with_seed(game, Variant::Dcfr(Discount::RECOMMENDED), 4).with_baseline();
+        s.train(20_000);
+        s
+    }
+
+    #[test]
+    fn current_checkpoint_round_trips_and_resumes() {
+        let s = trained();
+        let path = temp_path("v2");
+        s.save_checkpoint(&path).unwrap();
+        let loaded =
+            SoaMccfr::load_checkpoint(&path, PushFoldHoldem::new(40, 2, 1, 0)).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(loaded.iterations(), s.iterations());
+        assert_eq!(loaded.nodes_visited(), s.nodes_visited());
+        assert_eq!(loaded.average_strategy_at(0), s.average_strategy_at(0));
+    }
+
+    #[test]
+    fn a_pre_f32_checkpoint_still_loads() {
+        // The server's interrupted runs must survive the storage change: a file
+        // written in the old layout (f64 strategy sums, no magic marker) has to
+        // load, carry its counters, and keep its average strategy.
+        let s = trained();
+        let path = temp_path("v1");
+        {
+            let mut w = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+            legacy::write_v1(
+                &mut w,
+                s.variant,
+                s.use_baseline,
+                &s.table,
+                s.rng,
+                s.iterations,
+                s.nodes_visited,
+            )
+            .unwrap();
+            std::io::Write::flush(&mut w).unwrap();
+        }
+        let loaded =
+            SoaMccfr::load_checkpoint(&path, PushFoldHoldem::new(40, 2, 1, 0)).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(loaded.iterations(), s.iterations(), "counters survive");
+        assert_eq!(loaded.nodes_visited(), s.nodes_visited());
+        assert_eq!(loaded.bytes_per_info_set(), 24, "converted to the f32 layout");
+        // The sums went f64 -> f32, so the deployed strategy is preserved to
+        // f32 precision rather than bit-for-bit.
+        for (a, b) in loaded.average_strategy_at(0).iter().zip(s.average_strategy_at(0)) {
+            assert!((a - b).abs() < 1e-6, "strategy preserved: {a} vs {b}");
+        }
+        // …and it can keep training from there.
+        let mut resumed = loaded;
+        resumed.train(1_000);
+        assert_eq!(resumed.iterations(), s.iterations() + 1_000);
+    }
 }
