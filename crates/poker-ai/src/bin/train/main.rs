@@ -1,42 +1,46 @@
-//! Blueprint training entrypoint (Phase 1.5 / Phase 3).
+//! Blueprint training entrypoint.
 //!
-//! Trains the first *converging* heads-up blueprint — a push/fold NLHE strategy
-//! over the real `poker-core` engine — with external-sampling DCFR and writes
-//! the average strategy to `data/blueprint_pushfold.bin`.
+//! The no-subcommand form trains a *converging* heads-up blueprint — a push/fold
+//! NLHE strategy over the real `poker-core` engine — with external-sampling DCFR
+//! and writes the average strategy to `data/blueprint_pushfold.bin`.
 //!
 //! Push/fold is the right first target: it has no postflop, so it converges
 //! without the cloud-scale card abstraction (see
 //! [`poker_ai::games::push_fold`]).  The full-game blueprint
-//! ([`poker_ai::games::blueprint`]) reuses this exact training loop once a
-//! complete postflop abstraction is built; only the `Game` changes.
+//! ([`poker_ai::games::blueprint`]) reuses this exact training loop; only the
+//! `Game` changes.
 //!
-//! Usage:
-//!   train [iters] [stack_bb] [seed] [flags]
-//!     iters     MCCFR iterations           (default 1_000_000)
-//!     stack_bb  starting stack, big blinds (default 20)
-//!     seed      RNG seed                   (default 1)
-//!   flags (compose the Phase 3 algorithm stack onto the DCFR+baseline base):
-//!     --optimistic       predictive regret updates (R += 2rₜ − r_{t−1})
-//!     --rbp              Regret-Based Pruning
-//!     --parallel[=BATCH] mini-batch parallel MCCFR (plain external sampling)
-//!     --atomic[=THREADS] (with --soa) lock-free atomic training — near-linear
-//!                        core scaling, NOT bit-deterministic (default: all cores)
-//!     --chunk=N          iterations per progress line + checkpoint (default ~1%)
-//!     --expl-every=N     run the exploitability eval only every Nth chunk (def 10)
-//!     --data=DIR         artifact directory for maps/checkpoints/blueprints
-//!                        (default `data/` — point it at scratch space on
-//!                        quota-limited boxes)
+//! ```text
+//! train [iters] [stack_bb] [seed] [flags]
+//!   iters     MCCFR iterations           (default 1_000_000)
+//!   stack_bb  starting stack, big blinds (default 20)
+//!   seed      RNG seed                   (default 1)
+//! flags (compose refinements onto the DCFR + baseline base):
+//!   --optimistic       predictive regret updates (R += 2rₜ − r_{t−1})
+//!   --rbp              Regret-Based Pruning
+//!   --parallel[=BATCH] mini-batch parallel MCCFR (plain external sampling)
+//!   --atomic[=THREADS] (with --soa) lock-free atomic training — near-linear
+//!                      core scaling, NOT bit-deterministic (default: all cores)
+//!   --chunk=N          iterations per progress line + checkpoint (default ~1%)
+//!   --expl-every=N     run the exploitability eval only every Nth chunk (def 10)
+//!   --data=DIR         artifact directory for maps/checkpoints/blueprints
+//!                      (default `data/` — point it at scratch space on
+//!                      quota-limited boxes)
 //!
-//!   train compare [iters] [stack_bb] [seed]
-//!     Trains the base config and each Phase 3 feature in turn and prints a
-//!     recorded before/after table (final exploitability, wall-time, node
-//!     visits) — the evidence the features pay off on the real trainer.
+//! train compare [iters] [stack_bb] [seed]
+//!   Trains the base config and each refinement in turn and prints a recorded
+//!   before/after table (final exploitability, wall-time, node visits) — the
+//!   evidence the features pay off on the real trainer.
 //!
-//!   train blueprint [iters] [stack_bb] [seed] [flags]
-//!     Trains the full abstracted heads-up NLHE blueprint ([`BlueprintHoldem`]),
-//!     loading the `cluster`-built card abstraction from data/ and capping the
-//!     betting abstraction at `--cap=N` raises/street (default 1 — the memory
-//!     feasibility lever).  See [`run_blueprint`] for the full flag list.
+//! train blueprint [iters] [stack_bb] [seed] [flags]
+//!   Trains the full abstracted heads-up NLHE blueprint, loading the
+//!   `cluster`-built card abstraction from data/ and capping the betting
+//!   abstraction at `--cap=N` raises/street (default 1 — the memory
+//!   feasibility lever).
+//! ```
+//!
+//! See [`blueprint::run_blueprint`] for the full `train blueprint` flag list,
+//! and [`poker_ai::games::blueprint::BlueprintHoldem`] for the game it trains.
 
 mod blueprint;
 mod harness;
@@ -50,7 +54,7 @@ use poker_ai::util::cli::validate_flags;
 pub const BIG_BLIND: u32 = 2;
 pub const SMALL_BLIND: u32 = 1;
 
-/// Which Phase 3 refinements to compose onto the DCFR + baseline base.
+/// Which MCCFR refinements to compose onto the DCFR + baseline base.
 #[derive(Clone, Copy, Default)]
 pub struct RunConfig {
     pub optimistic: bool,

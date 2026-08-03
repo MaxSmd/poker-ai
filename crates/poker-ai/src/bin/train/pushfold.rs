@@ -161,7 +161,7 @@ pub fn run(args: &[String]) {
     print_shove_chart(stack, &avg);
 }
 
-/// Train the base config and each Phase 3 refinement in turn, printing a recorded
+/// Train the base config and each MCCFR refinement in turn, printing a recorded
 /// before/after table.  This is the evidence that composing optimistic updates,
 /// RBP, and parallelization onto the real trainer actually pays off (or, on a
 /// tree as small as push/fold, where it does and does not move the needle).
@@ -173,7 +173,7 @@ pub fn run_comparison(args: &[String]) {
     let eval_game = PushFoldHoldem::new(stack, BIG_BLIND, SMALL_BLIND, 0);
     let expl_deals = 2_000_000;
 
-    println!("Phase 3 feature comparison: {iters} iters, {stack_bb}bb, seed {seed}");
+    println!("Feature comparison: {iters} iters, {stack_bb}bb, seed {seed}");
     println!("(exploitability = exact-style MC best response of the average strategy)\n");
     println!("{:<28}{:>14}{:>16}{:>10}", "config", "expl (mbb/g)", "node visits", "time (s)");
     println!("{}", "-".repeat(68));
@@ -199,7 +199,8 @@ pub fn run_comparison(args: &[String]) {
     }
 }
 
-/// Train push/fold on the flat **SoA** [`RegretTable`] store (the ~10×-smaller
+/// Train push/fold on the flat **SoA**
+/// [`RegretTable`](poker_ai::solver::regret_table::RegretTable) store (the ~10×-smaller
 /// blueprint storage), via `--soa`.  Uses DCFR + the VR-MCCFR baseline; `--parallel`
 /// uses the SoA parallel path (which keeps the baseline).
 pub fn run_soa(args: &[String]) {
@@ -254,7 +255,8 @@ pub fn run_soa(args: &[String]) {
     });
 }
 
-/// Load the abstracted heads-up [`BlueprintHoldem`] for a real full-game training
+/// Load the abstracted heads-up
+/// [`BlueprintHoldem`](poker_ai::games::blueprint::BlueprintHoldem) for a real full-game training
 /// run: equal `stack` chips, raise abstraction capped at `cap` raises/street, and
 /// whatever per-street `{flop,turn,river}_buckets.bin` maps exist in `dir`
 /// Render the SB opening shove range as a 13×13 grid (upper triangle = suited)

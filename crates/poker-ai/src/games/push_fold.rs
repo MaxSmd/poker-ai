@@ -1,5 +1,5 @@
 //! Heads-up push/fold NLHE — the first *converging* blueprint over real
-//! mechanics (Phase 1.5).
+//! mechanics.
 //!
 //! [`super::blueprint::BlueprintHoldem`] is the full game, but it cannot
 //! converge locally: without a complete postflop card abstraction (the

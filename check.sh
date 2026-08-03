@@ -1,8 +1,8 @@
 #!/bin/sh
 # Verification, sized for a fanless laptop rather than a build farm.
 #
-#   ./check.sh          fast lane  — build, clippy, the 254-test suite  (~2 min)
-#   ./check.sh gates    heavy lane — the oracle gates                   (~10 min)
+#   ./check.sh          fast lane  — build, clippy, docs, tests  (~2 min)
+#   ./check.sh gates    heavy lane — the oracle gates             (~10 min)
 #   ./check.sh all      both
 #
 # Run the fast lane before you stop for the session; it catches the whole
@@ -37,6 +37,12 @@ fast() {
     cargo build --all-targets
     echo "== clippy =="
     cargo clippy --all-targets -- -D warnings
+    # Docs are gated like the code: a `[`Foo`]` that no longer resolves fails
+    # here. Without this the whole doc layer is the one subsystem with no
+    # check, and it rots silently under every rename. Covers the bins too,
+    # which the crate-level `deny` in lib.rs cannot reach.
+    echo "== docs =="
+    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all
     echo "== tests =="
     cargo test --release
 }

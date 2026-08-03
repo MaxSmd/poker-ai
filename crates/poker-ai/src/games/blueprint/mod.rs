@@ -142,7 +142,7 @@ impl BlueprintHoldem {
 
     /// Build the dense info-set `Indexing` so the game can drive the flat SoA
     /// regret store ([`crate::games::IndexedGame`] / [`crate::solver::mccfr::SoaMccfr`])
-    /// — the ~10×-smaller blueprint store the memory budget assumes (finding #4).
+    /// — the ~10×-smaller blueprint store `docs/memory-budget.md` assumes.
     ///
     /// Requires a **finite raise cap** (the uncapped betting tree is unbounded)
     /// and a **full-coverage** abstraction on every post-flop street (the dense

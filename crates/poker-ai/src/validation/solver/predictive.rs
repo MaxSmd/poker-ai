@@ -83,7 +83,7 @@ impl<G: Game> PredictiveSolver<G> {
         Self { game, nodes: HashMap::new(), iterations: 0 }
     }
 
-    /// **Warm-start** the regrets from a blueprint strategy (Phase 5 resolving).
+    /// **Warm-start** the regrets from a blueprint strategy.
     ///
     /// RM⁺ plays `σ ∝ [Z]⁺`, so seeding `Z(a) = π(a) · scale` makes the solver's
     /// *first-iterate* strategy equal to the blueprint `π` at every seeded info

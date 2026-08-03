@@ -1,4 +1,4 @@
-//! Counterfactual-value extraction (continual re-solving, finding #4).
+//! Counterfactual-value extraction, for continual re-solving.
 //!
 //! Continual re-solving (DeepStack) carries the opponent's **counterfactual
 //! values** (CFVs) forward from one resolve to the next: they become the

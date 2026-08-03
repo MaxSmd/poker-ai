@@ -1,4 +1,4 @@
-//! Pluggable leaf evaluator for depth-limited resolving (Phase 5).
+//! Pluggable leaf evaluator for depth-limited resolving.
 //!
 //! A subgame solver cannot search to the end of the hand within a 2–5 s budget,
 //! so it cuts the tree at a depth limit (e.g. the start of the next street) and

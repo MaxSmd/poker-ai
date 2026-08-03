@@ -1,4 +1,4 @@
-//! Warm-starting subgame solvers from blueprint values (Phase 5 resolving).
+//! Warm-starting subgame solvers from blueprint values.
 //!
 //! A resolving call has only a 2–5 s budget, so it should not start the subgame
 //! solver from a uniform strategy when the blueprint already has a reasonable

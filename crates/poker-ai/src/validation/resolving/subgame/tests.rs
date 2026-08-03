@@ -150,7 +150,7 @@ fn turn_subgame_uses_the_leaf_evaluator() {
     }
 }
 
-// ----- Phase 5 completion: warm-start, DCFR fallback, comparison, stress -----
+// ----- Warm-start, DCFR fallback, comparison, stress -----
 
 /// A clean river root with an arbitrarily inflated pot — the public state the
 /// resolver receives after an **off-tree** (e.g. overbet) line on a prior
@@ -217,7 +217,7 @@ fn dcfr_fallback_resolves_the_subgame() {
 
 #[test]
 fn predictive_matches_or_beats_dcfr_on_the_subgame() {
-    // The Phase 5 deliverable: a recorded comparison of predictive vs DCFR
+    // A recorded comparison of predictive vs DCFR
     // subgame solving at an equal budget.  Both reach a good strategy; the
     // predictive (CFR⁺) last iterate should be at least as good as DCFR's
     // average — the reason the resolver defaults to it.

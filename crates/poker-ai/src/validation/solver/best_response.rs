@@ -2,7 +2,7 @@
 //!
 //! In a two-player zero-sum game the *exploitability* of a strategy profile is
 //! the average amount each player can gain by deviating to a best response.
-//! Unlike Local Best Response (Phase 4, a sampled lower bound), this is the
+//! Unlike Local Best Response (a sampled lower bound), this is the
 //! exact value — feasible only because the validation games are tiny — and it
 //! is what proves the solver has actually reached the known equilibrium.
 //!

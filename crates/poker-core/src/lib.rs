@@ -1,3 +1,6 @@
+// See the note in `poker-ai/src/lib.rs`: broken doc links fail the build.
+#![deny(rustdoc::broken_intra_doc_links)]
+
 pub mod action;
 pub mod betting;
 pub mod evaluator;

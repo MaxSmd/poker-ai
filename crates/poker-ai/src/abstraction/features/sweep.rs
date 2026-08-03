@@ -110,7 +110,7 @@ pub fn board_cfvs(board: [u8; 5], opp_reach: &[f64; 1326], half_pot: f64, out: &
 /// different opponent-reach vectors without re-evaluating hands or re-sorting.
 ///
 /// The rank order is a function of the board alone (not the reach), so it is the
-/// one reusable part of the sweep.  Runout averaging (finding #1's turn leaf)
+/// one reusable part of the sweep.  Runout averaging (the turn-leaf case)
 /// applies the *same* board's structure across every CFR iteration and, via
 /// [`PreparedRunout`], across all 44 rivers — turning a per-iteration
 /// `O(runouts · n log n)` evaluate+sort into a one-time sort plus a linear sweep.

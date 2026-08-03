@@ -77,7 +77,7 @@ pub(super) enum NodeKind {
     ///
     /// `marker` namespaces the emitted key: `MARKER_NONE` for a betting node;
     /// `MARKER_CONTINUATION` for the opponent's depth-limit **continuation
-    /// choice** (finding #1: `player` is the fixed chooser, `children[i]` a
+    /// choice** (`player` is the fixed chooser, `children[i]` a
     /// `RunoutShowdown` at the `i`-th continuation's inflated pot, matching the
     /// explicit oracle's continuation info set); `MARKER_GADGET` for the
     /// re-solving gadget's per-hand Follow/Terminate choice (never emitted).

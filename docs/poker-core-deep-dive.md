@@ -237,7 +237,7 @@ The two evaluators give bit-identical results; the algorithmic one is the oracle
 
 ## 5. GameState: Packing Six Players into Tight Memory
 
-`GameState` ([`state.rs`](../crates/poker-core/src/state.rs)) holds all mutable state for one hand of 6-max NLHE:
+`GameState` ([`state/`](../crates/poker-core/src/state/)) holds all mutable state for one hand of 6-max NLHE:
 
 ```rust
 pub struct GameState {
@@ -665,9 +665,9 @@ The patterns in `poker-core` generalize beyond poker:
 
 ---
 
-## 13. What Comes Next
+## 13. What Is Built On Top
 
-`poker-core` is Phase 1 of a multi-phase roadmap (`poker-ai-plan-v3.md`) to build a competitive heads-up / 6-max NLHE AI. The engine is the foundation; the strength comes from everything built on top in the `poker-ai` crate:
+`poker-core` is the foundation of a competitive heads-up NLHE agent; the strength comes from everything built on top of it in the `poker-ai` crate. All of the following is implemented — see [summary.md](summary.md) for what each one measured:
 
 **Information Abstraction**: compress the astronomical hand/board space into a tractable set of buckets using equity-distribution features clustered with K-Means++. Coarse abstraction is a permanent ceiling no amount of solver iterations can overcome.
 
@@ -698,4 +698,4 @@ The result is an engine that traverses tens of millions of nodes per second on a
 
 ---
 
-*This article describes the `poker-core` crate as implemented in this repository. The broader solver pipeline — DCFR/MCCFR, information abstraction, exploitability evaluation, and subgame resolving — lives in `poker-ai` and is described in `poker-ai-plan-v3.md` and the companion progress notes.*
+*This article describes the `poker-core` crate as implemented in this repository. The broader solver pipeline — DCFR/MCCFR, information abstraction, exploitability evaluation, and subgame resolving — lives in `poker-ai`; see [architecture.md](architecture.md) for the system design, [options.md](options.md) for every implemented option, and [summary.md](summary.md) for measured results.*

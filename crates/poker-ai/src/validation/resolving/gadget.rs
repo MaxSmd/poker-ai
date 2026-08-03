@@ -1,4 +1,4 @@
-//! The re-solving gadget — safe continual re-solving (finding #4).
+//! The re-solving gadget — safe continual re-solving.
 //!
 //! A plain [`Subgame`] resolve is anchored only on the opponent's *blueprint
 //! range*; it can hand the opponent more than an earlier resolve promised, so

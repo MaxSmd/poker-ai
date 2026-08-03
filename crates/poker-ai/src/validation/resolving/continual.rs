@@ -1,4 +1,4 @@
-//! Continual re-solving driver (finding #4).
+//! Continual re-solving driver.
 //!
 //! Instead of re-deriving every decision from raw blueprint beliefs (Pluribus
 //! style), continual re-solving **carries the opponent's counterfactual values

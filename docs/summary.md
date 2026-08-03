@@ -1,7 +1,7 @@
 # Poker AI — Technical Report
 
-A heads-up No-Limit Texas Hold'em agent written from scratch in Rust
-(~23.9k LoC), following the Libratus/DeepStack architecture: a coarse
+A heads-up No-Limit Texas Hold'em agent written from scratch in Rust,
+following the Libratus/DeepStack architecture: a coarse
 **blueprint strategy** trained offline by Monte-Carlo CFR over a card and
 betting abstraction, refined at play time by **depth-limited continual
 re-solving** with a counterfactual-value gadget. It plays the public
@@ -9,6 +9,10 @@ re-solving** with a counterfactual-value gadget. It plays the public
 currently beats it.
 
 ## Headline results
+
+All figures below come from **one** blueprint run — 200 bb, cap-3, `--soa
+--atomic`, 3×10⁹ iterations — and describe that artifact, not the current
+defaults in `cluster` / `train`, which have moved since.
 
 | Metric | Result |
 |---|---|
@@ -18,7 +22,7 @@ currently beats it.
 | Training cost | 3×10⁹ MCCFR iterations / 3.15×10¹² nodes in 13.9 h on 32 cores (**62.9M nodes/s**) |
 | Card abstraction | 1500 flop / 1500 turn / 800 river buckets over 1.29M / 13.96M / 123.16M canonical situations |
 | Play-time re-solve | ~1–2 s per river decision, full 1326-hand ranges |
-| Test suite | 250 tests, 0 failures, 0 clippy warnings; deterministic per seed |
+| Test suite | `./check.sh all` green — 0 failures, 0 clippy warnings, 0 rustdoc warnings; deterministic per seed |
 
 The exploitability figure is measured against a **card-exact** nemesis (it sees
 exact hole cards; the blueprint sees only buckets), so it upper-bounds the cost
@@ -56,8 +60,8 @@ at depth cuts; explicit river chance nodes on turn re-solves.
 
 **Deployment** — dual-state tracking mirroring the real hand inside the abstract
 game, with randomized pseudo-harmonic action translation (Ganzfried & Sandholm)
-for off-tree opponent bets; memory-mapped compact policy (~9 GB resident for an
-8 GB artifact vs ~25 GB as a hash map).
+for off-tree opponent bets; Bayesian range tracking with card removal at every
+decision; the blueprint is loaded from the flat SoA artifact the trainer writes.
 
 **Evaluation** — vectorized exact best response over the abstract game,
 AIVAT-style chance-only control variates for variance-reduced match scoring,

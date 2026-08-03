@@ -81,7 +81,7 @@ pub type ExplFn<G> = Box<dyn Fn(&Mccfr<G>) -> f64>;
 
 /// [`TrainerOps`] for the HashMap solver on the cursor fast path.  `expl` is
 /// the optional gated evaluator (push/fold supplies one; the blueprint has no
-/// affordable in-loop estimator — see [`run_blueprint`]).
+/// affordable in-loop estimator — see [`crate::blueprint::run_blueprint`]).
 pub struct CursorTrainer<G: Game + CursorGame> {
     pub solver: Mccfr<G>,
     pub parallel_batch: Option<u64>,

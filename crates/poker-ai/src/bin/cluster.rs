@@ -1,4 +1,4 @@
-//! Offline information-abstraction builder (Phase 2).
+//! Offline information-abstraction builder.
 //!
 //! Built **per board** via the equity sweep ([`board_equities`] /
 //! [`board_histograms`]): one board scores all ~1081 holes at once in
@@ -8,7 +8,7 @@
 //!
 //! Boards are enumerated by a suit-isomorphic board indexer and processed in
 //! parallel; each board emits `(joint slot, feature)` entries that are merged
-//! serially into the flat [`EquityCache`] keyed by finding #2's joint
+//! serially into the flat [`EquityCache`] keyed by the joint suit-isomorphic
 //! `(hole, board)` index.  Writes to a joint slot from different raw boards are
 //! idempotent (suit-iso ⇒ identical feature), and iterating canonical boards ×
 //! all holes covers every joint class.
@@ -28,15 +28,16 @@
 //! `POKER_AI_CLUSTER_MEM_GB` so the turn street builds too — e.g. on a 64 GB
 //! server `POKER_AI_CLUSTER_MEM_GB=8 cluster 0` builds all three streets full.
 //!
-//! Usage:
-//!   cluster [cap] [seed] [flop_k] [turn_k] [river_k] [--data=DIR]
-//!     cap   max canonical boards to process per street; 0 = full  (default 300)
-//!     seed  K-Means++ seed for flop/turn clustering                (default 1)
-//!     *_k   bucket counts per street (defaults 1500/1500/3000)
-//!     --data=DIR  output directory for the caches/maps (default `data/`)
-//!   env:
-//!     POKER_AI_CLUSTER_MEM_GB   per-street flat-cache budget in GB  (default 1.5)
-//!     POKER_AI_RIVER_OCHS       1/true → OCHS river feature (default scalar)
+//! ```text
+//! cluster [cap] [seed] [flop_k] [turn_k] [river_k] [--data=DIR]
+//!   cap   max canonical boards to process per street; 0 = full  (default 300)
+//!   seed  K-Means++ seed for flop/turn clustering                (default 1)
+//!   *_k   bucket counts per street (defaults 1500/1500/3000)
+//!   --data=DIR  output directory for the caches/maps (default `data/`)
+//! env:
+//!   POKER_AI_CLUSTER_MEM_GB   per-street flat-cache budget in GB  (default 1.5)
+//!   POKER_AI_RIVER_OCHS       1/true → OCHS river feature (default scalar)
+//! ```
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -223,7 +224,7 @@ fn main() {
     // `memory_estimate` so the two tools stay in lockstep — check the
     // footprint there BEFORE spending the build time here.  Defaults bumped
     // from the original 500/500/800 plan minimum: river dominates node count
-    // (~78%, Step 18/29 finding) so it gets the largest multiplier.
+    // (~78% of all info sets) so it gets the largest multiplier.
     let flop_buckets: usize = nums.get(2).and_then(|s| s.parse().ok()).unwrap_or(1500);
     let turn_buckets: usize = nums.get(3).and_then(|s| s.parse().ok()).unwrap_or(1500);
     let river_buckets: usize = nums.get(4).and_then(|s| s.parse().ok()).unwrap_or(3000);

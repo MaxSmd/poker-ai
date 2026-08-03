@@ -36,7 +36,7 @@ impl<G: Game> Mccfr<G> {
     // baseline snapshot as the control variate and emit per-(info set, action)
     // target deltas that are merged as EMA steps in iteration order, so the result
     // stays deterministic.  Optimistic and pruning remain serial-only — they
-    // compose poorly with batch staleness and were inert on push/fold (Step 15).
+    // compose poorly with batch staleness and were inert on push/fold.
 
     /// Train with `total_iters` iterations, running `batch` iterations in
     /// parallel at a time (mini-batch MCCFR).  Deterministic for a fixed seed and

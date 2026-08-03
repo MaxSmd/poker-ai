@@ -36,10 +36,13 @@
 //!   and rejected; see `lean_table.rs`).  Half the accumulator bytes at equal
 //!   measured convergence.
 //!
-//! Usage (from the repo root):
-//!   memory_estimate [flop_buckets] [turn_buckets] [river_buckets]
-//! Defaults: 500 500 800 (the current cluster build). Pre-flop is always the
-//! 169 canonical classes. `POKER_AI_ESTIMATE_STATES` caps the memo (default
+//! ```text
+//! memory_estimate [flop_buckets] [turn_buckets] [river_buckets]
+//! ```
+//!
+//! Bucket defaults track `cluster`'s (see its `main`), so a no-arg run reports
+//! the abstraction `cluster` actually builds. Pre-flop is always the 169
+//! canonical classes. `POKER_AI_ESTIMATE_STATES` caps the memo (default
 //! 15M states ≈ a few GB); a config that exceeds it is reported as truncated.
 
 use std::collections::HashMap;
@@ -54,7 +57,7 @@ use poker_core::action::{Action, ActionList};
 use poker_core::legal_actions;
 use poker_core::state::{GameState, MAX_PLAYERS, NO_CARD};
 
-/// Match the trainer's blinds ([`crate::bin::train`]); stack(chips) = bb × BIG_BLIND.
+/// Match the trainer's blinds (`bin/train/main.rs`); stack(chips) = bb × BIG_BLIND.
 const BIG_BLIND: u32 = 2;
 const SMALL_BLIND: u32 = 1;
 /// Current store: f32 regret + f64 strategy-sum + f32 baseline per slot
@@ -339,11 +342,13 @@ fn main() {
     let argv: Vec<String> = std::env::args().collect();
     validate_flags(&argv, 1, &[], 3);
     let args: Vec<u64> = std::env::args().skip(1).filter_map(|a| a.parse().ok()).collect();
+    // Defaults track `cluster`'s, so a no-arg run reports the footprint of the
+    // abstraction `cluster` actually builds. Change these together.
     let buckets = [
         169u64,
-        args.first().copied().unwrap_or(500),
-        args.get(1).copied().unwrap_or(500),
-        args.get(2).copied().unwrap_or(800),
+        args.first().copied().unwrap_or(1500),
+        args.get(1).copied().unwrap_or(1500),
+        args.get(2).copied().unwrap_or(3000),
     ];
     let rule = CapRule::from_env();
     let limit: usize = std::env::var("POKER_AI_ESTIMATE_STATES")
@@ -429,8 +434,8 @@ mod tests {
     /// A regression pin on the walker's own exact enumeration (heads-up,
     /// 20 bb, cap-2, buckets 169/500/500/800), NOT a live server cross-check:
     /// the numbers below were re-measured after `PREFLOP_BET_FRACS` changed
-    /// (Step 39, min-open 2.5bb→2bb) and no longer match the Step 28/29
-    /// server run (which trained the OLD abstraction: 4,631,870 / 5,011,836).
+    /// its min-open from 2.5 bb to 2 bb, and no longer match the last server
+    /// run, which trained the OLD abstraction (4,631,870 / 5,011,836).
     /// A fresh server run under the new abstraction should re-validate this
     /// pin against `with_indexing()`'s real count before it is trusted as a
     /// cross-check again; until then it only guards the walker against

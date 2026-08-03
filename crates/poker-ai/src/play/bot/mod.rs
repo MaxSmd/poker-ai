@@ -17,7 +17,7 @@
 //!   real river betting below it (exact to showdown, no leaf model — the
 //!   default; `turn_full_river = false` falls back to the K-continuation
 //!   check-down cut); a **flop** resolve cuts at the undealt turn with the
-//!   opponent choosing among K continuations at the leaf (finding #1) so the
+//!   opponent choosing among K continuations at the leaf, so the
 //!   resolve is robust to post-leaf betting the check-down ignores.  Turn/flop
 //!   resolves are far costlier than river ones and are opt-in.
 //! * **Continual re-solving** (DeepStack-style, on by default) — every resolve
@@ -59,7 +59,7 @@ pub struct BotConfig {
     /// Raise cap inside a resolve (bounds the public tree; used at every street).
     pub river_cap: u32,
     /// Rest-of-hand pot scales for the turn/flop depth-limit continuation choice
-    /// (finding #1): the opponent picks among these at each runout leaf, so the
+    /// the opponent picks among these at each runout leaf, so the
     /// resolve is robust to the post-leaf betting a plain check-down ignores.
     /// `scales[0]` should be `0.0`; `[0.0]` is a single check-down (no chooser).
     pub continuations: Vec<f64>,

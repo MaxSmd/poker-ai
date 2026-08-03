@@ -1,4 +1,4 @@
-//! Bucket-quality inspector (Phase 2 deliverable: "inspect bucket contents
+//! Bucket-quality inspector ("inspect bucket contents
 //! manually — each bucket should contain hands that feel intuitively similar").
 //!
 //! Builds a fresh river abstraction on one fixed board — enumerate every hole

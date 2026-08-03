@@ -1,6 +1,6 @@
 # Poker AI
 
-A No-Limit Texas Hold'em AI in Rust, built on the Pluribus/DeepStack architecture:
+A No-Limit Texas Hold'em AI in Rust, built on the Libratus/DeepStack architecture:
 a **coarse blueprint strategy** trained offline with Monte-Carlo CFR over a card-
 and betting-abstraction, sharpened at play time by **depth-limited continual
 re-solving** with CFV-gadget safety.
@@ -19,8 +19,8 @@ cases, measured benefits, and drawbacks**, and [docs/](docs/) for deep dives
 ## Build & test
 
 ```bash
-./check.sh          # fast lane: build, clippy, 254 tests            (~2 min)
-./check.sh gates    # heavy lane: the 14 oracle gates                (~10 min)
+./check.sh          # fast lane: build, clippy, docs, tests         (~2 min)
+./check.sh gates    # heavy lane: the oracle gates                  (~10 min)
 ./check.sh all      # both
 ```
 
@@ -28,6 +28,10 @@ Run the fast lane before you stop for a session — it catches the whole "didn't
 compile / obvious breakage" class. Run the gates after touching a solver,
 abstraction or resolving path: those are what prove the fast production code
 still agrees with its slow oracle (see [Production vs. validation](#production-vs-validation)).
+
+The fast lane also builds the docs with `RUSTDOCFLAGS="-D warnings"`, so a
+`[`Foo`]` link that a rename broke fails the same pass as a clippy lint. Docs
+are the easiest layer to let rot; this is the gate that stops it.
 
 The gates run at 2 threads under background QoS, because several allocate a few
 hundred MB and four at once pushes an 8 GB laptop into swap. `NICE=0 ./check.sh
@@ -111,16 +115,22 @@ full matrix before launching anything big.
 ### 3. Train the blueprint (`train blueprint`)
 
 ```bash
-# The headline run (production server config — Slumbot-depth 200bb stacks;
-# measured: 8.2 h / ~16 GB RSS on 32 cores, 2B iterations, 2.0T nodes):
-cargo run --release --bin train -- blueprint 2000000000 200 1 \
+# The headline run: production server config, Slumbot-depth 200 bb stacks.
+cargo run --release --bin train -- blueprint 3000000000 200 1 \
     --cap=3 --soa --atomic --resume
 ```
 
+Measured cost of that run — 3×10⁹ iterations, 3.15×10¹² nodes, 13.9 h on 32
+cores — and everything it produced are in
+[docs/summary.md](docs/summary.md#headline-results). Keep the numbers there and
+cite them from here; two copies drift.
+
 - `--cap=N` — betting abstraction: max raises per street (the tree-size lever)
-- `--soa` — flat structure-of-arrays regret store (32 B/info set vs ~350 B on
-  the HashMap path; f64 strategy sums so long-run averaging stays exact).
-  Needs the full-coverage abstraction from step 1.
+- `--soa` — flat structure-of-arrays regret store (16 B per (info set, action)
+  slot — 32 B/info set at 2 actions — vs ~350 B/info set on the HashMap path;
+  f64 strategy sums so long-run averaging stays exact, see
+  [docs/memory-budget.md](docs/memory-budget.md)). Needs the full-coverage
+  abstraction from step 1.
 - `--atomic[=THREADS]` — lock-free atomic training (Pluribus-style in-place
   CAS updates; defaults to all cores). Near-linear scaling — measured 4.5×
   over the batched path on 4 performance cores — at the cost of
@@ -177,7 +187,7 @@ Architecture (`crates/poker-ai/src/play/`):
 - **River re-solving** — each river decision is re-solved from the *actual*
   public state (real pot/stacks, so translation error vanishes where the money
   is deepest) with the vectorized full-range public-tree CFR⁺ solver
-  (`resolving/vector_cfr.rs`, ~1–2 s per decision). `--no-resolve` plays the
+  (`resolving/vector_cfr/`, ~1–2 s per decision). `--no-resolve` plays the
   blueprint throughout instead.
 - The runner prints a running **bb/100 ± 95% CI**, emits `@wandb` metric lines
   (wrap with `scripts/train_wandb.py` to chart a long match), persists the
@@ -197,7 +207,7 @@ resolving is wired into the bot but off by default (`--resolve-turn`
 ## Evaluation toolkit
 
 - `play expl`: vectorized abstract-game best response — the blueprint quality
-  metric (`evaluation/vector_br.rs`)
+  metric (`evaluation/vector_br/`)
 - `evaluation/exploitability.rs`: exact-style push/fold exploitability (mbb/g)
 - `validation/evaluation/local_br.rs`: sampled best response, generic over
   `Game` — the tool for future non-`BlueprintHoldem` (e.g. multiway) games

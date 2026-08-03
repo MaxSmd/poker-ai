@@ -64,7 +64,7 @@ impl VectorCfr {
             }
             // Board undealt (depth cut or all-in run-out): check-down showdown
             // averaged over the runout.  With K > 1 continuations, the opponent
-            // first chooses among them (finding #1); otherwise a plain leaf.
+            // first chooses among them; otherwise a plain leaf.
             // In full-river mode a turn all-in run-out gets NO chooser: with no
             // betting left, the plain check-down is exact and a continuation
             // choice would hand the opponent fictitious post-all-in leverage.
@@ -131,7 +131,7 @@ impl VectorCfr {
         id
     }
 
-    /// Build the depth-limit **continuation-choice** node (finding #1): a
+    /// Build the depth-limit **continuation-choice** node: a
     /// decision owned by the fixed [`chooser`](Self::chooser) with one action per
     /// `scales` entry, whose `i`-th child is a `RunoutShowdown` at the inflated
     /// pot `half_pot·(1 + scales[i])`.  Inflating a check-down pot by `s` scales

@@ -17,6 +17,8 @@ use poker_ai::solver::mccfr::Mccfr;
 use crate::harness::{run_chunked, CursorTrainer, SoaMode, SoaTrainer};
 use crate::{data_dir, emit_metric, parse_cadence, BIG_BLIND, SMALL_BLIND};
 
+/// Build the blueprint game at `stack` chips and `cap` raises/street, with every
+/// per-street `{flop,turn,river}_buckets.bin` map found in `dir`
 /// attached (a missing map leaves that street unabstracted — correct, but its
 /// info sets won't plateau, which is the signal that the abstraction is needed).
 pub fn load_blueprint_game(dir: &Path, stack: u32, cap: u32, verbose: bool) -> BlueprintHoldem {
@@ -39,7 +41,8 @@ pub fn load_blueprint_game(dir: &Path, stack: u32, cap: u32, verbose: bool) -> B
     game
 }
 
-/// Train the **full heads-up NLHE blueprint** ([`BlueprintHoldem`]) — the real
+/// Train the **full heads-up NLHE blueprint**
+/// ([`BlueprintHoldem`]) — the real
 /// abstracted game, the cloud-burst training target — with external-sampling
 /// DCFR + the VR-MCCFR baseline, checkpointing each chunk (so a preempted spot
 /// instance resumes with `--resume`).  Card abstraction is loaded from the
@@ -47,16 +50,17 @@ pub fn load_blueprint_game(dir: &Path, stack: u32, cap: u32, verbose: bool) -> B
 /// is capped at `--cap` raises/street (the feasibility lever — cap 1 fits a
 /// 64 GB box, see `memory_estimate`).
 ///
-/// Usage:
-///   train blueprint [iters] [stack_bb] [seed] [flags]
-///     --cap=N            raises per street (default 1)
-///     --soa              flat SoA regret store (~10× smaller; needs full-coverage
-///                        maps + finite cap — the cap-2/128 GB path, finding #4)
-///     --optimistic       predictive regret updates (serial path only; not --soa)
-///     --parallel[=BATCH] mini-batch parallel MCCFR (keeps the baseline)
-///     --resume           continue from blueprint_holdem[_soa].ckpt
-///     --chunk=N          iterations per progress line + checkpoint (default ~1%)
-///     --data=DIR         artifact directory (default `data/`)
+/// ```text
+/// train blueprint [iters] [stack_bb] [seed] [flags]
+///   --cap=N            raises per street (default 1)
+///   --soa              flat SoA regret store (~10× smaller; needs full-coverage
+///                      maps + finite cap)
+///   --optimistic       predictive regret updates (serial path only; not --soa)
+///   --parallel[=BATCH] mini-batch parallel MCCFR (keeps the baseline)
+///   --resume           continue from blueprint_holdem[_soa].ckpt
+///   --chunk=N          iterations per progress line + checkpoint (default ~1%)
+///   --data=DIR         artifact directory (default `data/`)
+/// ```
 ///
 /// Exploitability is NOT measured in-loop: the sampled best-response bound needs
 /// infeasibly many samples on this tree (it read *negative* at practical
@@ -107,7 +111,7 @@ pub fn run_blueprint(args: &[String]) {
     } else {
         let game = load_blueprint_game(&dir, stack, cap, true);
         let mut s = Mccfr::with_seed(game, Variant::Dcfr(Discount::RECOMMENDED), seed).with_baseline();
-        // Optimistic is serial-only (composes poorly with batch staleness — Step 15).
+        // Optimistic is serial-only: it composes poorly with batch staleness.
         if parallel_batch.is_none() && optimistic {
             s = s.with_optimistic();
         }
@@ -144,7 +148,7 @@ pub fn run_blueprint(args: &[String]) {
 }
 
 /// Train the heads-up NLHE blueprint with the **flat SoA regret store** instead
-/// of the `HashMap` — the ~10×-smaller table (finding #4) that lets the cap-2
+/// of the `HashMap` — the ~10×-smaller table that lets the cap-2
 /// abstraction fit a 128 GB box.  Needs a finite `--cap` and full-coverage
 /// `data/{flop,turn,river}_buckets.bin` (the dense index has one slot per
 /// `(sequence, bucket)`); the game's [`BlueprintHoldem::with_indexing`] enforces

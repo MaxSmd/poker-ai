@@ -1,4 +1,4 @@
-//! Depth-limited subgame solver (Phase 5 resolving).
+//! Depth-limited subgame solver.
 //!
 //! Resolving turns the public state at the resolve root into a *subgame* and
 //! solves it from scratch within a time budget, so the bot can answer bet sizes
@@ -85,7 +85,7 @@ fn deals_from_beliefs(template: &GameState, b0: &BeliefState, b1: &BeliefState) 
 pub struct SubgameNode {
     gs: Option<GameState>,
     history: Vec<u8>,
-    /// Multi-valued leaf state (finding #1).  At a depth-limit leaf with `K > 1`
+    /// Multi-valued leaf state.  At a depth-limit leaf with `K > 1`
     /// continuations this is `None` first — a decision node where the opponent
     /// picks a continuation — then `Some(i)` once chosen, a terminal scored by
     /// continuation `i`.  Always `None` when `K = 1` (no continuation node).
@@ -123,7 +123,7 @@ pub struct Subgame<'a> {
     leaf_eval: &'a dyn LeafEvaluator,
     big_blind: f64,
     /// Number of opponent continuations `K` offered at each depth-limit leaf
-    /// (finding #1).  `K = 1` ⇒ leaves are plain terminals (legacy behaviour).
+    /// `K = 1` ⇒ leaves are plain terminals (legacy behaviour).
     k: usize,
     /// The player who chooses the continuation at a leaf — the opponent of the
     /// resolve-root actor, whose post-leaf adaptation the resolve must be robust
@@ -192,7 +192,7 @@ impl<'a> Subgame<'a> {
 
     /// A depth-limit leaf with `K > 1` continuations that the opponent has not
     /// yet chosen between — a decision node for [`Self::chooser`], not a terminal
-    /// (finding #1).  False when `K = 1` (leaves are plain terminals).
+    /// False when `K = 1` (leaves are plain terminals).
     fn pending_continuation(&self, state: &SubgameNode) -> bool {
         self.k > 1
             && state.continuation.is_none()

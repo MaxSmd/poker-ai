@@ -1,4 +1,4 @@
-//! Benchmark: continual re-solving with CFV gadgets (finding #4).
+//! Benchmark: continual re-solving with CFV gadgets.
 //!
 //! Two questions:
 //!   1. **Safety** — does the re-solving gadget hold the opponent to the value it

@@ -1,4 +1,4 @@
-//! Vectorized range-vs-range subgame solving (finding #2).
+//! Vectorized range-vs-range subgame solving.
 //!
 //! The explicit-deal [`Subgame`](crate::validation::resolving::subgame::Subgame) enumerates
 //! every `(h0, h1)` pair as a chance child — up to 1326×1326 ≈ 1.76 M
@@ -18,15 +18,16 @@
 //! [`exploitability`](crate::validation::solver::best_response::exploitability) scores the
 //! vectorized result inside the explicit game and the two must agree.
 //!
-//! **Scope.** This solves *complete-board* (river) subgames — exactly the
-//! 1326×1326 blow-up the finding targets — with exact showdown and fold
-//! terminals, and *turn* subgames with the river depth-cut: any node that
-//! reaches the undealt river (the turn betting closing, or a turn all-in) is a
-//! leaf whose check-down showdown is averaged over the 44 live river runouts
+//! **Scope.** This solves *complete-board* (river) subgames — the full
+//! 1326×1326 range-vs-range case — with exact showdown and fold terminals, and
+//! *turn* subgames with the river depth-cut: any node that reaches the undealt
+//! river (the turn betting closing, or a turn all-in) is a leaf whose
+//! check-down showdown is averaged over the 44 live river runouts
 //! (`board_runout_cfvs`).  That average reproduces the explicit oracle's
 //! `CheckdownLeafEval` value exactly, so the same exploitability cross-check
-//! validates turn and flop resolves.  The K > 1 multi-continuation leaf of
-//! finding #1 is the remaining follow-up.
+//! validates turn and flop resolves.  Depth-limit leaves with `K > 1`
+//! continuations are supported via the continuation-choice node (see
+//! `build.rs`).
 
 mod build;
 mod keys;
@@ -128,7 +129,7 @@ impl VectorCfr {
     }
 
     /// [`new_capped`](Self::new_capped) with a **multi-valued depth-limit leaf**
-    /// (finding #1): at each turn/flop depth cut the opponent picks among the
+    /// at each turn/flop depth cut the opponent picks among the
     /// `scales` continuations (rest-of-hand pot inflations), so the resolve is
     /// robust to the opponent adapting past the leaf rather than overfitting one
     /// check-down.  `scales[0]` should be `0.0` (the normal check-down); a single

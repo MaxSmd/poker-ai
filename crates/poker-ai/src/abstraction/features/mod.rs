@@ -1,4 +1,4 @@
-//! Hand-strength and equity features for card abstraction (Phase 2).
+//! Hand-strength and equity features for card abstraction.
 //!
 //! The quality of card bucketing sets the strategic ceiling of the whole bot,
 //! and bucketing clusters on these features.  The atomic primitive is
@@ -10,9 +10,9 @@
 //!
 //! These are computed exactly (full enumeration).  Exact is the right choice
 //! for correctness and for the river/turn; the flop's ~10⁶-evaluation cost per
-//! hand is why Phase 2 caches results by suit-isomorphic key and (later) uses
-//! Monte-Carlo rollouts for the widest layers.  Correctness first, speed via the
-//! cache second.
+//! hand is why results are cached by suit-isomorphic key and computed per board
+//! by the sweep in `sweep.rs` rather than per hand.  Correctness first, speed via
+//! the cache second.
 
 mod equity;
 mod ochs;

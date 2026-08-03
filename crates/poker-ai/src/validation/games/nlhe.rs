@@ -1,5 +1,5 @@
 //! Heads-up No-Limit Hold'em bridge — the first time the solver meets the real
-//! `poker-core` engine (Phase 1.5, the thin-bridge step).
+//! `poker-core` engine — the thin bridge between the two.
 //!
 //! Full NLHE has an intractable chance space (every hole-card and board deal),
 //! so a blueprint needs sampling plus card abstraction.  Before any of that,
@@ -20,7 +20,7 @@
 //!
 //! This is a real-mechanics integration target, not an abstraction: every bet
 //! size, side-pot, and showdown comes from `poker-core`.  Replacing the curated
-//! deal set with sampled deals plus bucketed keys is the next step (Phase 2).
+//! deal set with sampled deals plus bucketed keys would be the next step.
 
 use poker_core::state::{GameState, MAX_PLAYERS, NO_CARD};
 use poker_core::{legal_actions, make_card};

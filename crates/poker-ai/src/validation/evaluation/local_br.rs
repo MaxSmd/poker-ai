@@ -46,7 +46,7 @@ impl Q {
     }
 }
 
-/// Phase 1: accumulate action values at the responder's info sets and return the
+/// Pass 1: accumulate action values at the responder's info sets and return the
 /// value to the responder of playing greedily here and below.
 fn accumulate<G: Game>(
     game: &G,
@@ -94,7 +94,7 @@ fn sample(probs: &[f64], rng: &mut u64) -> usize {
     sample_index(probs.iter().copied(), next_unit(rng))
 }
 
-/// Phase 2: exact value to `traverser` of the committed greedy policy `g`
+/// Pass 2: exact value to `traverser` of the committed greedy policy `g`
 /// against `strategy`.  Chance is enumerated when possible, else sampled.
 fn eval_greedy<G: Game>(
     game: &G,

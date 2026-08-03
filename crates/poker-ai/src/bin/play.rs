@@ -1,35 +1,37 @@
 //! Play the trained bot against **Slumbot** (slumbot.com, heads-up NLHE,
 //! 200 bb, blinds 50/100).
 //!
-//!   play slumbot [hands] [flags]
+//! ```text
+//! play slumbot [hands] [flags]
 //!
-//!     hands              number of hands to play (default 1000)
-//!     --data=DIR         artifact directory (default `data`): needs
-//!                        blueprint_holdem.bin + {flop,turn,river}_buckets.bin
-//!                        from the SAME training run
-//!     --policy=PATH      blueprint strategy file, overriding
-//!                        DATA/blueprint_holdem.bin (the path training writes
-//!                        to, so a preserved run needs this)
-//!     --stack-bb=N       blueprint stack depth in bb (default 200 — Slumbot's)
-//!     --cap=N            blueprint raise cap (default 3 — must match training)
-//!     --no-resolve       blueprint-only river (skip the vectorized re-solve)
-//!     --resolve-turn     also re-solve the turn (runout leaves — slower)
-//!     --resolve-flop     also re-solve the flop (two-card runout — much slower;
-//!                        for small-sample testing)
-//!     --iters=N          CFR⁺ iterations per river resolve (default 1500)
-//!     --turn-iters=N     CFR⁺ iterations per turn/flop resolve (default 500)
-//!     --river-cap=N      raise cap inside a resolve, every street (default 3)
-//!     --continuations=L  comma-separated turn/flop leaf pot scales, first 0.0
-//!                        (default 0.0,0.75,1.5,3.0; a single 0.0 = check-down)
-//!     --purify=X         drop action probabilities below X (default 0.1)
-//!     --seed=N           sampling seed (default 1)
-//!     --log-hands=PATH   write full per-hand histories (final action string,
-//!                        both hands, position, board, winnings) as JSONL,
-//!                        truncating PATH — the post-mortem feed for
-//!                        scripts/analyze_slumbot.py
-//!     --token=T          reuse a session token (also persisted to
-//!                        DATA/slumbot_token.txt automatically)
-//!     --username=U --password=P   log in a registered account instead
+//!   hands              number of hands to play (default 1000)
+//!   --data=DIR         artifact directory (default `data`): needs
+//!                      blueprint_holdem.bin + {flop,turn,river}_buckets.bin
+//!                      from the SAME training run
+//!   --policy=PATH      blueprint strategy file, overriding
+//!                      DATA/blueprint_holdem.bin (the path training writes
+//!                      to, so a preserved run needs this)
+//!   --stack-bb=N       blueprint stack depth in bb (default 200 — Slumbot's)
+//!   --cap=N            blueprint raise cap (default 3 — must match training)
+//!   --no-resolve       blueprint-only river (skip the vectorized re-solve)
+//!   --resolve-turn     also re-solve the turn (runout leaves — slower)
+//!   --resolve-flop     also re-solve the flop (two-card runout — much slower;
+//!                      for small-sample testing)
+//!   --iters=N          CFR⁺ iterations per river resolve (default 1500)
+//!   --turn-iters=N     CFR⁺ iterations per turn/flop resolve (default 500)
+//!   --river-cap=N      raise cap inside a resolve, every street (default 3)
+//!   --continuations=L  comma-separated turn/flop leaf pot scales, first 0.0
+//!                      (default 0.0,0.75,1.5,3.0; a single 0.0 = check-down)
+//!   --purify=X         drop action probabilities below X (default 0.1)
+//!   --seed=N           sampling seed (default 1)
+//!   --log-hands=PATH   write full per-hand histories (final action string,
+//!                      both hands, position, board, winnings) as JSONL,
+//!                      truncating PATH — the post-mortem feed for
+//!                      scripts/analyze_slumbot.py
+//!   --token=T          reuse a session token (also persisted to
+//!                      DATA/slumbot_token.txt automatically)
+//!   --username=U --password=P   log in a registered account instead
+//! ```
 //!
 //! Prints a running bb/100 with a 95% confidence interval and `@wandb` metric
 //! lines (compatible with scripts/train_wandb.py), and appends one line per
@@ -432,7 +434,7 @@ fn run_slumbot(args: &[String]) {
     let dir = PathBuf::from(flag::<String>(args, "data").unwrap_or_else(|| "data".into()));
     let stack_bb: u32 = flag(args, "stack-bb").unwrap_or(200);
     let cap: u32 = flag(args, "cap").unwrap_or(3);
-    // Turn/flop continuation scales (finding #1): comma-separated, first should
+    // Turn/flop continuation scales: comma-separated, first should
     // be 0.0.  A single value (e.g. `--continuations=0.0`) is a plain check-down.
     let continuations: Vec<f64> = flag::<String>(args, "continuations")
         .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect::<Vec<f64>>())

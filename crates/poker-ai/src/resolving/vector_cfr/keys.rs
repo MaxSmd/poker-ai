@@ -17,7 +17,7 @@ pub(super) const MARKER_GADGET: u8 = 0xA6;
 /// distribution (the explicit `Subgame::info_key`).  `hole` must be sorted
 /// ascending; `history` is the action-index path from the resolve root
 /// (empty at the root itself).  Betting nodes only — continuation-choice nodes
-/// (finding #1) carry an extra marker and are never queried by hole+history.
+/// carry an extra marker and are never queried by hole+history.
 pub fn subgame_info_key(player: usize, hole: [u8; 2], board: &[u8; 5], history: &[u8]) -> u64 {
     info_key(player, hole, board, history, MARKER_NONE)
 }

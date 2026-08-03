@@ -82,7 +82,7 @@ impl AsRef<[Action]> for ActionList {
 
 /// Returns the legal abstract actions available for the current player in `state`.
 ///
-/// Uses the blueprint action abstraction from [`betting`]:
+/// Uses the blueprint action abstraction from [`crate::betting`]:
 /// - Fold / Check / Call are always considered when applicable.
 /// - Raise sizes are drawn from the abstract pot-fraction sizes for the street.
 /// - AllIn is always appended when it represents a bet or raise above the

@@ -1,4 +1,4 @@
-//! Per-opponent marginal hand distributions (Phase 5 resolving).
+//! Per-opponent marginal hand distributions, for subgame re-solving.
 //!
 //! Depth-limited resolving needs a belief over each opponent's hole cards.  The
 //! joint over all opponents is intractable, so we keep **independent marginals**

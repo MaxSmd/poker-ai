@@ -1,24 +1,24 @@
 //! External-sampling Monte Carlo CFR (MCCFR).
 //!
-//! Full-traversal CFR (`super::cfr`) is the correctness oracle but visits the
-//! entire tree every iteration — intractable for NLHE, where a single iteration
-//! cannot enumerate all opponent hands.  External sampling is the tractable
-//! scheme (Lanctot et al., 2009): on each traversal one
-//! player is the *traverser* whose every action is explored to update regret,
-//! while **chance and the opponents are sampled** from their current
-//! distributions.
+//! Full-traversal CFR ([`crate::validation::solver::full_cfr`]) is the
+//! correctness oracle but visits the entire tree every iteration — intractable
+//! for NLHE, where a single iteration cannot enumerate all opponent hands.
+//! External sampling is the tractable scheme (Lanctot et al., 2009): on each
+//! traversal one player is the *traverser* whose every action is explored to
+//! update regret, while **chance and the opponents are sampled** from their
+//! current distributions.
 //!
-//! ## Why this module exists separately from `cfr`
+//! ## Why this module exists separately from the full-traversal solver
 //!
 //! Sampling introduces variance — the named convergence enemy in multiplayer.
 //! This is the regime where Discounted CFR's noise-suppression actually pays
 //! off (it did *not* in the variance-free full-traversal setting), and it is
-//! the substrate the VR-MCCFR baseline (control variate) layers onto next.
+//! the substrate the VR-MCCFR baseline (control variate) layers onto.
 //! Keeping it apart from the validated full-traversal solver makes the variance
 //! behavior easy to compare against the exact reference.
 //!
-//! The current strategy and average strategy are stored exactly as in `cfr`
-//! (a `HashMap<info_key, node>`); only the *update rule* differs.
+//! The current strategy and average strategy are stored exactly as in the
+//! oracle (a `HashMap<info_key, node>`); only the *update rule* differs.
 
 use std::collections::HashMap;
 use std::io;
