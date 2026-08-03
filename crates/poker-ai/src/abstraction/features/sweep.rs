@@ -9,6 +9,8 @@
 //! sampled.  [`PreparedShowdown`] and [`PreparedRunout`] hoist the sort out of
 //! the iteration loop so a CFR resolve re-sorts nothing.
 
+use rayon::prelude::*;
+
 use poker_core::evaluate_7_lut;
 
 use super::combo_index;
@@ -115,8 +117,25 @@ pub fn board_cfvs(board: [u8; 5], opp_reach: &[f64; 1326], half_pot: f64, out: &
 /// [`PreparedRunout`], across all 44 rivers — turning a per-iteration
 /// `O(runouts · n log n)` evaluate+sort into a one-time sort plus a linear sweep.
 pub struct PreparedShowdown {
-    /// Hero combos `(rank, card a, card b)` sorted ascending by 7-card rank.
-    sorted: Vec<(u32, u8, u8)>,
+    /// Hero combos `(rank, card a, card b, combo_index(a, b))` sorted ascending
+    /// by 7-card rank.  The combo index is *stored*, not recomputed: the tier
+    /// sweep touches every combo five times, and `combo_index` is a compare,
+    /// a multiply and a shift each time.
+    sorted: Vec<(u32, u8, u8, u16)>,
+}
+
+/// The reach denominators a showdown sweep divides by: total opponent reach and
+/// the per-card reach behind the blocker correction.
+///
+/// These depend on the reach vector and on which cards the board kills, but
+/// **not on hand ranks** — which is what lets [`PreparedRunout::evaluate`] pay
+/// for them once for the whole runout instead of once per completion.
+#[derive(Clone, Copy)]
+struct ReachSums {
+    /// Σ reach over every combo avoiding the board.
+    total: f64,
+    /// …of which, the reach of combos holding card `c`.
+    card: [f64; 52],
 }
 
 impl PreparedShowdown {
@@ -128,15 +147,15 @@ impl PreparedShowdown {
             used |= 1 << c;
         }
         let live: Vec<u8> = (0u8..52).filter(|c| used & (1 << c) == 0).collect();
-        let mut sorted: Vec<(u32, u8, u8)> = Vec::with_capacity(1081);
+        let mut sorted: Vec<(u32, u8, u8, u16)> = Vec::with_capacity(1081);
         for i in 0..live.len() {
             let a = live[i];
             for &b in &live[i + 1..] {
                 let rank = evaluate_7_lut(&[a, b, board[0], board[1], board[2], board[3], board[4]]);
-                sorted.push((rank, a, b));
+                sorted.push((rank, a, b, combo_index(a, b) as u16));
             }
         }
-        sorted.sort_unstable_by_key(|&(r, _, _)| r);
+        sorted.sort_unstable_by_key(|&(r, _, _, _)| r);
         Self { sorted }
     }
 
@@ -145,16 +164,35 @@ impl PreparedShowdown {
     /// sweep of [`board_cfvs`], accumulating so a runout can sum over rivers.
     /// The caller zeroes `out` (single board) or accumulates across boards.
     pub fn accumulate(&self, opp_reach: &[f64; 1326], half_pot: f64, out: &mut [f64; 1326]) {
-        // Total opponent reach and per-card reach, for the blocker-corrected
-        // "valid opponents" denominator under each hero hand.
-        let mut total_w = 0.0;
-        let mut card_w = [0.0; 52];
-        for &(_, a, b) in &self.sorted {
-            let r = opp_reach[combo_index(a, b)];
-            total_w += r;
-            card_w[a as usize] += r;
-            card_w[b as usize] += r;
+        self.accumulate_with(opp_reach, half_pot, &self.reach_sums(opp_reach), out);
+    }
+
+    /// This board's [`ReachSums`], by direct summation over its live combos —
+    /// the O(1081) pass a runout replaces with an O(52) restriction of the
+    /// partial board's sums.
+    fn reach_sums(&self, opp_reach: &[f64; 1326]) -> ReachSums {
+        let mut sums = ReachSums { total: 0.0, card: [0.0; 52] };
+        for &(_, a, b, ci) in &self.sorted {
+            let r = opp_reach[ci as usize];
+            sums.total += r;
+            sums.card[a as usize] += r;
+            sums.card[b as usize] += r;
         }
+        sums
+    }
+
+    /// [`accumulate`](Self::accumulate) with the reach denominators supplied,
+    /// so a runout can derive them instead of re-summing per completion.
+    /// `sums` must be this board's — [`reach_sums`](Self::reach_sums) is the
+    /// reference definition.
+    fn accumulate_with(
+        &self,
+        opp_reach: &[f64; 1326],
+        half_pot: f64,
+        sums: &ReachSums,
+        out: &mut [f64; 1326],
+    ) {
+        let (total_w, card_w) = (sums.total, &sums.card);
 
         let mut g_below = 0.0; // reach of strictly-weaker tiers
         let mut below = [0.0; 52]; // …holding card c
@@ -166,30 +204,31 @@ impl PreparedShowdown {
             let mut j = i;
             let mut tier_w = 0.0;
             while j < self.sorted.len() && self.sorted[j].0 == rank {
-                let (_, a, b) = self.sorted[j];
-                let r = opp_reach[combo_index(a, b)];
+                let (_, a, b, ci) = self.sorted[j];
+                let r = opp_reach[ci as usize];
                 tier_card[a as usize] += r;
                 tier_card[b as usize] += r;
                 tier_w += r;
                 j += 1;
             }
 
-            for &(_, a, b) in &self.sorted[i..j] {
+            for &(_, a, b, ci) in &self.sorted[i..j] {
                 let (ua, ub) = (a as usize, b as usize);
-                let rh = opp_reach[combo_index(a, b)];
+                let rh = opp_reach[ci as usize];
                 // Weaker / tied / stronger opponent reach, blockers removed.
                 // Re-add the hero's own combo (subtracted twice via a and b).
                 let weaker = g_below - below[ua] - below[ub];
                 let tied = tier_w - tier_card[ua] - tier_card[ub] + rh;
                 let valid = total_w - card_w[ua] - card_w[ub] + rh;
                 let stronger = valid - weaker - tied;
-                out[combo_index(a, b)] += half_pot * (weaker - stronger);
+                out[ci as usize] += half_pot * (weaker - stronger);
             }
 
             g_below += tier_w;
-            for &(_, a, b) in &self.sorted[i..j] {
-                below[a as usize] += opp_reach[combo_index(a, b)];
-                below[b as usize] += opp_reach[combo_index(a, b)];
+            for &(_, a, b, ci) in &self.sorted[i..j] {
+                let r = opp_reach[ci as usize];
+                below[a as usize] += r;
+                below[b as usize] += r;
                 tier_card[a as usize] = 0.0;
                 tier_card[b as usize] = 0.0;
             }
@@ -208,8 +247,21 @@ impl PreparedShowdown {
 /// iteration* with a linear sweep over precomputed ranks.  A turn board (one
 /// missing card) enumerates 48 river completions; a flop board (two missing)
 /// enumerates C(49, 2) = 1176 turn+river completions.
+///
+/// [`evaluate`](Self::evaluate) additionally hoists the reach denominators out
+/// of the completion loop — they are rank-free, so the completions share all but
+/// an O(52) correction (1.45× on the turn-checkdown resolve, measured).
 pub struct PreparedRunout {
     completions: Vec<PreparedShowdown>,
+    /// The card(s) each completion adds to the partial board, parallel to
+    /// `completions` (only `[..missing]` is meaningful).  This is what turns the
+    /// partial board's [`ReachSums`] into a completion's — see
+    /// [`restrict`](Self::restrict).
+    added: Vec<[u8; 2]>,
+    /// Cards not on the partial board: the combos the base sums range over.
+    live: Vec<u8>,
+    /// Cards each completion adds — 1 from a turn board, 2 from a flop.
+    missing: usize,
     /// Live completions per compatible (hero, opp) pair — `C(48 − real, missing)`
     /// — the exact normalizing denominator (see [`board_runout_cfvs`]).
     live_per_pair: f64,
@@ -237,12 +289,14 @@ impl PreparedRunout {
         let unused: Vec<u8> = (0u8..52).filter(|c| used & (1 << c) == 0).collect();
 
         let mut completions = Vec::new();
+        let mut added = Vec::new();
         let mut full = board;
         match missing {
             1 => {
                 for &r in &unused {
                     full[4] = r;
                     completions.push(PreparedShowdown::new(full));
+                    added.push([r, r]);
                 }
             }
             2 => {
@@ -251,6 +305,7 @@ impl PreparedRunout {
                         full[3] = unused[i];
                         full[4] = unused[j];
                         completions.push(PreparedShowdown::new(full));
+                        added.push([unused[i], unused[j]]);
                     }
                 }
             }
@@ -265,20 +320,111 @@ impl PreparedRunout {
         } else {
             (free * (free - 1) / 2) as f64
         };
-        Self { completions, live_per_pair }
+        Self { completions, added, live: unused, missing, live_per_pair }
     }
 
     /// The showdown CFV averaged over the runout: sum every completion's
     /// reach-weighted showdown into `out`, then divide by the live-completion
     /// count (see [`board_runout_cfvs`]).
     pub fn evaluate(&self, opp_reach: &[f64; 1326], half_pot: f64, out: &mut [f64; 1326]) {
+        // The reach denominators are rank-free, so they are *not* per-completion
+        // work: across completions they differ only by the combos the new board
+        // card(s) block.  Summing them once over the partial board and
+        // restricting in O(52) replaces 48 (turn) or 1176 (flop) full passes
+        // over ~1081 combos — about a third of `evaluate`, exactly, no
+        // approximation.  The tier walk stays per-completion: ranks change.
+        let base = self.base_sums(opp_reach);
+
+        // The completion loop is the resolver's hot spot: a turn leaf costs 48
+        // tier walks and a flop leaf 1176, against ONE for a river leaf, which
+        // is why turn/flop resolves cost ~14×/~350× a river resolve per
+        // iteration.  The walks are independent, so this is a map-reduce.
+        let chunk = self.chunk_len();
+        let partials: Vec<[f64; 1326]> = self
+            .completions
+            .par_chunks(chunk)
+            .zip(self.added.par_chunks(chunk))
+            .map(|(completions, added)| {
+                let mut acc = [0.0; 1326];
+                for (c, add) in completions.iter().zip(added) {
+                    let sums = self.restrict(&base, opp_reach, &add[..self.missing]);
+                    c.accumulate_with(opp_reach, half_pot, &sums, &mut acc);
+                }
+                acc
+            })
+            .collect();
+
+        // Fold in chunk order, not completion order: the partials are summed by
+        // index, so the result is identical run to run whatever the thread
+        // schedule was.  It is NOT bit-identical to the sequential fold — the
+        // additions re-associate — but the difference is f64 rounding, four
+        // orders below the 1e-9 the runout tests hold `evaluate` to.
         out.fill(0.0);
-        for c in &self.completions {
-            c.accumulate(opp_reach, half_pot, out);
+        for partial in &partials {
+            for (o, &v) in out.iter_mut().zip(partial.iter()) {
+                *o += v;
+            }
         }
         for o in out.iter_mut() {
             *o /= self.live_per_pair;
         }
+    }
+
+    /// Completions per parallel chunk.  Depends only on the completion count —
+    /// a property of the board shape — so the chunk boundaries, and therefore
+    /// the summation order, are the same on every machine and every run.
+    ///
+    /// `TARGET` sets the parallel width; the floor keeps a task worth more than
+    /// the cost of scheduling it, which matters on the turn's 48 completions
+    /// (a leaf is evaluated once per traverser per iteration, so these tasks
+    /// are spawned in the hundreds of thousands over a resolve).
+    fn chunk_len(&self) -> usize {
+        const TARGET: usize = 64;
+        const FLOOR: usize = 4;
+        self.completions.len().div_ceil(TARGET).max(FLOOR)
+    }
+
+    /// Reach sums over every combo avoiding the *partial* board — the superset
+    /// each completion restricts.
+    fn base_sums(&self, opp_reach: &[f64; 1326]) -> ReachSums {
+        let mut sums = ReachSums { total: 0.0, card: [0.0; 52] };
+        for i in 0..self.live.len() {
+            let a = self.live[i];
+            for &b in &self.live[i + 1..] {
+                let r = opp_reach[combo_index(a, b)];
+                sums.total += r;
+                sums.card[a as usize] += r;
+                sums.card[b as usize] += r;
+            }
+        }
+        sums
+    }
+
+    /// `base` minus every combo holding a `dead` (completion) card — the
+    /// completion's own [`ReachSums::total`]/[`card`](ReachSums::card).
+    ///
+    /// `total` drops `base.card[d]` per dead card, with the combos holding *two*
+    /// dead cards added back (they were subtracted twice); `card[x]` drops the
+    /// combos `{x, d}`.  A dead card's own slot is zeroed rather than fixed up:
+    /// no live hero combo holds a board card, so the sweep never reads it.
+    fn restrict(&self, base: &ReachSums, opp_reach: &[f64; 1326], dead: &[u8]) -> ReachSums {
+        let mut sums = *base;
+        for (k, &d) in dead.iter().enumerate() {
+            sums.total -= base.card[d as usize];
+            for &e in &dead[..k] {
+                sums.total += opp_reach[combo_index(d, e)];
+            }
+        }
+        for &x in &self.live {
+            if dead.contains(&x) {
+                sums.card[x as usize] = 0.0;
+                continue;
+            }
+            for &d in dead {
+                sums.card[x as usize] -= opp_reach[combo_index(x, d)];
+            }
+        }
+        sums
     }
 }
 
@@ -365,4 +511,89 @@ pub fn board_histograms(board: &[u8], bins: usize) -> Vec<f32> {
         }
     }
     hist
+}
+
+#[cfg(test)]
+mod runout_denominator_tests {
+    use super::*;
+    use poker_core::{make_card, state::NO_CARD};
+
+    /// A deliberately lumpy reach vector: zeros, a wide dynamic range, and mass
+    /// on combos that use board cards (which the sums must exclude).
+    fn lumpy_reach() -> [f64; 1326] {
+        let mut reach = [0.0; 1326];
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        for (i, r) in reach.iter_mut().enumerate() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *r = if i % 7 == 0 { 0.0 } else { (x >> 40) as f64 / 1024.0 };
+        }
+        reach
+    }
+
+    /// The O(52) restriction of the partial board's sums must reproduce each
+    /// completion's own O(1081) summation — this is the whole hoist.
+    fn check_restriction(board: [u8; 5]) {
+        let runout = PreparedRunout::new(board);
+        let reach = lumpy_reach();
+        let base = runout.base_sums(&reach);
+        for (c, added) in runout.completions.iter().zip(&runout.added) {
+            let derived = runout.restrict(&base, &reach, &added[..runout.missing]);
+            let direct = c.reach_sums(&reach);
+            assert!(
+                (derived.total - direct.total).abs() < 1e-9,
+                "total {} vs {}",
+                derived.total,
+                direct.total
+            );
+            // Only slots a live hero combo can index are read by the sweep.
+            for &(_, a, b, _) in &c.sorted {
+                for x in [a as usize, b as usize] {
+                    assert!(
+                        (derived.card[x] - direct.card[x]).abs() < 1e-9,
+                        "card[{x}] {} vs {}",
+                        derived.card[x],
+                        direct.card[x]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn turn_runout_denominators_match_direct_summation() {
+        let board = [make_card(12, 0), make_card(11, 1), make_card(4, 2), make_card(2, 3), NO_CARD];
+        check_restriction(board);
+    }
+
+    #[test]
+    fn flop_runout_denominators_match_direct_summation() {
+        let board = [make_card(12, 0), make_card(11, 1), make_card(4, 2), NO_CARD, NO_CARD];
+        check_restriction(board);
+    }
+
+    /// End to end: `evaluate` (hoisted denominators) must agree with the
+    /// per-completion `accumulate` it replaced, to well inside f64 noise.
+    #[test]
+    fn evaluate_matches_per_completion_accumulate() {
+        let board = [make_card(12, 0), make_card(11, 1), make_card(4, 2), make_card(2, 3), NO_CARD];
+        let runout = PreparedRunout::new(board);
+        let reach = lumpy_reach();
+
+        let mut fast = [0.0; 1326];
+        runout.evaluate(&reach, 7.5, &mut fast);
+
+        let mut slow = [0.0; 1326];
+        for c in &runout.completions {
+            c.accumulate(&reach, 7.5, &mut slow);
+        }
+        for o in slow.iter_mut() {
+            *o /= runout.live_per_pair;
+        }
+
+        let worst = fast.iter().zip(&slow).map(|(a, b)| (a - b).abs()).fold(0.0f64, f64::max);
+        let scale = slow.iter().fold(0.0f64, |m, v| m.max(v.abs())).max(1.0);
+        assert!(worst < 1e-9 * scale, "hoisted denominators changed the CFV: {worst} (scale {scale})");
+    }
 }

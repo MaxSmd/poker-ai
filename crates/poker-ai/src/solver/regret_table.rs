@@ -57,6 +57,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use super::variant::Variant;
+use super::MAX_ACTIONS;
 use crate::util::rng::xorshift_next_unit;
 
 /// EMA learning rate for the VR-MCCFR baseline (mirrors `mccfr::BASELINE_RATE`).
@@ -131,8 +132,12 @@ pub trait RegretStore: Serialize + Sized {
     /// resident do nothing.
     fn enable_baseline(&mut self) {}
     fn bytes_per_info_set(&self) -> usize;
-    /// Regret-matching current strategy, written into `out`.
-    fn strategy_into(&self, info_set: usize, out: &mut Vec<f64>);
+    /// Regret-matching current strategy, written into the first `n` slots of
+    /// `out` and `n` returned.  The buffer is a fixed
+    /// `[f64; MAX_ACTIONS]` rather than a `Vec` so the traversals can keep it on
+    /// the stack: this is the per-decision-node call, and a `Vec` here is one
+    /// heap allocation per visited node (~10¹² of them over a blueprint run).
+    fn strategy_into(&self, info_set: usize, out: &mut [f64; MAX_ACTIONS]) -> usize;
     /// Average (deployable) strategy, written into `out`.
     fn average_into(&self, info_set: usize, out: &mut Vec<f64>);
     /// The traverser's regret update at iteration `t`: per-action lazy discount
@@ -326,18 +331,21 @@ impl RegretTable {
         Some(&mut self.consec_below[span])
     }
 
-    /// Regret-matched current strategy for `info_set`, written into `out` (`f64`
-    /// arithmetic over the `f32` regrets).
-    pub fn strategy_into(&self, info_set: usize, out: &mut Vec<f64>) {
+    /// Regret-matched current strategy for `info_set`, written into `out[..n]`
+    /// and `n` returned (`f64` arithmetic over the `f32` regrets).
+    pub fn strategy_into(&self, info_set: usize, out: &mut [f64; MAX_ACTIONS]) -> usize {
         let regret = &self.regret[self.span(info_set)];
         let n = regret.len();
-        out.clear();
+        assert!(n <= MAX_ACTIONS, "info set wider than the stack buffer");
         let total: f64 = regret.iter().map(|&r| (r as f64).max(0.0)).sum();
         if total > 0.0 {
-            out.extend(regret.iter().map(|&r| (r as f64).max(0.0) / total));
+            for (o, &r) in out.iter_mut().zip(regret) {
+                *o = (r as f64).max(0.0) / total;
+            }
         } else {
-            out.extend(std::iter::repeat_n(1.0 / n as f64, n));
+            out[..n].fill(1.0 / n as f64);
         }
+        n
     }
 
     /// Average (deployable) strategy for `info_set`, written into `out`.
@@ -393,7 +401,7 @@ impl RegretStore for RegretTable {
         RegretTable::bytes_per_info_set(self)
     }
 
-    fn strategy_into(&self, info_set: usize, out: &mut Vec<f64>) {
+    fn strategy_into(&self, info_set: usize, out: &mut [f64; MAX_ACTIONS]) -> usize {
         RegretTable::strategy_into(self, info_set, out)
     }
 
@@ -532,17 +540,17 @@ mod tests {
     #[test]
     fn uniform_strategy_when_no_regret() {
         let t = RegretTable::with_layout(1, |_| 4, false, false);
-        let mut s = Vec::new();
-        t.strategy_into(0, &mut s);
-        assert_eq!(s, vec![0.25; 4]);
+        let mut s = [0.0; MAX_ACTIONS];
+        let n = t.strategy_into(0, &mut s);
+        assert_eq!(&s[..n], &[0.25; 4]);
     }
 
     #[test]
     fn regret_matching_normalizes_positive_regret() {
         let mut t = RegretTable::with_layout(1, |_| 3, false, false);
         t.regret_mut(0).copy_from_slice(&[3.0, 0.0, -2.0]);
-        let mut s = Vec::new();
-        t.strategy_into(0, &mut s);
+        let mut s = [0.0; MAX_ACTIONS];
+        assert_eq!(t.strategy_into(0, &mut s), 3);
         assert!((s[0] - 1.0).abs() < 1e-9 && s[1] == 0.0 && s[2] == 0.0);
     }
 

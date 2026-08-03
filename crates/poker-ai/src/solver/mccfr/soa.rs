@@ -14,6 +14,7 @@ use crate::games::{CursorGame, IndexedGame};
 use crate::solver::variant::Variant;
 use crate::solver::lean_table::LeanTable;
 use crate::solver::regret_table::{sr_add, RegretStore, RegretTable};
+use crate::solver::MAX_ACTIONS;
 use crate::util::rng::{sample_index, xorshift_next_unit};
 
 // ── SoA (flat) blueprint solver ──────────────────────────────────────────────
@@ -149,11 +150,14 @@ impl<G: IndexedGame, S: RegretStore> SoaMccfr<G, S> {
         let actions = CursorGame::legal(&self.game, cursor);
         let acts = actions.as_ref();
         let num_actions = acts.len();
-        let mut strategy = Vec::new();
-        self.table.strategy_into(index, &mut strategy);
+        // Stack scratch, not `Vec`s: this runs once per decision node.
+        let mut strategy = [0.0f64; MAX_ACTIONS];
+        let n = self.table.strategy_into(index, &mut strategy);
+        debug_assert_eq!(n, num_actions, "table fan-out must match the engine's");
+        let strategy = &strategy[..n];
 
         if player == traverser {
-            let mut util = vec![0.0; num_actions];
+            let mut util = [0.0f64; MAX_ACTIONS];
             let mut node_value = 0.0;
             for a in 0..num_actions {
                 CursorGame::apply(&self.game, cursor, a, acts[a]);
@@ -161,7 +165,8 @@ impl<G: IndexedGame, S: RegretStore> SoaMccfr<G, S> {
                 CursorGame::undo(&self.game, cursor);
                 node_value += strategy[a] * util[a];
             }
-            self.table.add_regret(index, &util, node_value, t, self.variant);
+            let util = &util[..num_actions];
+            self.table.add_regret(index, util, node_value, t, self.variant);
             if self.use_baseline {
                 let sgn = Self::sign(traverser);
                 for (a, &u) in util.iter().enumerate() {
@@ -170,8 +175,8 @@ impl<G: IndexedGame, S: RegretStore> SoaMccfr<G, S> {
             }
             node_value
         } else {
-            self.table.add_strategy(index, &strategy, t, self.variant, &mut self.sr_rng);
-            let a = self.sample(&strategy);
+            self.table.add_strategy(index, strategy, t, self.variant, &mut self.sr_rng);
+            let a = self.sample(strategy);
             CursorGame::apply(&self.game, cursor, a, acts[a]);
             let v_child = self.traverse(cursor, traverser, t);
             CursorGame::undo(&self.game, cursor);
@@ -180,7 +185,7 @@ impl<G: IndexedGame, S: RegretStore> SoaMccfr<G, S> {
             }
             let sgn = Self::sign(traverser);
             let v0 = sgn * v_child;
-            let (baseline_exp, baseline_a) = self.table.baseline_pair(index, &strategy, a);
+            let (baseline_exp, baseline_a) = self.table.baseline_pair(index, strategy, a);
             let corrected0 = baseline_exp + (v0 - baseline_a);
             self.table.baseline_ema(index, a, v0);
             sgn * corrected0
@@ -289,11 +294,14 @@ impl<G: IndexedGame> SoaMccfr<G, RegretTable> {
         let actions = CursorGame::legal(&self.game, cursor);
         let acts = actions.as_ref();
         let num_actions = acts.len();
-        let mut strategy = Vec::new();
-        self.table.strategy_into(index, &mut strategy);
+        // Stack scratch, not `Vec`s: this runs once per decision node.
+        let mut strategy = [0.0f64; MAX_ACTIONS];
+        let n = self.table.strategy_into(index, &mut strategy);
+        debug_assert_eq!(n, num_actions, "table fan-out must match the engine's");
+        let strategy = &strategy[..n];
 
         if player == traverser {
-            let mut util = vec![0.0; num_actions];
+            let mut util = [0.0f64; MAX_ACTIONS];
             let mut node_value = 0.0;
             for a in 0..num_actions {
                 CursorGame::apply(&self.game, cursor, a, acts[a]);
@@ -302,14 +310,14 @@ impl<G: IndexedGame> SoaMccfr<G, RegretTable> {
                 node_value += strategy[a] * util[a];
             }
             let sgn = self.use_baseline.then_some(Self::sign(traverser));
-            record_traverser_delta(delta, key, &util, node_value, sgn);
+            record_traverser_delta(delta, key, &util[..num_actions], node_value, sgn);
             node_value
         } else {
             let weight = match self.variant {
                 Variant::Vanilla => 1.0,
                 Variant::Dcfr(d) => d.strategy_weight(t),
             };
-            record_strategy_delta(delta, key, weight, &strategy);
+            record_strategy_delta(delta, key, weight, strategy);
             let a = sample_index(strategy.iter().copied(), xorshift_next_unit(rng));
             CursorGame::apply(&self.game, cursor, a, acts[a]);
             let v_child = self.traverse_ro(cursor, traverser, rng, delta, t);

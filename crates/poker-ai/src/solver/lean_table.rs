@@ -138,16 +138,19 @@ impl RegretStore for LeanTable {
         per_slot * (self.regret.len() / cap)
     }
 
-    fn strategy_into(&self, info_set: usize, out: &mut Vec<f64>) {
+    fn strategy_into(&self, info_set: usize, out: &mut [f64; MAX_ACTIONS]) -> usize {
         let regret = &self.regret[self.span(info_set)];
         let n = regret.len();
-        out.clear();
+        assert!(n <= MAX_ACTIONS, "info set wider than the stack buffer");
         let total: f64 = regret.iter().map(|&r| (r as f64).max(0.0)).sum();
         if total > 0.0 {
-            out.extend(regret.iter().map(|&r| (r as f64).max(0.0) / total));
+            for (o, &r) in out.iter_mut().zip(regret) {
+                *o = (r as f64).max(0.0) / total;
+            }
         } else {
-            out.extend(std::iter::repeat_n(1.0 / n as f64, n));
+            out[..n].fill(1.0 / n as f64);
         }
+        n
     }
 
     fn average_into(&self, info_set: usize, out: &mut Vec<f64>) {
@@ -252,8 +255,8 @@ mod tests {
         let mut t = table2();
         // Regrets 1.0 bb / 3.0 bb / negative → RM proportions 0.25 / 0.75 / 0.
         t.add_regret(0, &[1.0, 3.0, -2.0], 0.0, 1, Variant::Vanilla);
-        let mut s = Vec::new();
-        t.strategy_into(0, &mut s);
+        let mut s = [0.0; MAX_ACTIONS];
+        assert_eq!(t.strategy_into(0, &mut s), 3);
         assert!((s[0] - 0.25).abs() < 1e-9 && (s[1] - 0.75).abs() < 1e-9 && s[2] == 0.0);
     }
 
@@ -264,7 +267,7 @@ mod tests {
         for step in 1..=400u64 {
             t.add_regret(0, &[80.0, 40.0, 0.0], 0.0, step, Variant::Vanilla);
         }
-        let mut s = Vec::new();
+        let mut s = [0.0; MAX_ACTIONS];
         t.strategy_into(0, &mut s);
         assert!((s[0] - 2.0 * s[1]).abs() < 0.01, "2:1 regret ratio preserved: {s:?}");
         assert!(t.regret[t.span(0)].iter().all(|&r| (r as f64) <= REGRET_SAT));
@@ -318,7 +321,7 @@ mod tests {
         assert_eq!(t.bytes_per_info_set(), 12, "regret + strategy-sum only");
         // Regret matching and averaging work unchanged without it.
         t.add_regret(0, &[1.0, 3.0, -2.0], 0.0, 1, Variant::Vanilla);
-        let mut s = Vec::new();
+        let mut s = [0.0; MAX_ACTIONS];
         t.strategy_into(0, &mut s);
         assert!((s[0] - 0.25).abs() < 1e-9);
 

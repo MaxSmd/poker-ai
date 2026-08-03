@@ -193,6 +193,62 @@ fn vectorized_multi_continuation_is_more_robust_than_single() {
 }
 
 #[test]
+#[ignore = "four K-aware turn resolves + four exact-BR passes; run by hand when \
+            re-tuning the continuation set"]
+fn continuation_count_robustness_sweep() {
+    // How much of K = 4's robustness does K = 2 buy?  K is a direct multiplier
+    // on depth-cut leaf count, and a turn leaf costs 48 runout tier walks
+    // against a river leaf's one — so halving K halves the dominant term in a
+    // turn/flop resolve.  Every candidate is scored in the SAME K = 4 oracle
+    // (the opponent may still adapt among all four continuations), so this
+    // measures robustness to an adversary the K = 2 resolve cannot see.
+    //
+    // Measured: K=4 0.00037 bb, K=2 [0, 1.5] 1.13336, K=2 [0, 3.0] 1.72399,
+    // K=1 1.37349.  **Robustness is not gradual in K** — halving it gives back
+    // ~all of the 3700× K=4 buys, and the bracketing pair is WORSE than not
+    // modelling continuations at all.  So K is not a knob for buying back
+    // turn/flop resolve cost; leaf-evaluation throughput is.
+    use crate::validation::resolving::leaf_eval::MultiContinuationLeaf;
+    let beliefs = duel_ranges();
+    let oracle_scales = vec![0.0, 0.75, 1.5, 3.0]; // == MultiContinuationLeaf default
+    let root = || public_root_at(turn_board(), 20, 2);
+
+    let leaf = MultiContinuationLeaf::with_scales(oracle_scales.clone());
+    let game = Subgame::new(root(), &beliefs, &leaf);
+
+    // K = 2 candidates: the midpoint pair, and the bracketing pair (widest
+    // spread — the hypothesis being that covering the extremes matters more
+    // than resolution between them).
+    let candidates: Vec<(&str, Vec<f64>)> = vec![
+        ("K=4 [0, .75, 1.5, 3]", oracle_scales.clone()),
+        ("K=2 [0, 1.5]", vec![0.0, 1.5]),
+        ("K=2 [0, 3.0]", vec![0.0, 3.0]),
+    ];
+
+    let mut results = Vec::new();
+    for (label, scales) in candidates {
+        let solved = solve_vectorized_multi(&root(), &beliefs, 2_000, u32::MAX, scales);
+        let expl = exploitability(&game, &solved.strategy);
+        println!("continuation sweep — {label:<22} {expl:.5} bb");
+        results.push((label, expl));
+    }
+
+    let single = solve_vectorized(&root(), &beliefs, 2_000);
+    let expl_single = exploitability(&game, &single.strategy);
+    println!("continuation sweep — {:<22} {expl_single:.5} bb", "K=1 (check-down)");
+
+    let expl_k4 = results[0].1;
+    let best_k2 = results[1..].iter().fold(f64::INFINITY, |m, &(_, e)| m.min(e));
+    println!(
+        "continuation sweep — best K=2 costs {:.5} bb over K=4, and saves {:.5} bb over K=1",
+        best_k2 - expl_k4,
+        expl_single - best_k2
+    );
+    assert!(expl_k4 < expl_single, "K=4 ({expl_k4}) must beat K=1 ({expl_single})");
+    assert!(best_k2 < expl_single, "the best K=2 ({best_k2}) must beat K=1 ({expl_single})");
+}
+
+#[test]
 #[ignore = "flop's two-card runout + exact-BR oracle is minutes-slow; \
             the 990-divisor is guarded fast by flop_runout_cfvs_matches_hand_vs_hand_equity"]
 fn vectorized_flop_resolve_agrees_with_explicit_oracle() {
