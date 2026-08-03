@@ -37,6 +37,7 @@ mod solve;
 mod tests;
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use poker_core::legal_actions;
 use poker_core::state::{GameState, NO_CARD};
@@ -65,7 +66,11 @@ pub struct VectorResolved {
 /// The vectorized public-tree solver.
 pub struct VectorCfr {
     kinds: Vec<NodeKind>,
-    stores: Vec<NodeStore>,
+    /// Per-decision-node regret/strategy blocks.  Each is written by exactly
+    /// ONE node, so the locks are permanently uncontended — they exist to let
+    /// the traversal hand disjoint stores to concurrent subtree tasks without
+    /// `unsafe` or index rebasing, not to arbitrate real contention.
+    stores: Vec<Mutex<NodeStore>>,
     root: usize,
     reach0: [f64; NUM_COMBOS],
     reach1: [f64; NUM_COMBOS],
@@ -235,7 +240,7 @@ impl VectorCfr {
         let term = self.kinds.len();
         self.kinds.push(NodeKind::CfvTerminal);
         let store = self.stores.len();
-        self.stores.push(NodeStore::new(2));
+        self.stores.push(Mutex::new(NodeStore::new(2)));
         let id = self.kinds.len();
         self.kinds.push(NodeKind::Decision {
             player: self.chooser,

@@ -18,12 +18,24 @@
 //! for the whole run.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
+
+use rayon::prelude::*;
 
 use super::keys::{info_key, MARKER_GADGET};
 use super::node::{cfv_terminal_values, valid_reach_into, Env, NodeKind, NodeStore};
 use super::{VectorCfr, VectorResolved};
 use crate::abstraction::features::combo_cards;
 use crate::resolving::belief_state::NUM_COMBOS;
+
+/// Recursion depth below which sibling subtrees are traversed concurrently.
+///
+/// Two levels of a betting tree is O(10–40) independent tasks — enough to fill
+/// a large box while every task still carries a whole subtree.  Going deeper
+/// multiplies the task count into the thousands, where scheduling costs more
+/// than the arithmetic; the runout sweep inside a leaf has its own, much wider,
+/// parallel split (`PreparedRunout::evaluate`), so the leaves are already busy.
+const PAR_DEPTH: usize = 2;
 
 /// A pool of reusable per-hand buffers for the traversal.
 ///
@@ -105,7 +117,7 @@ impl VectorCfr {
     /// extraction.
     fn eval_average(
         env: &Env<'_>,
-        stores: &[NodeStore],
+        stores: &[Mutex<NodeStore>],
         scratch: &mut Scratch,
         id: usize,
         reach_other: &[f64; NUM_COMBOS],
@@ -159,7 +171,7 @@ impl VectorCfr {
                 let a = children.len();
                 let mut sigma = scratch.take(a * NUM_COMBOS);
                 let mut total = scratch.take(NUM_COMBOS);
-                stores[*store].average_into(&mut sigma, &mut total);
+                Self::store(stores, *store).average_into(&mut sigma, &mut total);
                 out.fill(0.0);
                 let mut cv = scratch.take(NUM_COMBOS);
                 for (ai, &child) in children.iter().enumerate() {
@@ -217,16 +229,37 @@ impl VectorCfr {
             };
             Self::cfr(
                 &env,
-                &mut self.stores,
+                &self.stores,
                 &mut self.scratch,
                 self.root,
                 &reach_tr,
                 &reach_op,
                 traverser,
                 self.t,
+                0,
                 &mut root_value,
             );
         }
+    }
+
+    /// The regret block for a decision node.
+    ///
+    /// Each store is written by exactly one node, so this lock never actually
+    /// contends: it exists so the traversal can hand *disjoint* stores to
+    /// concurrent subtree tasks without `unsafe` or index rebasing.  An
+    /// uncontended acquire is tens of nanoseconds against a per-node cost in
+    /// the tens of microseconds.
+    fn store(stores: &[Mutex<NodeStore>], id: usize) -> std::sync::MutexGuard<'_, NodeStore> {
+        stores[id].lock().expect("node store mutex poisoned")
+    }
+
+    /// Whether every child of a decision node is a depth-cut runout leaf — the
+    /// shape [`build_continuation_chooser`](super::VectorCfr) gives a
+    /// continuation chooser.  Recognised structurally rather than by
+    /// `MARKER_CONTINUATION` so it cannot drift from what the builder emits,
+    /// and so any future node with the same shape gets the same fast path.
+    fn all_runout_leaves(env: &Env<'_>, children: &[usize]) -> bool {
+        children.iter().all(|&c| matches!(env.kinds[c], NodeKind::RunoutShowdown { .. }))
     }
 
     /// Counterfactual value vector for `traverser` (per traverser hand) into
@@ -235,16 +268,30 @@ impl VectorCfr {
     /// decision nodes.
     ///
     /// `out` is fully overwritten; callers need not pre-zero it.
+    ///
+    /// ## Parallelism
+    ///
+    /// Sibling subtrees are independent — they touch disjoint stores — so the
+    /// child loops run concurrently while `depth < PAR_DEPTH`.  The cutoff
+    /// keeps tasks coarse: the root's few actions each carry a large subtree,
+    /// whereas parallelising near the leaves would spend more on scheduling
+    /// than on arithmetic.
+    ///
+    /// The result is **bit-identical** to a serial traversal.  Each child
+    /// writes only its own slot, and every combination back into `out` runs
+    /// serially in child-index order afterwards, so no float addition is ever
+    /// re-associated by the thread schedule.
     #[allow(clippy::too_many_arguments)]
     fn cfr(
         env: &Env<'_>,
-        stores: &mut [NodeStore],
+        stores: &[Mutex<NodeStore>],
         scratch: &mut Scratch,
         id: usize,
         reach_tr: &[f64; NUM_COMBOS],
         reach_op: &[f64; NUM_COMBOS],
         traverser: usize,
         t: u64,
+        depth: usize,
         out: &mut [f64],
     ) {
         match &env.kinds[id] {
@@ -276,25 +323,83 @@ impl VectorCfr {
             NodeKind::Chance { children } => {
                 // River reveal: mask both reaches per branch, sum, divide by
                 // the per-pair-consistent count (44) — see `NodeKind::Chance`.
-                out.fill(0.0);
-                let mut cv = scratch.take(NUM_COMBOS);
-                for &(c, child) in children {
-                    let mut rt = *reach_tr;
-                    let mut ro = *reach_op;
-                    for (h, cards) in env.cards.iter().enumerate() {
-                        if cards[0] == c || cards[1] == c {
-                            rt[h] = 0.0;
-                            ro[h] = 0.0;
+                if depth < PAR_DEPTH {
+                    // One independent subtree per live river card — the widest
+                    // and most even split in the whole tree, and the reason a
+                    // full-river turn resolve parallelises well.  Each branch
+                    // zeroes its own blocked combos before returning, so the
+                    // fold below is a plain ordered sum.
+                    let partials: Vec<Vec<f64>> = children
+                        .par_iter()
+                        .map(|&(c, child)| {
+                            let mut rt = *reach_tr;
+                            let mut ro = *reach_op;
+                            for (h, cards) in env.cards.iter().enumerate() {
+                                if cards[0] == c || cards[1] == c {
+                                    rt[h] = 0.0;
+                                    ro[h] = 0.0;
+                                }
+                            }
+                            let mut cv = vec![0.0; NUM_COMBOS];
+                            let mut local = Scratch::default();
+                            Self::cfr(
+                                env,
+                                stores,
+                                &mut local,
+                                child,
+                                &rt,
+                                &ro,
+                                traverser,
+                                t,
+                                depth + 1,
+                                &mut cv,
+                            );
+                            for (h, cards) in env.cards.iter().enumerate() {
+                                if cards[0] == c || cards[1] == c {
+                                    cv[h] = 0.0;
+                                }
+                            }
+                            cv
+                        })
+                        .collect();
+                    out.fill(0.0);
+                    for cv in &partials {
+                        for (o, &v) in out.iter_mut().zip(cv.iter()) {
+                            *o += v;
                         }
                     }
-                    Self::cfr(env, stores, scratch, child, &rt, &ro, traverser, t, &mut cv);
-                    for (h, cards) in env.cards.iter().enumerate() {
-                        if cards[0] != c && cards[1] != c {
-                            out[h] += cv[h];
+                } else {
+                    out.fill(0.0);
+                    let mut cv = scratch.take(NUM_COMBOS);
+                    for &(c, child) in children {
+                        let mut rt = *reach_tr;
+                        let mut ro = *reach_op;
+                        for (h, cards) in env.cards.iter().enumerate() {
+                            if cards[0] == c || cards[1] == c {
+                                rt[h] = 0.0;
+                                ro[h] = 0.0;
+                            }
+                        }
+                        Self::cfr(
+                            env,
+                            stores,
+                            scratch,
+                            child,
+                            &rt,
+                            &ro,
+                            traverser,
+                            t,
+                            depth + 1,
+                            &mut cv,
+                        );
+                        for (h, cards) in env.cards.iter().enumerate() {
+                            if cards[0] != c && cards[1] != c {
+                                out[h] += cv[h];
+                            }
                         }
                     }
+                    scratch.give(cv);
                 }
-                scratch.give(cv);
                 for x in out.iter_mut() {
                     *x /= 44.0;
                 }
@@ -303,7 +408,7 @@ impl VectorCfr {
                 let a = children.len();
                 let mut sigma = scratch.take(a * NUM_COMBOS);
                 let mut total = scratch.take(NUM_COMBOS);
-                stores[*store].strategy_into(&mut sigma, &mut total);
+                Self::store(stores, *store).strategy_into(&mut sigma, &mut total);
                 out.fill(0.0);
 
                 if *player == traverser {
@@ -311,31 +416,171 @@ impl VectorCfr {
                     // counterfactual values (action-major, matching the store)
                     // to form regrets.
                     let mut child_v = scratch.take(a * NUM_COMBOS);
-                    for (ai, &child) in children.iter().enumerate() {
-                        let span = ai * NUM_COMBOS..(ai + 1) * NUM_COMBOS;
-                        let mut rt = *reach_tr;
-                        for (r, &s) in rt.iter_mut().zip(&sigma[span.clone()]) {
-                            *r *= s;
-                        }
-                        Self::cfr(
-                            env,
-                            stores,
-                            scratch,
-                            child,
-                            &rt,
-                            reach_op,
-                            traverser,
-                            t,
-                            &mut child_v[span.clone()],
-                        );
-                        for ((o, &s), &c) in
-                            out.iter_mut().zip(&sigma[span.clone()]).zip(&child_v[span])
+                    if Self::all_runout_leaves(env, children) {
+                        // Continuation chooser, traverser side.  Every child is
+                        // a `RunoutShowdown` on this node's board, differing
+                        // only by its inflated pot — and this branch passes
+                        // `reach_op` through UNCHANGED (only the traverser's own
+                        // reach is pushed by σ, and a runout leaf never reads
+                        // it).  Since `evaluate` is linear in `half_pot`, the K
+                        // children are one sweep and K scalings, not K sweeps.
+                        // At K=4 that is the dominant cost of a turn/flop
+                        // iteration divided by four, exactly.
+                        let mut unit = scratch.take(NUM_COMBOS);
                         {
-                            *o += s * c;
+                            let u: &mut [f64; NUM_COMBOS] = unit
+                                .as_mut_slice()
+                                .try_into()
+                                .expect("value buffer is NUM_COMBOS");
+                            env.runout
+                                .expect("a runout leaf requires the resolve's runout table")
+                                .evaluate(reach_op, 1.0, u);
+                        }
+                        for (ai, &child) in children.iter().enumerate() {
+                            let NodeKind::RunoutShowdown { half_pot } = &env.kinds[child] else {
+                                unreachable!("all_runout_leaves checked every child")
+                            };
+                            let span = ai * NUM_COMBOS..(ai + 1) * NUM_COMBOS;
+                            for (c, &v) in child_v[span.clone()].iter_mut().zip(unit.iter()) {
+                                *c = half_pot * v;
+                            }
+                            for ((o, &s), &c) in
+                                out.iter_mut().zip(&sigma[span.clone()]).zip(&child_v[span])
+                            {
+                                *o += s * c;
+                            }
+                        }
+                        scratch.give(unit);
+                    } else if depth < PAR_DEPTH && a > 1 {
+                        // Each action's subtree writes only its own slot of the
+                        // action-major `child_v`, and touches only stores that
+                        // no sibling can reach.
+                        child_v
+                            .par_chunks_mut(NUM_COMBOS)
+                            .zip(children.par_iter())
+                            .zip(sigma.par_chunks(NUM_COMBOS))
+                            .for_each(|((cv, &child), sg)| {
+                                let mut rt = *reach_tr;
+                                for (r, &s) in rt.iter_mut().zip(sg) {
+                                    *r *= s;
+                                }
+                                let mut local = Scratch::default();
+                                Self::cfr(
+                                    env,
+                                    stores,
+                                    &mut local,
+                                    child,
+                                    &rt,
+                                    reach_op,
+                                    traverser,
+                                    t,
+                                    depth + 1,
+                                    cv,
+                                );
+                            });
+                        for ai in 0..a {
+                            let span = ai * NUM_COMBOS..(ai + 1) * NUM_COMBOS;
+                            for ((o, &s), &c) in
+                                out.iter_mut().zip(&sigma[span.clone()]).zip(&child_v[span])
+                            {
+                                *o += s * c;
+                            }
+                        }
+                    } else {
+                        for (ai, &child) in children.iter().enumerate() {
+                            let span = ai * NUM_COMBOS..(ai + 1) * NUM_COMBOS;
+                            let mut rt = *reach_tr;
+                            for (r, &s) in rt.iter_mut().zip(&sigma[span.clone()]) {
+                                *r *= s;
+                            }
+                            Self::cfr(
+                                env,
+                                stores,
+                                scratch,
+                                child,
+                                &rt,
+                                reach_op,
+                                traverser,
+                                t,
+                                depth + 1,
+                                &mut child_v[span.clone()],
+                            );
+                            for ((o, &s), &c) in
+                                out.iter_mut().zip(&sigma[span.clone()]).zip(&child_v[span])
+                            {
+                                *o += s * c;
+                            }
                         }
                     }
-                    stores[*store].update(&sigma, &child_v, out, reach_tr, t);
+                    Self::store(stores, *store).update(&sigma, &child_v, out, reach_tr, t);
                     scratch.give(child_v);
+                } else if Self::all_runout_leaves(env, children) {
+                    // Continuation chooser, opponent side.  A runout sweep is
+                    // linear in the opponent reach as well as in the pot — every
+                    // hero value is a fixed blocker/rank-weighted combination of
+                    // `opp_reach` entries — and all K children share this node's
+                    // board, hence the same weights `M`.  So the sum over
+                    // children telescopes into ONE sweep:
+                    //
+                    //   Σᵢ potᵢ · M · (r_op ∘ σᵢ)  =  M · (r_op ∘ Σᵢ potᵢ σᵢ)
+                    //
+                    // The traverser-side branch above collapses the same K
+                    // sweeps by the pot scalar alone (its reach is common to
+                    // every child); this is that argument carried through the
+                    // per-action reach push, so a chooser costs one sweep on
+                    // BOTH sides of the alternation.
+                    let mut blend = [0.0; NUM_COMBOS];
+                    for (ai, &child) in children.iter().enumerate() {
+                        let NodeKind::RunoutShowdown { half_pot } = &env.kinds[child] else {
+                            unreachable!("all_runout_leaves checked every child")
+                        };
+                        let span = ai * NUM_COMBOS..(ai + 1) * NUM_COMBOS;
+                        for (b, &s) in blend.iter_mut().zip(&sigma[span]) {
+                            *b += half_pot * s;
+                        }
+                    }
+                    for (b, &r) in blend.iter_mut().zip(reach_op.iter()) {
+                        *b *= r;
+                    }
+                    let o: &mut [f64; NUM_COMBOS] =
+                        (&mut *out).try_into().expect("value buffer is NUM_COMBOS");
+                    env.runout
+                        .expect("a runout leaf requires the resolve's runout table")
+                        .evaluate(&blend, 1.0, o);
+                } else if depth < PAR_DEPTH && a > 1 {
+                    // Opponent node, parallel: same reach push per action, but
+                    // each subtree returns its own vector so the sum below can
+                    // stay in action order.
+                    let partials: Vec<Vec<f64>> = children
+                        .par_iter()
+                        .zip(sigma.par_chunks(NUM_COMBOS))
+                        .map(|(&child, sg)| {
+                            let mut ro = *reach_op;
+                            for (r, &s) in ro.iter_mut().zip(sg) {
+                                *r *= s;
+                            }
+                            let mut cv = vec![0.0; NUM_COMBOS];
+                            let mut local = Scratch::default();
+                            Self::cfr(
+                                env,
+                                stores,
+                                &mut local,
+                                child,
+                                reach_tr,
+                                &ro,
+                                traverser,
+                                t,
+                                depth + 1,
+                                &mut cv,
+                            );
+                            cv
+                        })
+                        .collect();
+                    for cv in &partials {
+                        for (o, &c) in out.iter_mut().zip(cv.iter()) {
+                            *o += c;
+                        }
+                    }
                 } else {
                     // Opponent node: push the opponent's reach by σ (folding it
                     // into the counterfactual weight) and sum over actions.
@@ -346,7 +591,18 @@ impl VectorCfr {
                         for (r, &s) in ro.iter_mut().zip(&sigma[span]) {
                             *r *= s;
                         }
-                        Self::cfr(env, stores, scratch, child, reach_tr, &ro, traverser, t, &mut cv);
+                        Self::cfr(
+                            env,
+                            stores,
+                            scratch,
+                            child,
+                            reach_tr,
+                            &ro,
+                            traverser,
+                            t,
+                            depth + 1,
+                            &mut cv,
+                        );
                         for (o, &c) in out.iter_mut().zip(cv.iter()) {
                             *o += c;
                         }
@@ -375,7 +631,7 @@ impl VectorCfr {
             }
             public_nodes += 1;
             let a = children.len();
-            let s = &self.stores[*store];
+            let s = self.stores[*store].lock().expect("node store mutex poisoned");
             for h in 0..NUM_COMBOS {
                 let total: f64 = (0..a).map(|ai| s.strategy_col(ai)[h] as f64).sum();
                 if total <= 0.0 {

@@ -193,6 +193,46 @@ fn vectorized_multi_continuation_is_more_robust_than_single() {
 }
 
 #[test]
+fn resolve_is_bit_identical_across_thread_counts() {
+    // The traversal runs sibling subtrees concurrently.  That is only sound to
+    // ship because siblings touch disjoint stores and every combination back
+    // into a parent happens serially in child order — so no float addition is
+    // ever re-associated by the thread schedule, and a resolve is bit-exactly
+    // reproducible whatever box it lands on.  This is the gate for that claim;
+    // without it the repo's "deterministic per seed" property would quietly
+    // depend on core count.
+    let beliefs = duel_ranges();
+    let scales = vec![0.0, 0.75, 1.5, 3.0];
+    let solve = |threads: usize| {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("thread pool");
+        pool.install(|| {
+            solve_vectorized_multi(
+                &public_root_at(turn_board(), 20, 2),
+                &beliefs,
+                200,
+                u32::MAX,
+                scales.clone(),
+            )
+        })
+    };
+
+    let serial = solve(1);
+    let parallel = solve(8);
+    assert_eq!(
+        serial.strategy.len(),
+        parallel.strategy.len(),
+        "thread count changed the emitted info-set count"
+    );
+    for (key, probs) in &serial.strategy {
+        let other = parallel.strategy.get(key).expect("info set missing under 8 threads");
+        assert_eq!(probs, other, "thread count changed a strategy, bit for bit");
+    }
+}
+
+#[test]
 #[ignore = "four K-aware turn resolves + four exact-BR passes; run by hand when \
             re-tuning the continuation set"]
 fn continuation_count_robustness_sweep() {

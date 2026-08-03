@@ -5,6 +5,8 @@
 //! chance reveal / continuation chooser) is made here, in one place, so the
 //! tree's shape is readable without tracing the solver.
 
+use std::sync::Mutex;
+
 use poker_core::legal_actions;
 use poker_core::state::{GameState, NO_CARD};
 
@@ -90,7 +92,7 @@ impl VectorCfr {
             children.push(self.build(next, h, r, prep));
         }
         let store = self.stores.len();
-        self.stores.push(NodeStore::new(acts.len()));
+        self.stores.push(Mutex::new(NodeStore::new(acts.len())));
         let id = self.kinds.len();
         self.kinds.push(NodeKind::Decision {
             player,
@@ -147,7 +149,7 @@ impl VectorCfr {
             children.push(child);
         }
         let store = self.stores.len();
-        self.stores.push(NodeStore::new(children.len()));
+        self.stores.push(Mutex::new(NodeStore::new(children.len())));
         let id = self.kinds.len();
         self.kinds.push(NodeKind::Decision {
             player: self.chooser,
