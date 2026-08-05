@@ -5,11 +5,11 @@
 //! lock-free atomic path for many-core boxes).  Checkpoints every chunk so a
 //! multi-hour run survives interruption.
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use poker_ai::abstraction::bucket_map::BucketMap;
 use poker_ai::games::blueprint::BlueprintHoldem;
+use poker_ai::play::policy::write_policy;
 use poker_ai::solver::variant::Variant;
 use poker_ai::solver::dcfr::Discount;
 use poker_ai::solver::mccfr::Mccfr;
@@ -134,17 +134,16 @@ pub fn run_blueprint(args: &[String]) {
     let mut trainer = CursorTrainer { solver, parallel_batch, expl: None };
     run_chunked(&mut trainer, iters, &parse_cadence(args, iters), &ckpt_path);
 
-    // Persist the deployable average strategy as f32 (halves the footprint).
-    let avg: HashMap<u64, Vec<f32>> = trainer
-        .solver
-        .average_strategy()
-        .into_iter()
-        .map(|(k, v)| (k, v.into_iter().map(|x| x as f32).collect()))
-        .collect();
+    // Persist the deployable average strategy as f32 (halves the footprint),
+    // streamed rather than buffered — see `play::policy::write_policy`.
     let path = dir.join("blueprint_holdem.bin");
-    let bytes = bincode::serialize(&avg).expect("serialize strategy");
-    std::fs::write(&path, &bytes).expect("write strategy");
-    println!("Saved {} info sets, {} bytes -> {}", avg.len(), bytes.len(), path.display());
+    let avg = trainer.solver.average_strategy();
+    let n = write_policy(
+        &path,
+        avg.into_iter().map(|(k, v)| (k, v.into_iter().map(|x| x as f32).collect())),
+    )
+    .expect("write strategy");
+    println!("Saved {n} info sets -> {}", path.display());
 }
 
 /// Train the heads-up NLHE blueprint with the **flat SoA regret store** instead
@@ -228,17 +227,18 @@ pub fn run_blueprint_soa(args: &[String]) {
     // Export the deployable average strategy in the SAME HashMap<u64, Vec<f32>>
     // format the HashMap path writes (keys reconstructed via info_key_at), so the
     // artifact is interchangeable; only visited info sets are emitted.
+    //
+    // Streamed, never materialized: this table has hundreds of millions of
+    // visited info sets and is still resident here, so building the `HashMap`
+    // and then a whole-file `Vec<u8>` was tens of GB of peak at the one moment
+    // in the run where dying costs the most (`play::policy::write_policy`).
     let game = load_blueprint_game(&dir, stack, cap, false).with_indexing();
-    let mut avg: HashMap<u64, Vec<f32>> = HashMap::new();
-    for i in 0..solver.capacity() {
-        if solver.is_visited(i) {
-            let probs = solver.average_strategy_at(i).into_iter().map(|x| x as f32).collect();
-            avg.insert(game.info_key_at(i), probs);
-        }
-    }
     let path = dir.join("blueprint_holdem.bin");
-    let bytes = bincode::serialize(&avg).expect("serialize strategy");
-    std::fs::write(&path, &bytes).expect("write strategy");
-    println!("Saved {} info sets, {} bytes -> {}", avg.len(), bytes.len(), path.display());
+    let visited = (0..solver.capacity()).filter(|&i| solver.is_visited(i)).map(|i| {
+        let probs = solver.average_strategy_at(i).into_iter().map(|x| x as f32).collect();
+        (game.info_key_at(i), probs)
+    });
+    let n = write_policy(&path, visited).expect("write strategy");
+    println!("Saved {n} info sets -> {}", path.display());
 }
 

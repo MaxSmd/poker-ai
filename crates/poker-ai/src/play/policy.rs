@@ -9,7 +9,7 @@
 //! footprint stays close to the file size and lookups are a binary search.
 
 use std::fs::File;
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 /// A key's probabilities live at `offset = packed >> 4`, `len = packed & 0xF`.
@@ -102,6 +102,61 @@ fn read_u64(r: &mut impl Read) -> io::Result<u64> {
     Ok(u64::from_le_bytes(buf))
 }
 
+/// **Stream** the trainer's `HashMap<u64, Vec<f32>>` artifact to `path`, one
+/// entry at a time — the write counterpart of [`CompactPolicy::load`], and the
+/// reason the two live in the same module: the byte format is defined once.
+///
+/// ## Why this exists rather than `bincode::serialize(&map)`
+///
+/// The export used to build the whole `HashMap` *and* then hand it to
+/// `bincode::serialize`, which returns a `Vec<u8>` of the entire file. At
+/// blueprint scale (~390 M entries on the last server run, a 9.8 GB artifact)
+/// that is ~23 GB of map plus ~10 GB of byte buffer, **on top of** the regret
+/// table, which is still resident. The peak lands at the very end of a
+/// multi-hour run, so an OOM there costs the whole run. Streaming holds one
+/// entry at a time; the checkpoint path took the same medicine for the same
+/// reason (see `SoaMccfr::save_checkpoint`).
+///
+/// The count prefix is written as a placeholder and patched after the entries
+/// are known, so a caller cannot desync the header from the body by
+/// miscounting. Writes to a temp file and renames, so a crash mid-export leaves
+/// the previous artifact intact.
+///
+/// Returns the number of entries written.
+pub fn write_policy<I>(path: impl AsRef<Path>, entries: I) -> io::Result<u64>
+where
+    I: IntoIterator<Item = (u64, Vec<f32>)>,
+{
+    let path = path.as_ref();
+    let tmp = path.with_extension("bin.tmp");
+    let mut w = BufWriter::with_capacity(1 << 20, File::create(&tmp)?);
+
+    // Placeholder for the entry count; patched below once it is known.
+    w.write_all(&0u64.to_le_bytes())?;
+    let mut count = 0u64;
+    for (key, probs) in entries {
+        if probs.len() > 0xF {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("action count {} exceeds the 15-action packing limit", probs.len()),
+            ));
+        }
+        w.write_all(&key.to_le_bytes())?;
+        w.write_all(&(probs.len() as u64).to_le_bytes())?;
+        for p in probs {
+            w.write_all(&p.to_le_bytes())?;
+        }
+        count += 1;
+    }
+
+    w.seek(SeekFrom::Start(0))?;
+    w.write_all(&count.to_le_bytes())?;
+    w.flush()?;
+    drop(w);
+    std::fs::rename(&tmp, path)?;
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,6 +182,59 @@ mod tests {
         assert_eq!(p.get(u64::MAX).unwrap(), &[1.0]);
         assert_eq!(p.get(8), None);
         std::fs::remove_file(&path).ok();
+    }
+
+    /// The streamed writer must produce bytes `bincode` still reads back as the
+    /// `HashMap<u64, Vec<f32>>` it replaced — the compatibility claim that lets
+    /// the export skip building the map at all.  Checked *through bincode*, not
+    /// against a byte snapshot, because `HashMap` iteration order is arbitrary.
+    #[test]
+    fn streamed_writes_stay_bincode_hashmap_compatible() {
+        let dir = std::env::temp_dir().join("poker_ai_policy_stream_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("streamed.bin");
+        let entries =
+            vec![(7u64, vec![0.25f32, 0.75]), (42, vec![0.1, 0.2, 0.7]), (u64::MAX, vec![1.0])];
+
+        let n = write_policy(&path, entries.clone()).unwrap();
+        assert_eq!(n, 3, "returns the count it patched into the header");
+
+        let bytes = std::fs::read(&path).unwrap();
+        let decoded: HashMap<u64, Vec<f32>> = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(decoded, entries.iter().cloned().collect::<HashMap<_, _>>());
+
+        // …and the streaming reader the bot actually uses agrees.
+        let p = CompactPolicy::load(&path).unwrap();
+        assert_eq!(p.len(), 3);
+        assert_eq!(p.get(42).unwrap(), &[0.1, 0.2, 0.7]);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// An empty export is a real case (a run that visited nothing) and the
+    /// count patch-back must still leave a valid zero-length map.
+    #[test]
+    fn streamed_empty_policy_is_a_valid_empty_map() {
+        let dir = std::env::temp_dir().join("poker_ai_policy_stream_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("empty.bin");
+        assert_eq!(write_policy(&path, Vec::new()).unwrap(), 0);
+        let bytes = std::fs::read(&path).unwrap();
+        let decoded: HashMap<u64, Vec<f32>> = bincode::deserialize(&bytes).unwrap();
+        assert!(decoded.is_empty());
+        assert!(CompactPolicy::load(&path).unwrap().is_empty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The writer rejects what the reader would reject, rather than emitting a
+    /// file that only fails at load time — on the far side of a training run.
+    #[test]
+    fn streamed_writer_rejects_an_unpackable_action_count() {
+        let dir = std::env::temp_dir().join("poker_ai_policy_stream_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("toowide.bin");
+        let err = write_policy(&path, vec![(1u64, vec![0.0625f32; 16])]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(!path.exists(), "a rejected export must not replace the artifact");
     }
 
     #[test]

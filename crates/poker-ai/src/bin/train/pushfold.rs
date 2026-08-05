@@ -10,6 +10,7 @@ use std::time::Instant;
 use poker_ai::abstraction::canonical::preflop_index;
 use poker_ai::evaluation::exploitability::push_fold_exploitability;
 use poker_ai::games::push_fold::PushFoldHoldem;
+use poker_ai::play::policy::write_policy;
 use poker_ai::solver::variant::Variant;
 use poker_ai::solver::dcfr::Discount;
 use poker_ai::solver::mccfr::{Mccfr, SoaMccfr};
@@ -153,10 +154,12 @@ pub fn run(args: &[String]) {
         .map(|(k, v)| (k, v.into_iter().map(|x| x as f32).collect()))
         .collect();
     let path = dir.join("blueprint_pushfold.bin");
-    let bytes = bincode::serialize(&avg).expect("serialize strategy");
-    std::fs::write(&path, &bytes).expect("write strategy");
+    // Same writer as the blueprint export, so the artifact format has exactly
+    // one definition.  Push/fold keeps its map — `print_shove_chart` reads it —
+    // and the clone is a few thousand entries.
+    let n = write_policy(&path, avg.iter().map(|(&k, v)| (k, v.clone()))).expect("write strategy");
 
-    println!("Saved {} info sets, {} bytes -> {}", avg.len(), bytes.len(), path.display());
+    println!("Saved {n} info sets -> {}", path.display());
 
     print_shove_chart(stack, &avg);
 }
