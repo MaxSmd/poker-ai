@@ -355,6 +355,113 @@ fn vectorized_solves_full_ranges_the_explicit_solver_cannot() {
 }
 
 #[test]
+#[ignore = "iteration-budget sweep: several resolves plus exact-BR passes; run by \
+            hand when tuning `play --iters`"]
+fn river_resolve_iteration_budget_sweep() {
+    // What does `play`'s default `--iters=1500` actually buy?  It is a linear
+    // multiplier on every river decision the deployed bot makes — 3.8 ms/iter
+    // measured, so 5.7 s/decision at the default, which `bench_resolve_cost`
+    // itself labels UNUSABLE LIVE.  If the strategy stops moving at a few
+    // hundred iterations the default is pure latency, and cutting it makes the
+    // bot deployable *and* every Slumbot A/B ~5× cheaper.
+    //
+    // Two views, because neither alone answers the production question:
+    //
+    //  A. **Quality, with ground truth** — a 20 bb duel river scored by exact
+    //     best response inside the explicit `Subgame` oracle.  Real
+    //     exploitability, but a far smaller tree than production.
+    //  B. **Settling, at production shape** — a 200 bb full-range river, capped
+    //     like the bot's own resolve, comparing each budget's average strategy
+    //     against a high-iteration reference.  No oracle exists at this size
+    //     (that is why `vectorized_solves_full_ranges_the_explicit_solver_cannot`
+    //     is a throughput demo, not a quality one), so "has it stopped moving"
+    //     is the strongest available signal.
+    //
+    // Reported, not asserted, except for the two ends: this is a tuning tool,
+    // and the operator picks the knee off the printed curve.
+    use std::time::Instant;
+
+    const BUDGETS: [u64; 6] = [50, 100, 200, 400, 800, 1500];
+
+    // ── A. oracle-scored quality on the small duel river ────────────────────
+    let beliefs = duel_ranges();
+    let leaf = CheckdownLeafEval::new(); // unused on a complete board
+    let oracle = Subgame::new(public_root(river_board(), 20), &beliefs, &leaf);
+    println!("\n== A. 20bb duel river, exploitability in the explicit oracle ==");
+    let mut expl_at = Vec::new();
+    for &iters in &BUDGETS {
+        let t0 = Instant::now();
+        let resolved = solve_vectorized(&public_root(river_board(), 20), &beliefs, iters);
+        let solve_s = t0.elapsed().as_secs_f64();
+        let expl = exploitability(&oracle, &resolved.strategy);
+        println!("  {iters:>5} iters   expl {expl:>8.5} bb   ({solve_s:>5.2}s)");
+        expl_at.push((iters, expl));
+    }
+
+    // ── B. production-shaped settling on a 200bb full-range river ───────────
+    // Uniform 1326-combo ranges and raise cap 3 mirror what `play` builds for
+    // a river decision (`BotConfig::river_cap`), so the iteration counts here
+    // are the ones that transfer.
+    let mut b0 = BeliefState::uniform();
+    let mut b1 = BeliefState::uniform();
+    b0.remove_board(&river_board());
+    b1.remove_board(&river_board());
+    let ranges = [b0, b1];
+    let root = public_root(river_board(), 400); // 200 bb at the 2-chip big blind
+
+    println!("\n== B. 200bb full-range river (cap 3), drift from the 3000-iter reference ==");
+    let t0 = Instant::now();
+    let reference = solve_vectorized_capped(&root, &ranges, 3_000, 3);
+    println!(
+        "  reference: 3000 iters, {} public nodes, {} info sets ({:.1}s)",
+        reference.public_nodes,
+        reference.info_sets,
+        t0.elapsed().as_secs_f64()
+    );
+
+    let mut drift_at = Vec::new();
+    for &iters in &BUDGETS {
+        let t0 = Instant::now();
+        let resolved = solve_vectorized_capped(&root, &ranges, iters, 3);
+        let solve_s = t0.elapsed().as_secs_f64();
+
+        // Mean/max total-variation distance per info set against the reference.
+        // Info sets the reference never reached carry no strategy to compare.
+        let (mut sum_tv, mut max_tv, mut n) = (0.0f64, 0.0f64, 0usize);
+        for (key, ref_probs) in &reference.strategy {
+            let Some(probs) = resolved.strategy.get(key) else { continue };
+            if probs.len() != ref_probs.len() {
+                continue;
+            }
+            let tv: f64 =
+                probs.iter().zip(ref_probs).map(|(a, b)| (a - b).abs()).sum::<f64>() / 2.0;
+            sum_tv += tv;
+            max_tv = max_tv.max(tv);
+            n += 1;
+        }
+        let mean_tv = if n > 0 { sum_tv / n as f64 } else { f64::NAN };
+        println!(
+            "  {iters:>5} iters   mean TV {mean_tv:>7.4}   max TV {max_tv:>7.4}   \
+             ({n} info sets, {solve_s:>5.2}s)"
+        );
+        drift_at.push((iters, mean_tv));
+    }
+
+    println!(
+        "\n  Pick the knee: the smallest budget whose oracle exploitability (A) and\n  \
+         drift (B) are both flat.  At 3.8 ms/iter that budget × 3.8 ms is the\n  \
+         per-river-decision latency the deployed bot pays.\n"
+    );
+
+    // The only hard claims: the sweep ran, and more iterations is not worse.
+    let (_, expl_lo) = expl_at[0];
+    let (_, expl_hi) = *expl_at.last().unwrap();
+    assert!(expl_hi <= expl_lo, "more iterations must not increase oracle exploitability");
+    let (_, drift_hi) = *drift_at.last().unwrap();
+    assert!(drift_hi < 0.05, "1500 iters should sit close to the 3000-iter reference");
+}
+
+#[test]
 fn raise_cap_bounds_the_public_tree() {
     // Deep-ish stacks with a small pot: the raise chain is what the cap
     // prunes.  The capped tree must be strictly smaller, still solve to

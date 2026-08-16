@@ -35,7 +35,30 @@ use crate::resolving::belief_state::NUM_COMBOS;
 /// multiplies the task count into the thousands, where scheduling costs more
 /// than the arithmetic; the runout sweep inside a leaf has its own, much wider,
 /// parallel split (`PreparedRunout::evaluate`), so the leaves are already busy.
-const PAR_DEPTH: usize = 2;
+///
+/// **That reasoning predates any measurement.**  A `RAYON_NUM_THREADS` sweep on
+/// a 128-core box showed the river resolve saturating at ~4–16 threads (10.1
+/// ms/iter serial → 3.5 at 128, i.e. 2.3% parallel efficiency), which is the
+/// signature of too few tasks *or* of the per-task allocation in the parallel
+/// branches — this depth is what distinguishes them.  Override with
+/// `POKER_AI_PAR_DEPTH` to sweep it without a rebuild; the value only changes
+/// *where* work runs, never the result (sibling subtrees touch disjoint stores
+/// and are summed back in fixed action order).
+const DEFAULT_PAR_DEPTH: usize = 2;
+
+/// [`DEFAULT_PAR_DEPTH`], or `POKER_AI_PAR_DEPTH` when set.  Read once — the
+/// resolve calls this per node, and a `getenv` in that path would itself show
+/// up in a profile.
+fn par_depth() -> usize {
+    use std::sync::OnceLock;
+    static DEPTH: OnceLock<usize> = OnceLock::new();
+    *DEPTH.get_or_init(|| {
+        std::env::var("POKER_AI_PAR_DEPTH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_PAR_DEPTH)
+    })
+}
 
 /// A pool of reusable per-hand buffers for the traversal.
 ///
@@ -272,7 +295,7 @@ impl VectorCfr {
     /// ## Parallelism
     ///
     /// Sibling subtrees are independent — they touch disjoint stores — so the
-    /// child loops run concurrently while `depth < PAR_DEPTH`.  The cutoff
+    /// child loops run concurrently while `depth < par_depth()`.  The cutoff
     /// keeps tasks coarse: the root's few actions each carry a large subtree,
     /// whereas parallelising near the leaves would spend more on scheduling
     /// than on arithmetic.
@@ -323,7 +346,7 @@ impl VectorCfr {
             NodeKind::Chance { children } => {
                 // River reveal: mask both reaches per branch, sum, divide by
                 // the per-pair-consistent count (44) — see `NodeKind::Chance`.
-                if depth < PAR_DEPTH {
+                if depth < par_depth() {
                     // One independent subtree per live river card — the widest
                     // and most even split in the whole tree, and the reason a
                     // full-river turn resolve parallelises well.  Each branch
@@ -451,7 +474,7 @@ impl VectorCfr {
                             }
                         }
                         scratch.give(unit);
-                    } else if depth < PAR_DEPTH && a > 1 {
+                    } else if depth < par_depth() && a > 1 {
                         // Each action's subtree writes only its own slot of the
                         // action-major `child_v`, and touches only stores that
                         // no sibling can reach.
@@ -547,7 +570,7 @@ impl VectorCfr {
                     env.runout
                         .expect("a runout leaf requires the resolve's runout table")
                         .evaluate(&blend, 1.0, o);
-                } else if depth < PAR_DEPTH && a > 1 {
+                } else if depth < par_depth() && a > 1 {
                     // Opponent node, parallel: same reach push per action, but
                     // each subtree returns its own vector so the sum below can
                     // stay in action order.
