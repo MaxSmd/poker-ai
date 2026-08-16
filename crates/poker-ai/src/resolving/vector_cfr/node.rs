@@ -171,6 +171,15 @@ impl NodeStore {
     /// for a positive `t` can only reach zero by underflow, and `t` here is a
     /// sum of at most `MAX_ACTIONS` finite `f32`s, so a stored `0.0` always
     /// means "no mass" and never "a real, tiny reciprocal".
+    ///
+    /// **Both of those are free, and neither is faster.** Measured on the
+    /// one-thread arm of `bench_resolve_cost`, before and after: river 10.0 →
+    /// 10.4 ms/iter, turn 35.4 → 34.2 — noise in both directions. This kernel
+    /// streams `num_actions × 1326` element arrays and is bound by memory
+    /// bandwidth, not by the ALU, so removing arithmetic removes work that was
+    /// already hiding under a load. The change is kept because it is also the
+    /// clearer code, not because it bought anything. **Anything aimed at this
+    /// function's speed should reduce bytes moved, not operations issued.**
     fn matched_kernel<const FLOOR: bool>(&self, src: &[f32], out: &mut [f64], total: &mut [f64]) {
         let a = self.num_actions;
         debug_assert_eq!(out.len(), a * NUM_COMBOS);
@@ -225,6 +234,10 @@ impl NodeStore {
         // stack array rather than a `Scratch` loan because `update` runs after
         // every child has returned, so exactly one of these frames is live at a
         // time regardless of tree depth.
+        //
+        // Like the hoists in `matched_kernel`, this measured as no change: the
+        // loop is memory-bound, so the multiplies were already free.  See that
+        // function's doc comment for the numbers.
         let weight = t as f64; // linear averaging
         let mut wr = [0.0f64; NUM_COMBOS];
         for (w, &r) in wr.iter_mut().zip(reach_p.iter()) {

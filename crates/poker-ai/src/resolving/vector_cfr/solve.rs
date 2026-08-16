@@ -36,22 +36,30 @@ use crate::resolving::belief_state::NUM_COMBOS;
 /// than the arithmetic; the runout sweep inside a leaf has its own, much wider,
 /// parallel split (`PreparedRunout::evaluate`), so the leaves are already busy.
 ///
-/// **That reasoning was wrong, and a (depth × threads) sweep on a 128-core box
-/// says so.**  Minimum of three reps, `bench_resolve_cost`'s exact-river arm:
+/// **That reasoning was wrong, and a depth sweep on a 128-core box says so.**
+/// `bench_resolve_cost` at [`resolve_threads`], minimum of 5 × 100 iterations,
+/// ms/iter:
 ///
 /// ```text
-///            8 thr   16 thr   32 thr
-///   depth 3   2.3     2.1      1.8     ms/iter
-///   depth 4   2.2     1.7      1.3
-///   depth 5   2.9     2.1      1.4
-///   depth 6   2.3     1.7      1.5
+///             river   turn
+///   depth 2    2.7    5.0
+///   depth 3    1.4    4.2
+///   depth 4    1.2    3.5   <-- DEFAULT_PAR_DEPTH
+///   depth 5    1.3    3.6
+///   depth 6    1.3    3.6
 /// ```
 ///
-/// Depth 4 is the optimum — 3 is task-starved, 5–6 add tasks without adding
-/// value.  The shipped configuration (depth 2 on rayon's default 128-thread
-/// pool) measured **3.5 ms/iter**, the worst cell in the grid: too few tasks
-/// *and* an oversubscribed pool.  Depth 4 at [`resolve_threads`] is 2.7× faster,
-/// taking a 1500-iteration river decision from 5.3 s to ~2.0 s.
+/// Depth 4 is the optimum on both arms: 2 is task-starved and 5–6 add tasks
+/// without adding value.  Depth 2 → 4 is 2.2× on the river arm, taking a
+/// 1500-iteration river decision from 4.0 s to 1.8 s — which is the difference
+/// between missing and meeting a live time budget.
+///
+/// Do not trust a sweep taken with a short probe.  An earlier version of this
+/// table was measured through a benchmark whose window was ~90 ms, and it
+/// reported a *fabricated-looking* grid that could not be reproduced: on a
+/// shared box that window is scheduler jitter, not signal.  See the header of
+/// `bench_resolve_cost` for what had to be fixed before these numbers meant
+/// anything.
 ///
 /// Override with `POKER_AI_PAR_DEPTH` to re-sweep without a rebuild.  The value
 /// only changes *where* work runs, never the result: sibling subtrees touch
@@ -74,10 +82,20 @@ fn par_depth() -> usize {
 
 /// Worker threads for the resolve's **own** pool (see [`resolve_pool`]).
 ///
-/// 16, not the measured optimum of 32: on the sweep above 32 threads is ~1.3
-/// ms/iter against 16's ~1.7, so the last 30% costs twice the cores — a poor
-/// trade on a shared machine, and this runs on one.  `POKER_AI_RESOLVE_THREADS`
-/// takes the other side of that trade on a box you own.
+/// Measured at [`DEFAULT_PAR_DEPTH`], minimum of 5 × 100 iterations, ms/iter:
+///
+/// ```text
+///              river   turn    (speedup vs. 1 thread)
+///    1 thr     10.0    35.4     —
+///    8 thr      1.7     5.1     5.9× / 6.9×
+///   16 thr      1.3     3.5     7.7× / 10.1×
+///   32 thr      1.0     2.5     10×  / 14.2×
+/// ```
+///
+/// 16, not the faster 32: the last step buys 0.3 ms on the river for twice the
+/// cores, a poor trade on a shared machine, and this runs on one.  Both arms
+/// clear the live budget from 8 threads up, so 16 has margin without being
+/// greedy.  `POKER_AI_RESOLVE_THREADS` takes the other side on a box you own.
 const DEFAULT_RESOLVE_THREADS: usize = 16;
 
 fn resolve_threads() -> usize {
@@ -90,12 +108,12 @@ fn resolve_threads() -> usize {
 
 /// The resolve's dedicated rayon pool.
 ///
-/// **Why not the global pool.**  Rayon defaults to one worker per core, which on
-/// a 128-core box is 128 threads fighting over the O(10–40)-task subtree split —
-/// measured at 4.5 ms/iter against 1.3 for the same work on 32.  The bad setting
-/// was the one you got by *default*, and it stayed invisible until someone swept
-/// `RAYON_NUM_THREADS` by hand.  Owning the pool makes the good setting the
-/// default and stops the resolve's cost depending on the host's core count.
+/// **Why not the global pool.**  Rayon defaults to one worker per core, so the
+/// resolve's cost silently depended on how many cores the host happened to have
+/// — and the subtree split is O(10–40) tasks, which does not want 128 workers.
+/// Owning the pool makes [`resolve_threads`] the setting you get by default,
+/// instead of one nobody would find without sweeping `RAYON_NUM_THREADS` by
+/// hand.
 ///
 /// Built once and leaked for the process; [`VectorCfr::run`] installs it, so
 /// every `par_iter` in the traversal lands here rather than on the global pool.
