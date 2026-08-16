@@ -43,13 +43,26 @@ use crate::resolving::belief_state::{combo_cards, BeliefState, NUM_COMBOS};
 #[derive(Clone, Debug)]
 pub struct BotConfig {
     /// Re-solve river decisions (recommended); otherwise blueprint throughout.
+    ///
+    /// The only resolve that is on by default, and the only one that fits a
+    /// live clock: 1.9 s per decision at `river_iters`, 2.1 s worst-case
+    /// (`bench_resolve_cost`, 16 threads).
     pub resolve_river: bool,
     /// Re-solve turn decisions.  Each depth-cut leaf averages 44 river runouts,
     /// so this is materially slower than a river resolve — off by default.
+    ///
+    /// **Read [`Self::turn_full_river`] before enabling this.**  With that flag
+    /// left at its default the turn resolve builds a 1.36 M-node tree and costs
+    /// **798 s per decision**; with it off, 1.8 s.  Turning this on alone is a
+    /// 13-minute decision, and nothing at runtime will warn you.
     pub resolve_turn: bool,
     /// Re-solve flop decisions.  Each depth-cut leaf averages C(45,2)=990
     /// turn+river runouts, an order of magnitude slower again — intended for
     /// small-sample testing, off by default.
+    ///
+    /// Measured at 25.1 s per decision even in the cheap continuation-cut mode
+    /// (flop never uses full-river).  That is over any live budget; this flag is
+    /// for offline experiments only.
     pub resolve_flop: bool,
     /// CFR⁺ iterations per river resolve.
     pub river_iters: u64,
@@ -66,8 +79,23 @@ pub struct BotConfig {
     /// Turn resolves deal the river as an explicit chance node and solve the
     /// **real river betting** — exact to showdown, no leaf model at all
     /// (default).  Off = cut at the reveal with the K-continuation check-down
-    /// leaf (`continuations`), ~48× cheaper per iteration; flop resolves
-    /// always use the continuation cut either way.
+    /// leaf (`continuations`); flop resolves always use the continuation cut
+    /// either way.
+    ///
+    /// The cost difference is not a tuning knob, it is a change of regime.
+    /// Measured at `river_cap = 3` (`bench_resolve_cost`, 16 threads):
+    ///
+    /// ```text
+    ///   full-river          1 356 939 nodes   1580.7 ms/iter   798 s/decision
+    ///   continuation cut          735 nodes      3.6 ms/iter     1.8 s/decision
+    ///   full-river, cap 1      11 115 nodes     16.3 ms/iter     8.2 s/decision
+    /// ```
+    ///
+    /// That is 439×, not the "~48×" this comment claimed before anyone
+    /// measured it.  The default is exact and unusable live; it stays the
+    /// default only because [`Self::resolve_turn`] is off, which is the single
+    /// thing keeping it out of the hot path.  Dropping `river_cap` to 1 does
+    /// not rescue it either.
     pub turn_full_river: bool,
     /// Continual re-solving (DeepStack-style): carry the opponent's
     /// counterfactual values from each resolve and constrain the next one
