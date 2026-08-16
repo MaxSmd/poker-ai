@@ -142,6 +142,36 @@ impl NodeStore {
         total: &mut [f64],
         floor_negative: bool,
     ) {
+        if floor_negative {
+            self.matched_kernel::<true>(src, out, total);
+        } else {
+            self.matched_kernel::<false>(src, out, total);
+        }
+    }
+
+    /// [`matched_into`](Self::matched_into) with `floor_negative` lifted into a
+    /// const parameter.
+    ///
+    /// Two things here are worth more than they look, because this runs at every
+    /// decision node of every iteration over `num_actions × 1326` elements:
+    ///
+    /// * **The `max(·, 0)` test was inside both inner loops** even though it is
+    ///   fixed for the whole call — the same predicate re-evaluated a few
+    ///   thousand times per node. As a const parameter it folds away at compile
+    ///   time and the `false` instantiation (the average pass, whose source
+    ///   array is already non-negative) becomes a plain widening copy.
+    /// * **The per-hand normalizer was a divide in the inner loop**, so a node
+    ///   with `a` actions issued `a × 1326` divisions of the *same* `1326`
+    ///   denominators. Reciprocating once up front turns all but 1326 of them
+    ///   into multiplies; a division is both far slower than a multiply and far
+    ///   worse at pipelining.
+    ///
+    /// The reciprocal pass overwrites `total` in place, storing `0.0` where the
+    /// mass was zero. That sentinel is exact rather than approximate: `1.0 / t`
+    /// for a positive `t` can only reach zero by underflow, and `t` here is a
+    /// sum of at most `MAX_ACTIONS` finite `f32`s, so a stored `0.0` always
+    /// means "no mass" and never "a real, tiny reciprocal".
+    fn matched_kernel<const FLOOR: bool>(&self, src: &[f32], out: &mut [f64], total: &mut [f64]) {
         let a = self.num_actions;
         debug_assert_eq!(out.len(), a * NUM_COMBOS);
         debug_assert_eq!(total.len(), NUM_COMBOS);
@@ -149,16 +179,20 @@ impl NodeStore {
         for ai in 0..a {
             let col = &src[ai * NUM_COMBOS..(ai + 1) * NUM_COMBOS];
             for (t, &r) in total.iter_mut().zip(col) {
-                *t += if floor_negative { (r as f64).max(0.0) } else { r as f64 };
+                *t += if FLOOR { (r as f64).max(0.0) } else { r as f64 };
             }
+        }
+        // One division per hand instead of one per (hand, action).
+        for t in total.iter_mut() {
+            *t = if *t > 0.0 { 1.0 / *t } else { 0.0 };
         }
         let uniform = 1.0 / a as f64;
         for ai in 0..a {
             let col = &src[ai * NUM_COMBOS..(ai + 1) * NUM_COMBOS];
             let dst = &mut out[ai * NUM_COMBOS..(ai + 1) * NUM_COMBOS];
-            for ((o, &r), &t) in dst.iter_mut().zip(col).zip(total.iter()) {
-                let r = if floor_negative { (r as f64).max(0.0) } else { r as f64 };
-                *o = if t > 0.0 { r / t } else { uniform };
+            for ((o, &r), &inv) in dst.iter_mut().zip(col).zip(total.iter()) {
+                let r = if FLOOR { (r as f64).max(0.0) } else { r as f64 };
+                *o = if inv != 0.0 { r * inv } else { uniform };
             }
         }
     }
@@ -184,7 +218,19 @@ impl NodeStore {
         let a = self.num_actions;
         debug_assert_eq!(sigma.len(), a * NUM_COMBOS);
         debug_assert_eq!(child_v.len(), a * NUM_COMBOS);
+
+        // `weight × reach_p[h]` does not depend on the action, but the loop
+        // below re-derived it once per (hand, action).  Hoisting it costs one
+        // pass and saves `(a − 1) × 1326` multiplies per node.  The buffer is a
+        // stack array rather than a `Scratch` loan because `update` runs after
+        // every child has returned, so exactly one of these frames is live at a
+        // time regardless of tree depth.
         let weight = t as f64; // linear averaging
+        let mut wr = [0.0f64; NUM_COMBOS];
+        for (w, &r) in wr.iter_mut().zip(reach_p.iter()) {
+            *w = weight * r;
+        }
+
         for ai in 0..a {
             let span = ai * NUM_COMBOS..(ai + 1) * NUM_COMBOS;
             let regret = &mut self.regret[span.clone()];
@@ -192,8 +238,14 @@ impl NodeStore {
             let cv = &child_v[span.clone()];
             let sg = &sigma[span];
             for h in 0..NUM_COMBOS {
-                regret[h] = ((regret[h] as f64 + cv[h] - v[h]).max(0.0)) as f32;
-                strat[h] += (weight * reach_p[h] * sg[h]) as f32;
+                // The accumulator is `f32` either way, so the old
+                // `f32 → f64 → max → f32` round-trip bought no precision: it
+                // rounded once at the store instead of once at the increment,
+                // and the increment is the smaller quantity.  Narrowing the
+                // instantaneous regret first keeps the accumulate-and-floor in
+                // `f32`, which is twice as many lanes per vector register.
+                regret[h] = (regret[h] + (cv[h] - v[h]) as f32).max(0.0);
+                strat[h] += (wr[h] * sg[h]) as f32;
             }
         }
     }
