@@ -13,10 +13,16 @@
 //!                      to, so a preserved run needs this)
 //!   --stack-bb=N       blueprint stack depth in bb (default 200 — Slumbot's)
 //!   --cap=N            blueprint raise cap (default 3 — must match training)
-//!   --no-resolve       blueprint-only river (skip the vectorized re-solve)
-//!   --resolve-turn     also re-solve the turn (runout leaves — slower)
-//!   --resolve-flop     also re-solve the flop (two-card runout — much slower;
-//!                      for small-sample testing)
+//!   --no-resolve       blueprint-only (skip the vectorized re-solve entirely)
+//!   --no-resolve-turn  blueprint on the turn (re-solving is ON by default)
+//!   --no-resolve-flop  blueprint on the flop (re-solving is ON by default)
+//!   --runout-sample=N  board completions evaluated per iteration at a
+//!                      depth-cut leaf, 0 = exact (default 64).  What makes
+//!                      turn/flop re-solving affordable: a flop leaf has 1176
+//!                      completions, and exact cost 24.6 s/decision
+//!   --turn-full-river  turn resolves solve the real river betting instead of
+//!                      cutting at the reveal.  Exact, and 798 s/decision —
+//!                      an offline reference, not a playable mode
 //!   --iters=N          CFR⁺ iterations per river resolve (default 1500)
 //!   --turn-iters=N     CFR⁺ iterations per turn/flop resolve (default 500)
 //!   --river-cap=N      raise cap inside a resolve, every street (default 3)
@@ -420,9 +426,10 @@ fn run_slumbot(args: &[String]) {
     validate(
         args,
         &[
-            "data", "policy", "stack-bb", "cap", "no-resolve", "resolve-turn", "resolve-flop",
-            "turn-checkdown", "no-continual", "iters", "turn-iters", "river-cap",
-            "continuations", "purify", "seed", "log-hands", "token", "username", "password",
+            "data", "policy", "stack-bb", "cap", "no-resolve", "no-resolve-turn",
+            "no-resolve-flop", "turn-full-river", "runout-sample", "no-continual", "iters",
+            "turn-iters", "river-cap", "continuations", "purify", "seed", "log-hands", "token",
+            "username", "password",
         ],
         1,
     );
@@ -440,14 +447,16 @@ fn run_slumbot(args: &[String]) {
         .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect::<Vec<f64>>())
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| vec![0.0, 0.75, 1.5, 3.0]);
+    // Turn and flop re-solving are ON by default: runout sampling brought them
+    // inside a live clock, and re-solving every postflop street is the point of
+    // the resolver.  `--no-resolve-turn` / `--no-resolve-flop` fall back street
+    // by street; `--no-resolve` is the blueprint-only arm and must switch off
+    // *all three*, or "no resolve" would still re-solve two streets.
+    let no_resolve = args.iter().any(|a| a == "--no-resolve");
     let cfg = BotConfig {
-        resolve_river: !args.iter().any(|a| a == "--no-resolve"),
-        // Turn and flop re-solving are ON by default: runout sampling brought
-        // them inside a live clock, and re-solving every postflop street is the
-        // point of the resolver.  `--no-resolve-turn` / `--no-resolve-flop`
-        // fall back to blueprint lookups for A/Bs.
-        resolve_turn: !args.iter().any(|a| a == "--no-resolve-turn"),
-        resolve_flop: !args.iter().any(|a| a == "--no-resolve-flop"),
+        resolve_river: !no_resolve,
+        resolve_turn: !no_resolve && !args.iter().any(|a| a == "--no-resolve-turn"),
+        resolve_flop: !no_resolve && !args.iter().any(|a| a == "--no-resolve-flop"),
         river_iters: flag(args, "iters").unwrap_or(1_500),
         turn_iters: flag(args, "turn-iters").unwrap_or(500),
         river_cap: flag(args, "river-cap").unwrap_or(3),
