@@ -36,15 +36,27 @@ use crate::resolving::belief_state::NUM_COMBOS;
 /// than the arithmetic; the runout sweep inside a leaf has its own, much wider,
 /// parallel split (`PreparedRunout::evaluate`), so the leaves are already busy.
 ///
-/// **That reasoning predates any measurement.**  A `RAYON_NUM_THREADS` sweep on
-/// a 128-core box showed the river resolve saturating at ~4–16 threads (10.1
-/// ms/iter serial → 3.5 at 128, i.e. 2.3% parallel efficiency), which is the
-/// signature of too few tasks *or* of the per-task allocation in the parallel
-/// branches — this depth is what distinguishes them.  Override with
-/// `POKER_AI_PAR_DEPTH` to sweep it without a rebuild; the value only changes
-/// *where* work runs, never the result (sibling subtrees touch disjoint stores
-/// and are summed back in fixed action order).
-const DEFAULT_PAR_DEPTH: usize = 2;
+/// **That reasoning was wrong, and a (depth × threads) sweep on a 128-core box
+/// says so.**  Minimum of three reps, `bench_resolve_cost`'s exact-river arm:
+///
+/// ```text
+///            8 thr   16 thr   32 thr
+///   depth 3   2.3     2.1      1.8     ms/iter
+///   depth 4   2.2     1.7      1.3
+///   depth 5   2.9     2.1      1.4
+///   depth 6   2.3     1.7      1.5
+/// ```
+///
+/// Depth 4 is the optimum — 3 is task-starved, 5–6 add tasks without adding
+/// value.  The shipped configuration (depth 2 on rayon's default 128-thread
+/// pool) measured **3.5 ms/iter**, the worst cell in the grid: too few tasks
+/// *and* an oversubscribed pool.  Depth 4 at [`resolve_threads`] is 2.7× faster,
+/// taking a 1500-iteration river decision from 5.3 s to ~2.0 s.
+///
+/// Override with `POKER_AI_PAR_DEPTH` to re-sweep without a rebuild.  The value
+/// only changes *where* work runs, never the result: sibling subtrees touch
+/// disjoint stores and are summed back in fixed action order.
+const DEFAULT_PAR_DEPTH: usize = 4;
 
 /// [`DEFAULT_PAR_DEPTH`], or `POKER_AI_PAR_DEPTH` when set.  Read once — the
 /// resolve calls this per node, and a `getenv` in that path would itself show
@@ -57,6 +69,45 @@ fn par_depth() -> usize {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_PAR_DEPTH)
+    })
+}
+
+/// Worker threads for the resolve's **own** pool (see [`resolve_pool`]).
+///
+/// 16, not the measured optimum of 32: on the sweep above 32 threads is ~1.3
+/// ms/iter against 16's ~1.7, so the last 30% costs twice the cores — a poor
+/// trade on a shared machine, and this runs on one.  `POKER_AI_RESOLVE_THREADS`
+/// takes the other side of that trade on a box you own.
+const DEFAULT_RESOLVE_THREADS: usize = 16;
+
+fn resolve_threads() -> usize {
+    std::env::var("POKER_AI_RESOLVE_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_RESOLVE_THREADS)
+}
+
+/// The resolve's dedicated rayon pool.
+///
+/// **Why not the global pool.**  Rayon defaults to one worker per core, which on
+/// a 128-core box is 128 threads fighting over the O(10–40)-task subtree split —
+/// measured at 4.5 ms/iter against 1.3 for the same work on 32.  The bad setting
+/// was the one you got by *default*, and it stayed invisible until someone swept
+/// `RAYON_NUM_THREADS` by hand.  Owning the pool makes the good setting the
+/// default and stops the resolve's cost depending on the host's core count.
+///
+/// Built once and leaked for the process; [`VectorCfr::run`] installs it, so
+/// every `par_iter` in the traversal lands here rather than on the global pool.
+fn resolve_pool() -> &'static rayon::ThreadPool {
+    use std::sync::OnceLock;
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(resolve_threads())
+            .thread_name(|i| format!("resolve-{i}"))
+            .build()
+            .expect("build the resolve thread pool")
     })
 }
 
@@ -232,6 +283,18 @@ impl VectorCfr {
     /// each iteration updates one player's regrets while the other plays its
     /// current strategy — the standard, robustly-converging scheme).
     pub fn run(&mut self, iters: u64) {
+        // On the resolve's own pool, not rayon's global one — see `resolve_pool`.
+        // A caller who has already installed a pool keeps it: that is how
+        // `resolve_is_bit_identical_across_thread_counts` pins determinism across
+        // thread counts, and overriding it there would make the gate vacuous.
+        if rayon::current_thread_index().is_some() {
+            self.run_on_current_pool(iters);
+        } else {
+            resolve_pool().install(|| self.run_on_current_pool(iters));
+        }
+    }
+
+    fn run_on_current_pool(&mut self, iters: u64) {
         let mut root_value = vec![0.0; NUM_COMBOS];
         for _ in 0..iters {
             self.t += 1;
