@@ -13,13 +13,12 @@
 //!   carried Bayes updates of the blueprint (`P(observed abstract action | hand)`
 //!   at every prior decision), and the resolved root distribution is played
 //!   directly in real chips.  A **river** resolve is exact to showdown; a
-//!   **turn** resolve deals the river as an explicit chance node and solves the
-//!   real river betting below it (exact to showdown, no leaf model — the
-//!   default; `turn_full_river = false` falls back to the K-continuation
-//!   check-down cut); a **flop** resolve cuts at the undealt turn with the
-//!   opponent choosing among K continuations at the leaf, so the
-//!   resolve is robust to post-leaf betting the check-down ignores.  Turn/flop
-//!   resolves are far costlier than river ones and are opt-in.
+//!   **turn** resolve cuts at the river reveal and a **flop** resolve at the
+//!   turn reveal, with the opponent choosing among K continuations at the leaf,
+//!   so the resolve is robust to post-leaf betting a plain check-down ignores.
+//!   All three streets re-solve by default, each inside ~2 s per decision;
+//!   `runout_sample` is what makes the turn and flop affordable, and
+//!   `turn_full_river` is an offline reference mode at 798 s/decision.
 //! * **Continual re-solving** (DeepStack-style, on by default) — every resolve
 //!   extracts the opponent's per-hand counterfactual values under the emitted
 //!   strategy; the next resolve in the same hand is constrained by the CFV
@@ -44,25 +43,26 @@ use crate::resolving::belief_state::{combo_cards, BeliefState, NUM_COMBOS};
 pub struct BotConfig {
     /// Re-solve river decisions (recommended); otherwise blueprint throughout.
     ///
-    /// The only resolve that is on by default, and the only one that fits a
-    /// live clock: 1.9 s per decision at `river_iters`, 2.1 s worst-case
-    /// (`bench_resolve_cost`, 16 threads).
+    /// 1.9 s per decision at `river_iters` (`bench_resolve_cost`, 16 threads).
+    /// A complete board has no runout, so [`Self::runout_sample`] does not
+    /// apply here — the river is always exact to showdown.
     pub resolve_river: bool,
-    /// Re-solve turn decisions.  Each depth-cut leaf averages 44 river runouts,
-    /// so this is materially slower than a river resolve — off by default.
+    /// Re-solve turn decisions.  On by default.
     ///
-    /// **Read [`Self::turn_full_river`] before enabling this.**  With that flag
-    /// left at its default the turn resolve builds a 1.36 M-node tree and costs
-    /// **798 s per decision**; with it off, 1.8 s.  Turning this on alone is a
-    /// 13-minute decision, and nothing at runtime will warn you.
+    /// 1.9 s per decision. A turn board has only 48 completions, so at the
+    /// default [`Self::runout_sample`] of 64 the turn sweep clamps to exact —
+    /// sampling buys nothing here and is not used.
+    ///
+    /// **[`Self::turn_full_river`] must stay off.** It replaces the depth cut
+    /// with the real river betting and costs 798 s per decision.
     pub resolve_turn: bool,
-    /// Re-solve flop decisions.  Each depth-cut leaf averages C(45,2)=990
-    /// turn+river runouts, an order of magnitude slower again — intended for
-    /// small-sample testing, off by default.
+    /// Re-solve flop decisions.  On by default.
     ///
-    /// Measured at 25.1 s per decision even in the cheap continuation-cut mode
-    /// (flop never uses full-river).  That is over any live budget; this flag is
-    /// for offline experiments only.
+    /// 2.1 s per decision — down from **24.6 s** before [`Self::runout_sample`]
+    /// existed. Each depth-cut leaf enumerates C(49,2)=1176 turn+river
+    /// completions against 48 on the turn, so the flop is the one street whose
+    /// cost is set almost entirely by the runout sweep rather than by the tree:
+    /// identical 735-node trees, 12× the per-iteration cost.
     pub resolve_flop: bool,
     /// CFR⁺ iterations per river resolve.
     pub river_iters: u64,
@@ -87,22 +87,47 @@ pub struct BotConfig {
     ///
     /// ```text
     ///   full-river          1 356 939 nodes   1580.7 ms/iter   798 s/decision
-    ///   continuation cut          735 nodes      3.6 ms/iter     1.8 s/decision
+    ///   continuation cut          735 nodes      3.9 ms/iter     1.9 s/decision
     ///   full-river, cap 1      11 115 nodes     16.3 ms/iter     8.2 s/decision
     /// ```
     ///
     /// That is 439×, not the "~48×" this comment claimed before anyone
-    /// measured it.  The default is exact and unusable live; it stays the
-    /// default only because [`Self::resolve_turn`] is off, which is the single
-    /// thing keeping it out of the hot path.  Dropping `river_cap` to 1 does
-    /// not rescue it either.
+    /// measured it.  It used to be the default, which made turning
+    /// [`Self::resolve_turn`] on a 13-minute decision; it is now **off**, and
+    /// exists as an offline reference for checking what the continuation cut
+    /// costs in strategy.  Sampling does not rescue it — its cost is the
+    /// 1.36 M-node tree, not the runout — and neither does `river_cap = 1`.
     pub turn_full_river: bool,
     /// Runout completions evaluated per iteration at each depth-cut leaf
-    /// (`0` = exact).  The lever that makes turn and flop re-solving affordable:
-    /// a flop leaf has 1176 completions and a turn leaf 48, and the resolve
-    /// pays that per iteration.  Sampling trades per-iteration accuracy — which
-    /// CFR averages away — for latency, which it cannot.  Ignored on the river
-    /// (a complete board has no runout) and by CFV extraction (exact, once).
+    /// (`0` = exact).  The lever that makes turn and flop re-solving affordable
+    /// at all: a flop leaf has 1176 completions and a turn leaf 48, and the
+    /// resolve pays that *per iteration*.  Sampling trades per-iteration
+    /// accuracy — which CFR averages away across iterations — for latency,
+    /// which it cannot.
+    ///
+    /// Seconds per decision at 500 iterations (`bench_resolve_cost`, 16
+    /// threads):
+    ///
+    /// ```text
+    ///   sample     turn    flop
+    ///   exact       2.1    24.6
+    ///       16      0.9     1.1
+    ///       32      1.4     1.6
+    ///       64      1.9     2.1   <-- default
+    ///      128      1.9     3.3
+    ///      256      1.8     6.1
+    /// ```
+    ///
+    /// 64 is chosen so the **turn stays exact** — it has only 48 completions,
+    /// so anything at or above that clamps to the full sweep — while the flop
+    /// samples 64 of 1176 and lands beside the river's 1.9 s. Below 64 the turn
+    /// starts being sampled to save time it does not need to save; above it,
+    /// only the flop gets slower. More completions is strictly better strategy
+    /// at equal latency, so raise this on a machine with headroom.
+    ///
+    /// Ignored on the river (a complete board has no runout) and by CFV
+    /// extraction, which runs once per resolve and stays exact because its
+    /// output is the safety guarantee the next continual resolve carries.
     pub runout_sample: usize,
     /// Continual re-solving (DeepStack-style): carry the opponent's
     /// counterfactual values from each resolve and constrain the next one

@@ -186,25 +186,36 @@ Architecture (`crates/poker-ai/src/play/`):
   and our abstract raises translate back at the same pot fraction.
 - **Bayes range tracking** — both players' ranges are updated at every
   decision with the blueprint's action likelihoods per hand, plus card removal.
-- **River re-solving** — each river decision is re-solved from the *actual*
-  public state (real pot/stacks, so translation error vanishes where the money
-  is deepest) with the vectorized full-range public-tree CFR⁺ solver
-  (`resolving/vector_cfr/`, ~1–2 s per decision). `--no-resolve` plays the
-  blueprint throughout instead.
+- **Postflop re-solving** — every flop, turn and river decision is re-solved
+  from the *actual* public state (real pot/stacks, so translation error
+  vanishes where the money is deepest) with the vectorized full-range
+  public-tree CFR⁺ solver (`resolving/vector_cfr/`). Measured at 16 threads:
+  **1.9 s** per river decision, 1.9 s per turn, 2.1 s per flop.
+
+  Turn and flop leaves cut at the undealt street, where each leaf averages 48
+  (turn) or 1176 (flop) board completions *per iteration* — the flop cost 24.6 s
+  a decision before `--runout-sample` let it estimate that sweep from a rotating
+  sample instead of enumerating it. `--no-resolve` plays the blueprint
+  throughout; `--no-resolve-turn` / `--no-resolve-flop` fall back street by
+  street.
 - The runner prints a running **bb/100 ± 95% CI**, emits `@wandb` metric lines
   (wrap with `scripts/train_wandb.py` to chart a long match), persists the
   session token, and logs every hand to `data/slumbot_results.csv`.
 
 Flags: `--iters=N` (resolve iterations), `--river-cap=N`, `--purify=X`
 (drop sub-X action probabilities), `--seed=N`, `--no-resolve`,
+`--no-resolve-turn`, `--no-resolve-flop`, `--runout-sample=N` (completions per
+iteration at a depth-cut leaf; `0` = exact),
 `--token=`/`--username=`/`--password=` — see the header of `src/bin/play.rs`.
 
 The rest of the resolving stack (`crates/poker-ai/src/validation/resolving/`,
 the explicit-deal oracle the vectorized solver is gated against) — CFV-gadget
 continual re-solving, blueprint warm-starting, multi-valued leaf continuations,
-full-river turn resolves — is implemented and tested; turn/flop play-time
-resolving is wired into the bot but off by default (`--resolve-turn`
-/`--resolve-flop`), and a Slumbot A/B of those arms is the next measurement.
+full-river turn resolves — is implemented and tested. Full-river turn resolving
+(`--turn-full-river`) stays an offline reference: it solves the real river
+betting rather than cutting at the reveal, which is exact and costs 798 s per
+decision. A Slumbot A/B of postflop re-solving against blueprint-only play
+(`--no-resolve-turn --no-resolve-flop`) is the next measurement.
 
 ## Evaluation toolkit
 
