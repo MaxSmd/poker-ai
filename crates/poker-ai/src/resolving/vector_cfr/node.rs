@@ -270,6 +270,10 @@ pub(super) struct Env<'a> {
     pub(super) kinds: &'a [NodeKind],
     pub(super) board: &'a [u8; 5],
     pub(super) runout: Option<&'a PreparedRunout>,
+    /// Runout completions sampled per training iteration, or `0` for the exact
+    /// sweep.  Applies to [`super::VectorCfr::cfr`] only — CFV extraction runs
+    /// once and stays exact.  See `PreparedRunout::evaluate_sampled`.
+    pub(super) runout_sample: usize,
     pub(super) prepared: &'a [PreparedShowdown],
     pub(super) cards: &'a [[u8; 2]],
     /// Carried opponent CFVs when a gadget wraps the root (`CfvTerminal`).

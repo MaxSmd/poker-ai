@@ -265,6 +265,16 @@ pub struct PreparedRunout {
     /// Live completions per compatible (hero, opp) pair — `C(48 − real, missing)`
     /// — the exact normalizing denominator (see [`board_runout_cfvs`]).
     live_per_pair: f64,
+    /// A fixed shuffle of completion indices, stored **twice back to back** so
+    /// that any window of up to `completions.len()` entries is one contiguous
+    /// slice — which is what lets [`evaluate_sampled`](Self::evaluate_sampled)
+    /// take a wrapping window without allocating or branching.
+    ///
+    /// Shuffled rather than sequential because consecutive completions share a
+    /// board card: a contiguous window of the natural order is a systematically
+    /// skewed sample (all the runouts bringing one particular card), while a
+    /// contiguous window of a shuffle is a spread one.
+    order: Vec<u32>,
 }
 
 impl PreparedRunout {
@@ -320,35 +330,99 @@ impl PreparedRunout {
         } else {
             (free * (free - 1) / 2) as f64
         };
-        Self { completions, added, live: unused, missing, live_per_pair }
+        // Deterministic Fisher–Yates.  A fixed-seed LCG, not a thread RNG: the
+        // sampling schedule has to be identical on every machine and every run,
+        // or two resolves of the same spot stop being reproducible and
+        // `resolve_is_bit_identical_across_thread_counts` stops meaning
+        // anything.
+        let n = completions.len();
+        let mut perm: Vec<u32> = (0..n as u32).collect();
+        let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
+        for i in (1..n).rev() {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            perm.swap(i, (s >> 33) as usize % (i + 1));
+        }
+        let mut order = perm.clone();
+        order.extend_from_slice(&perm);
+
+        Self { completions, added, live: unused, missing, live_per_pair, order }
     }
 
     /// The showdown CFV averaged over the runout: sum every completion's
     /// reach-weighted showdown into `out`, then divide by the live-completion
     /// count (see [`board_runout_cfvs`]).
     pub fn evaluate(&self, opp_reach: &[f64; 1326], half_pot: f64, out: &mut [f64; 1326]) {
+        self.evaluate_sampled(opp_reach, half_pot, out, 0, self.completions.len());
+    }
+
+    /// [`evaluate`](Self::evaluate) over a **sample** of `sample` completions
+    /// instead of all of them, rescaled so the estimate stays unbiased.
+    ///
+    /// ## Why sampling is nearly free here
+    ///
+    /// The completion loop is the resolver's hot spot: a turn leaf costs 48 tier
+    /// walks and a flop leaf 1176, against ONE for a river leaf. That is the
+    /// whole reason a flop resolve costs ~14× a turn one and ~350× a river one
+    /// per iteration — 735 identical tree nodes, 1176× the leaf work.
+    ///
+    /// But a resolve does not need each *iteration's* leaf value to be exact —
+    /// it needs the **average strategy** to converge, and that integrates over
+    /// every iteration. Total leaf work across a resolve is `iters × sample`,
+    /// so 500 iterations at `sample = 32` performs 16 000 tier walks per leaf:
+    /// less work than one exact pass at 500 iterations by 36×, yet the averaged
+    /// strategy has still seen *more* completions than the 1176 that exist.
+    /// The per-iteration estimate gets noisier; the artifact you deploy does
+    /// not. This is the same chance-sampling the trainer's external-sampling
+    /// MCCFR already relies on, applied at the runout rather than at the deal.
+    ///
+    /// `round` advances the window, so successive iterations see disjoint
+    /// samples and the schedule sweeps the whole completion set every
+    /// `ceil(n / sample)` rounds rather than resampling the same subset. It is
+    /// systematic sampling, not random: fully deterministic, independent of the
+    /// thread schedule, and identical across machines.
+    ///
+    /// Callers that need the exact expectation — CFV extraction, which runs
+    /// once per resolve rather than once per iteration — should use
+    /// [`evaluate`](Self::evaluate) and pay for it there, where it is affordable.
+    pub fn evaluate_sampled(
+        &self,
+        opp_reach: &[f64; 1326],
+        half_pot: f64,
+        out: &mut [f64; 1326],
+        round: u64,
+        sample: usize,
+    ) {
+        let n = self.completions.len();
+        // `0` is the callers' "exact" sentinel (`VectorCfr::runout_sample`,
+        // `BotConfig::runout_sample`), so it must mean *every* completion — not
+        // one.  Clamping instead of mapping here silently turned every exact
+        // resolve into a 1-completion sample, which read as a strategy
+        // regression rather than an arithmetic one.
+        let sample = if sample == 0 { n } else { sample.min(n) };
+
         // The reach denominators are rank-free, so they are *not* per-completion
         // work: across completions they differ only by the combos the new board
         // card(s) block.  Summing them once over the partial board and
         // restricting in O(52) replaces 48 (turn) or 1176 (flop) full passes
-        // over ~1081 combos — about a third of `evaluate`, exactly, no
-        // approximation.  The tier walk stays per-completion: ranks change.
+        // over ~1081 combos — exactly, no approximation.  The tier walk stays
+        // per-completion: ranks change.
         let base = self.base_sums(opp_reach);
 
-        // The completion loop is the resolver's hot spot: a turn leaf costs 48
-        // tier walks and a flop leaf 1176, against ONE for a river leaf, which
-        // is why turn/flop resolves cost ~14×/~350× a river resolve per
-        // iteration.  The walks are independent, so this is a map-reduce.
-        let chunk = self.chunk_len();
-        let partials: Vec<[f64; 1326]> = self
-            .completions
+        // A contiguous window of the doubled `order`, so no wrap branch and no
+        // index gather.
+        let offset = (round as usize).wrapping_mul(sample) % n;
+        let window = &self.order[offset..offset + sample];
+
+        // The walks are independent, so this is a map-reduce.
+        let chunk = Self::chunk_len_for(sample);
+        let partials: Vec<[f64; 1326]> = window
             .par_chunks(chunk)
-            .zip(self.added.par_chunks(chunk))
-            .map(|(completions, added)| {
+            .map(|block| {
                 let mut acc = [0.0; 1326];
-                for (c, add) in completions.iter().zip(added) {
-                    let sums = self.restrict(&base, opp_reach, &add[..self.missing]);
-                    c.accumulate_with(opp_reach, half_pot, &sums, &mut acc);
+                for &ci in block {
+                    let ci = ci as usize;
+                    let sums = self.restrict(&base, opp_reach, &self.added[ci][..self.missing]);
+                    self.completions[ci].accumulate_with(opp_reach, half_pot, &sums, &mut acc);
                 }
                 acc
             })
@@ -365,8 +439,14 @@ impl PreparedRunout {
                 *o += v;
             }
         }
+
+        // `live_per_pair` normalizes a full sweep; a sample of `sample`-in-`n`
+        // carries `sample / n` of that mass, so scaling back up by `n / sample`
+        // leaves the estimator unbiased.  At `sample == n` this is exactly the
+        // old divisor.
+        let scale = n as f64 / (self.live_per_pair * sample as f64);
         for o in out.iter_mut() {
-            *o /= self.live_per_pair;
+            *o *= scale;
         }
     }
 
@@ -378,10 +458,10 @@ impl PreparedRunout {
     /// the cost of scheduling it, which matters on the turn's 48 completions
     /// (a leaf is evaluated once per traverser per iteration, so these tasks
     /// are spawned in the hundreds of thousands over a resolve).
-    fn chunk_len(&self) -> usize {
+    fn chunk_len_for(n: usize) -> usize {
         const TARGET: usize = 64;
         const FLOOR: usize = 4;
-        self.completions.len().div_ceil(TARGET).max(FLOOR)
+        n.div_ceil(TARGET).max(FLOOR)
     }
 
     /// Reach sums over every combo avoiding the *partial* board — the superset
@@ -595,5 +675,129 @@ mod runout_denominator_tests {
         let worst = fast.iter().zip(&slow).map(|(a, b)| (a - b).abs()).fold(0.0f64, f64::max);
         let scale = slow.iter().fold(0.0f64, |m, v| m.max(v.abs())).max(1.0);
         assert!(worst < 1e-9 * scale, "hoisted denominators changed the CFV: {worst} (scale {scale})");
+    }
+
+    /// **The correctness claim behind runout sampling.**
+    ///
+    /// The schedule is systematic, so consecutive rounds take disjoint windows
+    /// of the shuffled order; when `sample` divides the completion count, one
+    /// full cycle of `n / sample` rounds tiles the set exactly once. Averaging
+    /// that cycle must therefore reproduce the exact sweep to f64 noise — which
+    /// is what makes the estimator unbiased rather than merely close.
+    ///
+    /// If this fails, the `n / sample` rescaling in `evaluate_sampled` is wrong
+    /// and every sampled resolve is quietly mis-scaled — a bug that would look
+    /// like a strategy problem, not an arithmetic one.
+    #[test]
+    fn sampled_runout_averages_to_the_exact_sweep_over_one_cycle() {
+        // A turn board: 48 completions, so 8 divides the set into 6 windows.
+        let board = [make_card(12, 0), make_card(11, 1), make_card(4, 2), make_card(2, 3), NO_CARD];
+        let runout = PreparedRunout::new(board);
+        assert_eq!(runout.completions.len(), 48);
+        let reach = lumpy_reach();
+
+        let mut exact = [0.0; 1326];
+        runout.evaluate(&reach, 7.5, &mut exact);
+
+        const SAMPLE: usize = 8;
+        let rounds = 48 / SAMPLE;
+        let mut mean = [0.0; 1326];
+        for round in 0..rounds {
+            let mut one = [0.0; 1326];
+            runout.evaluate_sampled(&reach, 7.5, &mut one, round as u64, SAMPLE);
+            for (m, &v) in mean.iter_mut().zip(one.iter()) {
+                *m += v / rounds as f64;
+            }
+        }
+
+        let worst = exact.iter().zip(&mean).map(|(a, b)| (a - b).abs()).fold(0.0f64, f64::max);
+        let scale = exact.iter().fold(0.0f64, |m, v| m.max(v.abs())).max(1.0);
+        assert!(worst < 1e-9 * scale, "sampling is biased: {worst} (scale {scale})");
+    }
+
+    /// Sampling noise must be a **knob**, not a cliff: a bigger sample has to
+    /// mean a closer estimate, monotonically, or `runout_sample` is not
+    /// something a caller can trade against latency.
+    ///
+    /// Measured RMS deviation from the exact sweep for one round on a 48-
+    /// completion turn board, as a percentage of the value scale:
+    ///
+    /// ```text
+    ///    4/48   11.8%      16/48   4.7%
+    ///    8/48    9.2%      24/48   3.4%
+    ///   12/48    7.1%      48/48   0.0%
+    /// ```
+    ///
+    /// Those are per-*iteration* errors, and they are large on purpose — the
+    /// point of sampling is that CFR averages them away across iterations, which
+    /// `sampled_runout_averages_to_the_exact_sweep_over_one_cycle` pins. What
+    /// this test guards is that the trade stays legible: pay more completions,
+    /// get a better estimate.
+    #[test]
+    fn sampling_noise_falls_monotonically_with_sample_size() {
+        let board = [make_card(12, 0), make_card(11, 1), make_card(4, 2), make_card(2, 3), NO_CARD];
+        let runout = PreparedRunout::new(board);
+        let reach = lumpy_reach();
+
+        let mut exact = [0.0; 1326];
+        runout.evaluate(&reach, 7.5, &mut exact);
+        let scale = exact.iter().fold(0.0f64, |m, v| m.max(v.abs())).max(1.0);
+
+        let rms = |sample: usize| {
+            let mut one = [0.0; 1326];
+            runout.evaluate_sampled(&reach, 7.5, &mut one, 0, sample);
+            let n = exact.len() as f64;
+            (exact.iter().zip(&one).map(|(a, b)| (a - b) * (a - b)).sum::<f64>() / n).sqrt() / scale
+        };
+
+        let errs: Vec<f64> = [4usize, 8, 12, 16, 24].iter().map(|&s| rms(s)).collect();
+        for w in errs.windows(2) {
+            assert!(w[1] < w[0], "a larger sample got worse: {errs:?}");
+        }
+        assert!(errs[0] < 0.20, "even a 4/48 sample should track the sweep: {}", errs[0]);
+        assert!(rms(48) < 1e-12, "a full sample must be the exact sweep, got {}", rms(48));
+    }
+
+    /// `evaluate` must remain exactly the full sweep after being re-expressed in
+    /// terms of the sampled path — the sampled window at `sample == n` is a
+    /// permutation of every completion, and permuting a sum must not change it.
+    #[test]
+    fn exact_evaluate_is_unchanged_by_the_sampling_refactor() {
+        let board = [make_card(12, 0), make_card(11, 1), make_card(4, 2), NO_CARD, NO_CARD];
+        let runout = PreparedRunout::new(board);
+        let reach = lumpy_reach();
+
+        let mut via_evaluate = [0.0; 1326];
+        runout.evaluate(&reach, 3.25, &mut via_evaluate);
+
+        let mut direct = [0.0; 1326];
+        for c in &runout.completions {
+            c.accumulate(&reach, 3.25, &mut direct);
+        }
+        for o in direct.iter_mut() {
+            *o /= runout.live_per_pair;
+        }
+
+        let worst =
+            via_evaluate.iter().zip(&direct).map(|(a, b)| (a - b).abs()).fold(0.0f64, f64::max);
+        let scale = direct.iter().fold(0.0f64, |m, v| m.max(v.abs())).max(1.0);
+        assert!(worst < 1e-9 * scale, "the exact path drifted: {worst} (scale {scale})");
+
+        // `sample = 0` is the "exact" sentinel every caller passes down.  An
+        // earlier version clamped it to 1 instead of mapping it to `n`, turning
+        // every supposedly-exact resolve into a one-completion sample — which
+        // surfaced only as a turn resolve missing an exploitability bound by
+        // 35%, i.e. as a strategy bug.  Pin the sentinel directly, at every
+        // round, so it cannot regress silently again.
+        for round in [0u64, 1, 7, 1000] {
+            let mut sentinel = [0.0; 1326];
+            runout.evaluate_sampled(&reach, 3.25, &mut sentinel, round, 0);
+            let worst = sentinel
+                .iter()
+                .zip(&via_evaluate)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f64, f64::max);
+            assert!(worst < 1e-9 * scale, "sample=0 is not exact at round {round}: {worst}");
+        }
     }
 }

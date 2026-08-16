@@ -97,6 +97,13 @@ pub struct BotConfig {
     /// thing keeping it out of the hot path.  Dropping `river_cap` to 1 does
     /// not rescue it either.
     pub turn_full_river: bool,
+    /// Runout completions evaluated per iteration at each depth-cut leaf
+    /// (`0` = exact).  The lever that makes turn and flop re-solving affordable:
+    /// a flop leaf has 1176 completions and a turn leaf 48, and the resolve
+    /// pays that per iteration.  Sampling trades per-iteration accuracy — which
+    /// CFR averages away — for latency, which it cannot.  Ignored on the river
+    /// (a complete board has no runout) and by CFV extraction (exact, once).
+    pub runout_sample: usize,
     /// Continual re-solving (DeepStack-style): carry the opponent's
     /// counterfactual values from each resolve and constrain the next one
     /// with the CFV gadget, so the opponent cannot profit from our strategy
@@ -114,13 +121,14 @@ impl Default for BotConfig {
     fn default() -> Self {
         Self {
             resolve_river: true,
-            resolve_turn: false,
-            resolve_flop: false,
+            resolve_turn: true,
+            resolve_flop: true,
             river_iters: 1_500,
             turn_iters: 500,
             river_cap: 3,
             continuations: vec![0.0, 0.75, 1.5, 3.0],
-            turn_full_river: true,
+            turn_full_river: false,
+            runout_sample: 64,
             continual: true,
             purify: 0.1,
             seed: 1,

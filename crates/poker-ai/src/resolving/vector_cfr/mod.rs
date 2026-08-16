@@ -79,6 +79,10 @@ pub struct VectorCfr {
     /// river resolve, which has no `RunoutShowdown` leaves).  Built once and
     /// shared across every iteration and every turn leaf.
     runout: Option<PreparedRunout>,
+    /// Runout completions evaluated per training iteration at each depth-cut
+    /// leaf, or `0` for the exact sweep (the default).  See
+    /// [`Self::with_runout_sample`].
+    runout_sample: usize,
     /// Pre-sorted complete boards for `Showdown` leaves: one entry for a river
     /// resolve, one per live river card for a full-river turn resolve.  Built
     /// once at construction so no iteration ever re-sorts a board.
@@ -203,6 +207,7 @@ impl VectorCfr {
             reach1,
             board,
             runout,
+            runout_sample: 0,
             prepared: Vec::new(),
             full_river,
             cards: (0..NUM_COMBOS).map(combo_cards).collect(),
@@ -226,6 +231,30 @@ impl VectorCfr {
         me.root = me.build(root.clone(), Vec::new(), 0, root_prep);
         me.inner_root = me.root;
         me
+    }
+
+    /// Evaluate only `sample` of the depth-cut leaves' board completions per
+    /// training iteration, instead of all of them (`0` = exact, the default).
+    ///
+    /// This is the lever that makes turn and flop re-solving affordable live.
+    /// A flop leaf enumerates C(49,2)=1176 turn+river completions and a turn
+    /// leaf 48, against ONE for a river leaf — which is the entire reason a
+    /// flop resolve costs ~350× a river resolve per iteration despite building
+    /// an identically sized tree. Sampling cuts that factor directly.
+    ///
+    /// It costs accuracy per iteration and **not** accuracy in the emitted
+    /// strategy: total leaf work is `iters × sample`, so the averaged strategy
+    /// integrates over far more completions than exist, while each individual
+    /// iteration sees a noisier estimate. `PreparedRunout::evaluate_sampled`
+    /// carries the full argument, including why the schedule is systematic
+    /// rather than random (determinism, and even coverage).
+    ///
+    /// CFV extraction stays exact regardless — it runs once per resolve, where
+    /// the exact sweep is affordable, and its output is the safety guarantee
+    /// the next continual resolve is constrained by.
+    pub fn with_runout_sample(mut self, sample: usize) -> Self {
+        self.runout_sample = sample;
+        self
     }
 
     /// Constrain this resolve with the opponent's **carried counterfactual

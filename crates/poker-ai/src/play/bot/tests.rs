@@ -266,6 +266,9 @@ fn resolve_bot(turn: bool, flop: bool, continuations: Vec<f64>) -> Bot {
             // These tests pin the K-continuation leaf path; the full-river
             // path has its own test below.
             turn_full_river: false,
+            // Exact runout sweeps: these tests pin leaf wiring and legality,
+            // so they should not also depend on the sampling schedule.
+            runout_sample: 0,
             continual: true,
             purify: 0.0,
             seed: 42,

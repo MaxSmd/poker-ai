@@ -134,13 +134,19 @@ impl Bot {
                 self.cfg.turn_iters,
             )
         } else {
+            // Turn and flop cut at the undealt street, so every leaf pays for a
+            // runout sweep once per iteration — 48 completions on the turn and
+            // 1176 on the flop.  `runout_sample` is what keeps that inside a
+            // live clock; the river arm above never reaches here (a complete
+            // board has no runout to sample).
             (
                 VectorCfr::new_capped_multi(
                     &root,
                     &beliefs,
                     self.cfg.river_cap,
                     self.cfg.continuations.clone(),
-                ),
+                )
+                .with_runout_sample(self.cfg.runout_sample),
                 self.cfg.turn_iters,
             )
         };

@@ -51,6 +51,13 @@ fn card(rank: u8, suit: u8) -> u8 {
     rank * 4 + suit
 }
 
+/// Runout completions per iteration for the turn/flop arms (`0` = exact).
+/// These are the arms whose cost is dominated by the runout sweep, so this is
+/// the knob worth sweeping here.
+fn runout_sample() -> usize {
+    env_or("POKER_AI_RUNOUT_SAMPLE", 0) as usize
+}
+
 /// `POKER_AI_BENCH_PROBE` / `POKER_AI_BENCH_REPS`, or the defaults.
 fn env_or(name: &str, default: u64) -> u64 {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(default)
@@ -131,6 +138,10 @@ fn main() {
         env_or("POKER_AI_BENCH_REPS", 5),
         env_or("POKER_AI_BENCH_PROBE", 100),
     );
+    match runout_sample() {
+        0 => println!("Runout sweeps are EXACT; set POKER_AI_RUNOUT_SAMPLE to sample them."),
+        n => println!("Runout sweeps sample {n} completions per iteration."),
+    }
     if heavy {
         println!("Running the HEAVY arms too — expect several GB of RSS.\n");
     } else {
@@ -143,9 +154,18 @@ fn main() {
     let t = public_root_at(turn, 2);
     bench(
         "turn checkdown K=4 (500 it)",
-        || VectorCfr::new_capped_multi(&t, &ranges, 3, vec![0.0, 0.75, 1.5, 3.0]),
+        || VectorCfr::new_capped_multi(&t, &ranges, 3, vec![0.0, 0.75, 1.5, 3.0])
+            .with_runout_sample(runout_sample()),
         500,
     );
+    let f = public_root_at(flop, 1);
+    bench(
+        "flop checkdown K=4 (500 it)",
+        || VectorCfr::new_capped_multi(&f, &ranges, 3, vec![0.0, 0.75, 1.5, 3.0])
+            .with_runout_sample(runout_sample()),
+        500,
+    );
+
     if !heavy {
         return;
     }
@@ -165,10 +185,4 @@ fn main() {
         500,
     );
 
-    let f = public_root_at(flop, 1);
-    bench(
-        "flop checkdown K=4 (500 it)",
-        || VectorCfr::new_capped_multi(&f, &ranges, 3, vec![0.0, 0.75, 1.5, 3.0]),
-        500,
-    );
 }

@@ -175,6 +175,7 @@ impl VectorCfr {
             kinds: &self.kinds,
             board: &self.board,
             runout: self.runout.as_ref(),
+            runout_sample: self.runout_sample,
             prepared: &self.prepared,
             cards: &self.cards,
             carried: self.carried.as_deref(),
@@ -326,6 +327,7 @@ impl VectorCfr {
                 kinds: &self.kinds,
                 board: &self.board,
                 runout: self.runout.as_ref(),
+            runout_sample: self.runout_sample,
                 prepared: &self.prepared,
                 cards: &self.cards,
                     carried: self.carried.as_deref(),
@@ -413,7 +415,7 @@ impl VectorCfr {
                 let o: &mut [f64; NUM_COMBOS] = out.try_into().expect("value buffer is NUM_COMBOS");
                 env.runout
                     .expect("turn resolve must build a runout table for its leaves")
-                    .evaluate(reach_op, *half_pot, o);
+                    .evaluate_sampled(reach_op, *half_pot, o, t, env.runout_sample);
             }
             NodeKind::Fold { payoffs } => {
                 let mut vr = [0.0; NUM_COMBOS];
@@ -538,7 +540,7 @@ impl VectorCfr {
                                 .expect("value buffer is NUM_COMBOS");
                             env.runout
                                 .expect("a runout leaf requires the resolve's runout table")
-                                .evaluate(reach_op, 1.0, u);
+                                .evaluate_sampled(reach_op, 1.0, u, t, env.runout_sample);
                         }
                         for (ai, &child) in children.iter().enumerate() {
                             let NodeKind::RunoutShowdown { half_pot } = &env.kinds[child] else {
@@ -650,7 +652,7 @@ impl VectorCfr {
                         (&mut *out).try_into().expect("value buffer is NUM_COMBOS");
                     env.runout
                         .expect("a runout leaf requires the resolve's runout table")
-                        .evaluate(&blend, 1.0, o);
+                        .evaluate_sampled(&blend, 1.0, o, t, env.runout_sample);
                 } else if depth < par_depth() && a > 1 {
                     // Opponent node, parallel: same reach push per action, but
                     // each subtree returns its own vector so the sum below can

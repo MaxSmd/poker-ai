@@ -442,15 +442,23 @@ fn run_slumbot(args: &[String]) {
         .unwrap_or_else(|| vec![0.0, 0.75, 1.5, 3.0]);
     let cfg = BotConfig {
         resolve_river: !args.iter().any(|a| a == "--no-resolve"),
-        resolve_turn: args.iter().any(|a| a == "--resolve-turn"),
-        resolve_flop: args.iter().any(|a| a == "--resolve-flop"),
+        // Turn and flop re-solving are ON by default: runout sampling brought
+        // them inside a live clock, and re-solving every postflop street is the
+        // point of the resolver.  `--no-resolve-turn` / `--no-resolve-flop`
+        // fall back to blueprint lookups for A/Bs.
+        resolve_turn: !args.iter().any(|a| a == "--no-resolve-turn"),
+        resolve_flop: !args.iter().any(|a| a == "--no-resolve-flop"),
         river_iters: flag(args, "iters").unwrap_or(1_500),
         turn_iters: flag(args, "turn-iters").unwrap_or(500),
         river_cap: flag(args, "river-cap").unwrap_or(3),
         continuations,
-        // Turn resolves solve the real river betting by default; the
-        // K-continuation check-down cut stays available for A/Bs and speed.
-        turn_full_river: !args.iter().any(|a| a == "--turn-checkdown"),
+        // Turn resolves cut at the river reveal with the K-continuation leaf.
+        // `--turn-full-river` solves the real river betting instead: exact, and
+        // measured at 798 s/decision, so it is an offline reference only.
+        turn_full_river: args.iter().any(|a| a == "--turn-full-river"),
+        // 0 = exact runout sweep.  The default samples, which is what makes
+        // turn/flop resolving affordable at all.
+        runout_sample: flag(args, "runout-sample").unwrap_or(64),
         // Continual re-solving (CFV-gadget carry) on by default; --no-continual
         // gives independent per-decision resolves for A/Bs.
         continual: !args.iter().any(|a| a == "--no-continual"),
