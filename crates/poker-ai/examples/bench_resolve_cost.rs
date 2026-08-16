@@ -6,6 +6,11 @@
 //! usable in a live match (Slumbot allows ~a few seconds per decision).
 //!
 //!   cargo run --release --example bench_resolve_cost
+//!
+//! Each arm reports the minimum per-iteration cost over `POKER_AI_BENCH_REPS`
+//! batches of `POKER_AI_BENCH_PROBE` iterations (default 5 x 100).  Raise the
+//! probe when sweeping small differences on a busy machine; lower it for the
+//! opt-in `all` arms, which are minutes per batch.
 
 use std::time::Instant;
 
@@ -46,23 +51,62 @@ fn card(rank: u8, suit: u8) -> u8 {
     rank * 4 + suit
 }
 
-/// Time a few iterations and extrapolate — the expensive modes take tens of
-/// minutes at their real iteration counts, which is itself the finding.
-fn bench(label: &str, mut solver: VectorCfr, target_iters: u64) {
-    let build = Instant::now();
-    let build_s = build.elapsed().as_secs_f64();
-    let nodes = solver.public_node_count();
-    // Enough probe iterations that the per-iteration figure is stable: at 4 the
-    // river arm swung 14–21 ms/iter run to run, which is wider than most of the
-    // differences worth measuring here.
-    const PROBE: u64 = 20;
+/// `POKER_AI_BENCH_PROBE` / `POKER_AI_BENCH_REPS`, or the defaults.
+fn env_or(name: &str, default: u64) -> u64 {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(default)
+}
+
+/// Time `reps` batches of `probe` iterations and report the **minimum**,
+/// extrapolating to the mode's real iteration count — the expensive modes take
+/// tens of minutes at that count, which is itself the finding.
+///
+/// ## Why the shape of this function matters
+///
+/// It previously took a built `VectorCfr` by value and ran one 20-iteration
+/// batch.  Both halves of that were wrong once the arms got fast:
+///
+/// * **Construction escaped the clock.**  The solver was built in the *caller's*
+///   argument expression, so `build.elapsed()` was reading a stopwatch started
+///   one line earlier and always reported ~0.  Table construction is not free
+///   and is itself parallel, so it also polluted any whole-process CPU%
+///   measurement.  Taking a builder closure puts it back inside the clock.
+/// * **The window was far too short.**  20 iterations was tuned when an
+///   iteration cost 14–21 ms.  After the denominator hoist the river arm is
+///   ~4 ms, making the measured window ~90 ms — short enough on a shared box
+///   that a thread-count sweep produced a non-monotone ordering (1 thread
+///   apparently beating 16).  That was jitter being read as signal.
+///
+/// Minimum-of-reps rather than mean: on a machine with other tenants the fast
+/// tail is the machine's real capability and the slow tail is someone else's
+/// job.  A warm-up batch runs first so pool construction and first-touch page
+/// faults land outside the measurement.
+fn bench(label: &str, build: impl Fn() -> VectorCfr, target_iters: u64) {
+    let probe = env_or("POKER_AI_BENCH_PROBE", 100);
+    let reps = env_or("POKER_AI_BENCH_REPS", 5);
+
     let t = Instant::now();
-    solver.run(PROBE);
-    let per_iter = t.elapsed().as_secs_f64() / PROBE as f64;
-    let total = build_s + per_iter * target_iters as f64;
+    let mut solver = build();
+    let build_s = t.elapsed().as_secs_f64();
+    let nodes = solver.public_node_count();
+
+    solver.run(5);
+
+    let mut best = f64::INFINITY;
+    let mut worst: f64 = 0.0;
+    for _ in 0..reps {
+        let t = Instant::now();
+        solver.run(probe);
+        let per_iter = t.elapsed().as_secs_f64() / probe as f64;
+        best = best.min(per_iter);
+        worst = worst.max(per_iter);
+    }
+
+    let total = build_s + best * target_iters as f64;
     println!(
-        "{label:<36} {nodes:>8} nodes  {:>8.1} ms/iter  x{target_iters:>5} it = {:>9.1} s/decision{}",
-        per_iter * 1000.0,
+        "{label:<36} {nodes:>8} nodes  {:>7.1} ms/iter (max {:>6.1})  build {:>5.1}s  x{target_iters:>5} it = {:>8.1} s/decision{}",
+        best * 1000.0,
+        worst * 1000.0,
+        build_s,
         total,
         if total > 5.0 { "   <-- UNUSABLE LIVE" } else { "" }
     );
@@ -82,7 +126,11 @@ fn main() {
     let heavy = std::env::args().any(|a| a == "all");
 
     println!("Resolve cost at 200bb (blinds {SB}/{BB}), raise cap 3, full 1326-hand ranges.");
-    println!("VectorCfr is SINGLE-THREADED — these are one-core timings.");
+    println!(
+        "Minimum of {} x {} iterations, after a warm-up batch; build time is measured separately.",
+        env_or("POKER_AI_BENCH_REPS", 5),
+        env_or("POKER_AI_BENCH_PROBE", 100),
+    );
     if heavy {
         println!("Running the HEAVY arms too — expect several GB of RSS.\n");
     } else {
@@ -90,12 +138,12 @@ fn main() {
     }
 
     let r = public_root_at(river, 3);
-    bench("river (exact, 1500 it)", VectorCfr::new_capped(&r, &ranges, 3), 1500);
+    bench("river (exact, 1500 it)", || VectorCfr::new_capped(&r, &ranges, 3), 1500);
 
     let t = public_root_at(turn, 2);
     bench(
         "turn checkdown K=4 (500 it)",
-        VectorCfr::new_capped_multi(&t, &ranges, 3, vec![0.0, 0.75, 1.5, 3.0]),
+        || VectorCfr::new_capped_multi(&t, &ranges, 3, vec![0.0, 0.75, 1.5, 3.0]),
         500,
     );
     if !heavy {
@@ -103,24 +151,24 @@ fn main() {
     }
     bench(
         "turn FULL-RIVER (500 it)  [default]",
-        VectorCfr::new_full(&t, &ranges, 3, vec![0.0], true),
+        || VectorCfr::new_full(&t, &ranges, 3, vec![0.0], true),
         500,
     );
     bench(
         "turn FULL-RIVER (100 it)",
-        VectorCfr::new_full(&t, &ranges, 3, vec![0.0], true),
+        || VectorCfr::new_full(&t, &ranges, 3, vec![0.0], true),
         100,
     );
     bench(
         "turn FULL-RIVER cap1 (500 it)",
-        VectorCfr::new_full(&t, &ranges, 1, vec![0.0], true),
+        || VectorCfr::new_full(&t, &ranges, 1, vec![0.0], true),
         500,
     );
 
     let f = public_root_at(flop, 1);
     bench(
         "flop checkdown K=4 (500 it)",
-        VectorCfr::new_capped_multi(&f, &ranges, 3, vec![0.0, 0.75, 1.5, 3.0]),
+        || VectorCfr::new_capped_multi(&f, &ranges, 3, vec![0.0, 0.75, 1.5, 3.0]),
         500,
     );
 }
