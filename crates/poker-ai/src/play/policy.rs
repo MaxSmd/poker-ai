@@ -11,6 +11,7 @@
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// A key's probabilities live at `offset = packed >> 4`, `len = packed & 0xF`.
 #[derive(Clone, Copy)]
@@ -19,10 +20,78 @@ struct Entry {
     packed: u64,
 }
 
+/// How [`CompactPolicy::probs_or_uniform`] resolved its lookups.
+///
+/// **Why this is instrumented at all.** `probs_or_uniform` falls back to a
+/// uniform distribution on a miss, silently — no error, no log line. A uniform
+/// fallback is a *reasonable* default and a *catastrophic* steady state: the
+/// bot plays every action equally often and, worse, the Bayes range tracker
+/// updates both players' ranges with those fake likelihoods, so every
+/// downstream re-solve starts from beliefs that were never informed by the
+/// blueprint. A bot in that state looks like it is working. It plays legal
+/// poker, logs no errors, and loses.
+///
+/// That failure has already happened once here — a `--cap` mismatch between the
+/// bot and the trained blueprint changed the abstract betting tree, so every
+/// info key missed. It cost roughly two thousand hands to notice. This counter
+/// makes it visible in ten.
+///
+/// Counts are `Relaxed` atomics: they are diagnostics, never control flow, and
+/// exact ordering between them is worth nothing next to keeping the lookup
+/// free of synchronization.
+#[derive(Default)]
+pub struct LookupStats {
+    hit: AtomicU64,
+    /// The blueprint has no entry for this info key at all.
+    miss: AtomicU64,
+    /// The key resolved, but to a different number of actions than the caller
+    /// offered — a key collision, or an abstraction that no longer matches the
+    /// one that was trained.
+    width_mismatch: AtomicU64,
+}
+
+/// A snapshot of [`LookupStats`], taken together so the ratios are consistent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LookupCounts {
+    pub hit: u64,
+    pub miss: u64,
+    pub width_mismatch: u64,
+}
+
+impl LookupCounts {
+    pub fn total(&self) -> u64 {
+        self.hit + self.miss + self.width_mismatch
+    }
+
+    /// Fraction of lookups the blueprint actually answered, `1.0` if none were
+    /// made (nothing has gone wrong yet).
+    pub fn hit_rate(&self) -> f64 {
+        match self.total() {
+            0 => 1.0,
+            n => self.hit as f64 / n as f64,
+        }
+    }
+}
+
+impl std::fmt::Display for LookupCounts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}/{} blueprint lookups hit ({:.1}%), {} missed, {} width-mismatched",
+            self.hit,
+            self.total(),
+            100.0 * self.hit_rate(),
+            self.miss,
+            self.width_mismatch
+        )
+    }
+}
+
 /// Sorted flat map from info key to an action distribution.
 pub struct CompactPolicy {
     entries: Vec<Entry>,
     probs: Vec<f32>,
+    stats: LookupStats,
 }
 
 impl CompactPolicy {
@@ -51,7 +120,7 @@ impl CompactPolicy {
             entries.push(Entry { key, packed: (offset << 4) | len as u64 });
         }
         entries.sort_unstable_by_key(|e| e.key);
-        Ok(Self { entries, probs })
+        Ok(Self { entries, probs, stats: LookupStats::default() })
     }
 
     /// Build from explicit entries (tests / small games).
@@ -64,7 +133,7 @@ impl CompactPolicy {
             entries.push(Entry { key, packed: ((probs.len() as u64) << 4) | p.len() as u64 });
             probs.extend_from_slice(&p);
         }
-        Self { entries, probs }
+        Self { entries, probs, stats: LookupStats::default() }
     }
 
     /// The stored distribution for `key`, if the blueprint visited it.
@@ -78,12 +147,37 @@ impl CompactPolicy {
 
     /// The distribution for `key` as `f64`, falling back to uniform over
     /// `num_actions` when the blueprint never visited the info set.
+    ///
+    /// Every call is counted — see [`LookupStats`] for why a silent uniform
+    /// fallback is the most dangerous failure this bot has.  Read the tally with
+    /// [`lookup_counts`](Self::lookup_counts).
     pub fn probs_or_uniform(&self, key: u64, num_actions: usize) -> Vec<f64> {
         match self.get(key) {
-            Some(p) if p.len() == num_actions => p.iter().map(|&x| x as f64).collect(),
+            Some(p) if p.len() == num_actions => {
+                self.stats.hit.fetch_add(1, Relaxed);
+                p.iter().map(|&x| x as f64).collect()
+            }
             // A stored width that disagrees with the queried menu means the key
-            // collided or the abstraction changed — treat as unknown.
-            _ => vec![1.0 / num_actions as f64; num_actions],
+            // collided or the abstraction changed — treat as unknown, but count
+            // it separately: a miss means "never trained here", a mismatch means
+            // "trained a different game", and they need different fixes.
+            Some(_) => {
+                self.stats.width_mismatch.fetch_add(1, Relaxed);
+                vec![1.0 / num_actions as f64; num_actions]
+            }
+            None => {
+                self.stats.miss.fetch_add(1, Relaxed);
+                vec![1.0 / num_actions as f64; num_actions]
+            }
+        }
+    }
+
+    /// Snapshot of how the blueprint lookups have resolved so far.
+    pub fn lookup_counts(&self) -> LookupCounts {
+        LookupCounts {
+            hit: self.stats.hit.load(Relaxed),
+            miss: self.stats.miss.load(Relaxed),
+            width_mismatch: self.stats.width_mismatch.load(Relaxed),
         }
     }
 
@@ -235,6 +329,44 @@ mod tests {
         let err = write_policy(&path, vec![(1u64, vec![0.0625f32; 16])]).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(!path.exists(), "a rejected export must not replace the artifact");
+    }
+
+    /// The counter has to separate the two failure modes, because they have
+    /// different fixes: a **miss** means the blueprint never trained that info
+    /// set (undertrained tail, or the wrong artifact), a **width mismatch**
+    /// means the key resolved into a differently-shaped game (a `--cap` or
+    /// `--stack-bb` that disagrees with training). Lumping them together would
+    /// have made the `--cap` incident look like sparse coverage.
+    #[test]
+    fn lookup_counts_separate_hits_misses_and_width_mismatches() {
+        let p = CompactPolicy::from_entries(vec![(5, vec![0.9, 0.1]), (9, vec![0.3, 0.3, 0.4])]);
+        assert_eq!(p.lookup_counts().total(), 0, "nothing counted before any lookup");
+        assert_eq!(p.lookup_counts().hit_rate(), 1.0, "no lookups is not a failure");
+
+        p.probs_or_uniform(5, 2); // hit
+        p.probs_or_uniform(9, 3); // hit
+        p.probs_or_uniform(6, 2); // miss: no such key
+        p.probs_or_uniform(5, 3); // width mismatch: key exists, wrong menu
+
+        let c = p.lookup_counts();
+        assert_eq!(c, LookupCounts { hit: 2, miss: 1, width_mismatch: 1 });
+        assert_eq!(c.total(), 4);
+        assert!((c.hit_rate() - 0.5).abs() < 1e-12);
+    }
+
+    /// The whole point is catching a totally-missing blueprint, so pin the
+    /// degenerate case: an empty policy answers nothing and must report a 0%
+    /// hit rate rather than the "no lookups yet" 1.0.
+    #[test]
+    fn an_empty_policy_reports_a_zero_hit_rate_once_queried() {
+        let p = CompactPolicy::from_entries(vec![]);
+        for k in 0..10u64 {
+            p.probs_or_uniform(k, 3);
+        }
+        let c = p.lookup_counts();
+        assert_eq!(c.hit, 0);
+        assert_eq!(c.miss, 10);
+        assert_eq!(c.hit_rate(), 0.0);
     }
 
     #[test]

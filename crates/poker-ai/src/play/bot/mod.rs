@@ -203,6 +203,17 @@ impl Bot {
         Self { game, policy, cfg, rng }
     }
 
+    /// How the blueprint lookups behind this bot's decisions have resolved.
+    ///
+    /// The number to watch during a match: a low hit rate means the bot is
+    /// playing uniform-random in the abstract game *and* feeding those fake
+    /// action likelihoods to the range tracker, so every re-solve below it
+    /// starts from beliefs the blueprint never informed.  See
+    /// [`crate::play::policy::LookupStats`].
+    pub fn lookup_counts(&self) -> crate::play::policy::LookupCounts {
+        self.policy.lookup_counts()
+    }
+
     /// xorshift64* uniform in `[0, 1)`.
     fn unit(&mut self) -> f64 {
         self.rng ^= self.rng >> 12;

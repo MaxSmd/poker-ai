@@ -570,10 +570,17 @@ fn run_slumbot(args: &[String]) {
                         mean * 100.0,
                         adj_mean * 100.0
                     );
+                    // Blueprint hit rate on every progress line: the uniform
+                    // fallback is silent, and a bot running on uniform
+                    // fallbacks plays legal poker, logs no errors, and loses.
+                    // Worth seeing at hand 100, not hand 2000.
+                    let lookups = bot.lookup_counts();
+                    println!("         {lookups}");
                     println!(
-                        "@wandb {{\"hand\":{played},\"net_bb\":{net_bb:.2},\"bb100\":{:.2},\"bb100_ci\":{ci:.2},\"adj_bb100\":{:.2},\"adj_bb100_ci\":{adj_ci:.2}}}",
+                        "@wandb {{\"hand\":{played},\"net_bb\":{net_bb:.2},\"bb100\":{:.2},\"bb100_ci\":{ci:.2},\"adj_bb100\":{:.2},\"adj_bb100_ci\":{adj_ci:.2},\"bp_hit_rate\":{:.4}}}",
                         mean * 100.0,
-                        adj_mean * 100.0
+                        adj_mean * 100.0,
+                        lookups.hit_rate()
                     );
                 }
             }
@@ -604,6 +611,20 @@ fn run_slumbot(args: &[String]) {
         mean * 100.0,
         adj_mean * 100.0
     );
+    let lookups = bot.lookup_counts();
+    println!("Blueprint lookups: {lookups}");
+    // A low hit rate invalidates the match rather than reporting it: the bot was
+    // playing uniform-random in the abstract game and feeding the range tracker
+    // likelihoods the blueprint never produced.  Loud, because the failure mode
+    // is that everything else looks normal.
+    if lookups.hit_rate() < 0.9 && lookups.total() > 0 {
+        eprintln!(
+            "WARNING: only {:.1}% of blueprint lookups hit. This match does not measure the \
+             blueprint — check that --cap and --stack-bb match the training run, and that \
+             --policy points at the artifact those settings produced.",
+            100.0 * lookups.hit_rate()
+        );
+    }
     println!("Per-hand log: {}", csv_path.display());
 }
 
