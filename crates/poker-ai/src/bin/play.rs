@@ -1,8 +1,14 @@
 //! Play the trained bot against **Slumbot** (slumbot.com, heads-up NLHE,
-//! 200 bb, blinds 50/100).
+//! 200 bb, blinds 50/100), or measure it locally.
+//!
+//! Subcommands: `slumbot` (play a match), `chart` (print a strategy chart),
+//! `expl` (abstract-game exploitability of the **blueprint**), `lbr`
+//! (exploitability lower bound of the **live agent** by local best response —
+//! the only measurement here that exercises re-solving).
 //!
 //! ```text
 //! play slumbot [hands] [flags]
+//! play lbr     [hands] [--lbr-seed=S] [bot flags]
 //!
 //!   hands              number of hands to play (default 1000)
 //!   --data=DIR         artifact directory (default `data`): needs
@@ -91,9 +97,10 @@ fn main() {
         Some("slumbot") => run_slumbot(&args),
         Some("chart") => run_chart(&args),
         Some("expl") => run_expl(&args),
+        Some("lbr") => run_lbr(&args),
         _ => {
             eprintln!(
-                "usage: play slumbot [hands] [flags]  |  play chart [flags]  |  play expl [flags]\n\
+                "usage: play slumbot [hands] | chart | expl | lbr [hands]  [flags]\n\
                  see the header of src/bin/play.rs"
             );
             std::process::exit(2);
@@ -422,36 +429,16 @@ fn load_game(dir: &Path, stack_bb: u32, cap: u32) -> BlueprintHoldem {
     game
 }
 
-fn run_slumbot(args: &[String]) {
-    validate(
-        args,
-        &[
-            "data", "policy", "stack-bb", "cap", "no-resolve", "no-resolve-turn",
-            "no-resolve-flop", "turn-full-river", "runout-sample", "no-continual", "iters",
-            "turn-iters", "river-cap", "continuations", "purify", "seed", "log-hands", "token",
-            "username", "password",
-        ],
-        1,
-    );
-    let hands: u64 = args
-        .get(2)
-        .filter(|a| !a.starts_with("--"))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1000);
-    let dir = PathBuf::from(flag::<String>(args, "data").unwrap_or_else(|| "data".into()));
+/// Build the playing agent from the shared flags — the setup `slumbot` and
+/// `lbr` both need, kept in one place so the two commands cannot drift into
+/// configuring different bots and producing incomparable numbers.
+fn build_bot(args: &[String], dir: &Path) -> Bot {
     let stack_bb: u32 = flag(args, "stack-bb").unwrap_or(200);
     let cap: u32 = flag(args, "cap").unwrap_or(3);
-    // Turn/flop continuation scales: comma-separated, first should
-    // be 0.0.  A single value (e.g. `--continuations=0.0`) is a plain check-down.
     let continuations: Vec<f64> = flag::<String>(args, "continuations")
         .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect::<Vec<f64>>())
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| vec![0.0, 0.75, 1.5, 3.0]);
-    // Turn and flop re-solving are ON by default: runout sampling brought them
-    // inside a live clock, and re-solving every postflop street is the point of
-    // the resolver.  `--no-resolve-turn` / `--no-resolve-flop` fall back street
-    // by street; `--no-resolve` is the blueprint-only arm and must switch off
-    // *all three*, or "no resolve" would still re-solve two streets.
     let no_resolve = args.iter().any(|a| a == "--no-resolve");
     let cfg = BotConfig {
         resolve_river: !no_resolve,
@@ -461,23 +448,16 @@ fn run_slumbot(args: &[String]) {
         turn_iters: flag(args, "turn-iters").unwrap_or(500),
         river_cap: flag(args, "river-cap").unwrap_or(3),
         continuations,
-        // Turn resolves cut at the river reveal with the K-continuation leaf.
-        // `--turn-full-river` solves the real river betting instead: exact, and
-        // measured at 798 s/decision, so it is an offline reference only.
         turn_full_river: args.iter().any(|a| a == "--turn-full-river"),
-        // 0 = exact runout sweep.  The default samples, which is what makes
-        // turn/flop resolving affordable at all.
         runout_sample: flag(args, "runout-sample").unwrap_or(64),
-        // Continual re-solving (CFV-gadget carry) on by default; --no-continual
-        // gives independent per-decision resolves for A/Bs.
         continual: !args.iter().any(|a| a == "--no-continual"),
         purify: flag(args, "purify").unwrap_or(0.1),
         seed: flag(args, "seed").unwrap_or(1),
     };
 
     println!("Loading abstraction from {} ({stack_bb}bb, cap-{cap})", dir.display());
-    let game = load_game(&dir, stack_bb, cap);
-    let policy_path = policy_path(args, &dir);
+    let game = load_game(dir, stack_bb, cap);
+    let policy_path = policy_path(args, dir);
     println!("Loading blueprint strategy {} ...", policy_path.display());
     let policy = CompactPolicy::load(&policy_path).unwrap_or_else(|e| {
         eprintln!("cannot load {}: {e}", policy_path.display());
@@ -500,7 +480,86 @@ fn run_slumbot(args: &[String]) {
     if cfg.resolve_turn || cfg.resolve_flop {
         println!("  continuations (K={}): {:?}", cfg.continuations.len(), cfg.continuations);
     }
-    let mut bot = Bot::new(game, policy, cfg);
+    Bot::new(game, policy, cfg)
+}
+
+/// Exploitability lower bound of the **live agent** by local best response
+/// (`evaluation::lbr`).  Unlike `expl`, this exercises the whole playing stack —
+/// blueprint lookups, range tracking, purification and per-decision re-solving —
+/// because LBR plays real hands against it rather than best-responding to a
+/// strategy file.
+///
+/// ```text
+/// play lbr [hands] [--lbr-seed=S] [bot flags]
+/// ```
+fn run_lbr(args: &[String]) {
+    validate(
+        args,
+        &[
+            "data", "policy", "stack-bb", "cap", "no-resolve", "no-resolve-turn",
+            "no-resolve-flop", "turn-full-river", "runout-sample", "no-continual", "iters",
+            "turn-iters", "river-cap", "continuations", "purify", "seed", "lbr-seed",
+        ],
+        1,
+    );
+    let hands: u64 = args
+        .get(2)
+        .filter(|a| !a.starts_with("--"))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1000);
+    let dir = PathBuf::from(flag::<String>(args, "data").unwrap_or_else(|| "data".into()));
+    let mut bot = build_bot(args, &dir);
+    let lbr_seed: u64 = flag(args, "lbr-seed").unwrap_or(1);
+
+    println!("\nLocal best response: {hands} hands, seats alternating, seed {lbr_seed}");
+    println!("LBR's win rate is a LOWER BOUND on the agent's exploitability.\n");
+    let t0 = std::time::Instant::now();
+    let out = poker_ai::evaluation::lbr::run_lbr(&mut bot, hands, lbr_seed, |o| {
+        println!(
+            "  {:>6} hands   LBR {:>8.1} ± {:.1} bb/100   ({:.0} mbb/hand)",
+            o.hands,
+            o.bb100(),
+            o.ci95(),
+            o.mbb_per_hand()
+        );
+        println!(
+            "@wandb {{\"lbr_hand\":{},\"lbr_bb100\":{:.2},\"lbr_bb100_ci\":{:.2},\"lbr_mbb\":{:.1}}}",
+            o.hands,
+            o.bb100(),
+            o.ci95(),
+            o.mbb_per_hand()
+        );
+    });
+    println!(
+        "\nLBR exploitability lower bound: {:.1} mbb/hand  ({:+.1} ± {:.1} bb/100 over {} hands, {} errors, {:.0}s)",
+        out.mbb_per_hand(),
+        out.bb100(),
+        out.ci95(),
+        out.hands,
+        out.errors,
+        t0.elapsed().as_secs_f64()
+    );
+    println!("Blueprint lookups: {}", bot.lookup_counts());
+}
+
+fn run_slumbot(args: &[String]) {
+    validate(
+        args,
+        &[
+            "data", "policy", "stack-bb", "cap", "no-resolve", "no-resolve-turn",
+            "no-resolve-flop", "turn-full-river", "runout-sample", "no-continual", "iters",
+            "turn-iters", "river-cap", "continuations", "purify", "seed", "log-hands", "token",
+            "username", "password",
+        ],
+        1,
+    );
+    let hands: u64 = args
+        .get(2)
+        .filter(|a| !a.starts_with("--"))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1000);
+    let dir = PathBuf::from(flag::<String>(args, "data").unwrap_or_else(|| "data".into()));
+    let mut bot = build_bot(args, &dir);
 
     // Session token: flag > persisted file > fresh (server mints one).
     let token_path = dir.join("slumbot_token.txt");

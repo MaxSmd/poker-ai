@@ -4,4 +4,5 @@
 //! [`crate::validation::evaluation`].
 
 pub mod exploitability;
+pub mod lbr;
 pub mod vector_br;
