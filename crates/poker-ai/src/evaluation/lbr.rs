@@ -211,8 +211,13 @@ fn lbr_action(gs: &GameState, hole: [u8; 2], opp: &BeliefState, rng: &mut u64) -
 ///
 /// `lbr_seat` is the engine seat LBR occupies (0 = SB/button, 1 = BB); the
 /// caller alternates it so neither side keeps the positional edge.
-fn play_hand(bot: &mut Bot, lbr_seat: usize, rng: &mut u64) -> Result<f64, String> {
-    let (holes_two, board) = deal(rng);
+fn play_hand(
+    bot: &mut Bot,
+    lbr_seat: usize,
+    deal_rng: &mut u64,
+    play_rng: &mut u64,
+) -> Result<f64, String> {
+    let (holes_two, board) = deal(deal_rng);
     let bot_seat = 1 - lbr_seat;
     let mut holes = [[NO_CARD; 2]; MAX_PLAYERS];
     holes[lbr_seat] = holes_two[0];
@@ -239,7 +244,7 @@ fn play_hand(bot: &mut Bot, lbr_seat: usize, rng: &mut u64) -> Result<f64, Strin
             // see the module header.
             let mut opp = BeliefState::uniform();
             opp.remove_board(&board_now);
-            let act = lbr_action(&gs, holes[lbr_seat], &opp, rng);
+            let act = lbr_action(&gs, holes[lbr_seat], &opp, play_rng);
             wire.push_str(&token(&gs, act));
             act
         };
@@ -259,10 +264,18 @@ fn play_hand(bot: &mut Bot, lbr_seat: usize, rng: &mut u64) -> Result<f64, Strin
 /// Seats alternate every hand, so position cancels rather than being averaged
 /// over an unbalanced sample.
 pub fn run_lbr(bot: &mut Bot, hands: u64, seed: u64, progress: impl Fn(&LbrOutcome)) -> LbrOutcome {
-    let mut rng = seed | 1;
+    // TWO streams, deliberately.  Dealing and LBR's equity rollouts must not
+    // share one, or the deal sequence depends on how many equity calls LBR
+    // happened to make — which depends on how the *agent* played.  Two
+    // configurations of the agent would then see different cards, and an
+    // ablation between them would be comparing different games.  Split, every
+    // arm run at the same `seed` sees the identical deals, and the comparison
+    // is paired.
+    let mut deal_rng = seed | 1;
+    let mut play_rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
     let mut out = LbrOutcome::default();
     for h in 0..hands {
-        match play_hand(bot, (h % 2) as usize, &mut rng) {
+        match play_hand(bot, (h % 2) as usize, &mut deal_rng, &mut play_rng) {
             Ok(bb) => out.record(bb),
             Err(e) => {
                 out.errors += 1;
