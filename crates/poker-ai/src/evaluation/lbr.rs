@@ -96,9 +96,21 @@ impl LbrOutcome {
         1.96 * (var / n).sqrt() * 100.0
     }
 
-    /// The same figure the literature quotes: milli-big-blinds per hand.
+    /// LBR's win rate in milli-big-blinds per hand — the figure the literature
+    /// quotes.  **Negative means the bound is vacuous**, not that the agent is
+    /// unexploitable: exploitability is never below zero (a Nash opponent scores
+    /// 0), so a losing LBR has only shown itself to be a weak responder.  Use
+    /// [`bound_mbb`](Self::bound_mbb) for the quantity that is safe to publish
+    /// and read this one as a head-to-head win rate.
     pub fn mbb_per_hand(&self) -> f64 {
         self.bb100() * 10.0
+    }
+
+    /// The publishable exploitability lower bound: `max(0, ·)`.  A responder
+    /// that loses proves nothing about the agent, so the bound it certifies is
+    /// zero.
+    pub fn bound_mbb(&self) -> f64 {
+        self.mbb_per_hand().max(0.0)
     }
 
     fn record(&mut self, bb: f64) {

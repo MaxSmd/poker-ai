@@ -530,9 +530,24 @@ fn run_lbr(args: &[String]) {
             o.mbb_per_hand()
         );
     });
+    if out.mbb_per_hand() <= 0.0 {
+        println!(
+            "\nLBR LOST: {:+.1} ± {:.1} bb/100 over {} hands ({} errors, {:.0}s).",
+            out.bb100(),
+            out.ci95(),
+            out.hands,
+            out.errors,
+            t0.elapsed().as_secs_f64()
+        );
+        println!(
+            "  Exploitability lower bound certified: 0.0 mbb/hand — a responder that loses \n               proves nothing about the agent.  The win rate above is still a valid head-to-head \n               against a fixed benchmark opponent, which is what makes the ablation arms comparable."
+        );
+        println!("Blueprint lookups: {}", bot.lookup_counts());
+        return;
+    }
     println!(
         "\nLBR exploitability lower bound: {:.1} mbb/hand  ({:+.1} ± {:.1} bb/100 over {} hands, {} errors, {:.0}s)",
-        out.mbb_per_hand(),
+        out.bound_mbb(),
         out.bb100(),
         out.ci95(),
         out.hands,
