@@ -543,6 +543,7 @@ fn run_lbr(args: &[String]) {
             "  Exploitability lower bound certified: 0.0 mbb/hand — a responder that loses \n               proves nothing about the agent.  The win rate above is still a valid head-to-head \n               against a fixed benchmark opponent, which is what makes the ablation arms comparable."
         );
         println!("Blueprint lookups: {}", bot.lookup_counts());
+    println!("Abstraction tracking: {}", bot.tracking_counts());
         return;
     }
     println!(
@@ -555,6 +556,7 @@ fn run_lbr(args: &[String]) {
         t0.elapsed().as_secs_f64()
     );
     println!("Blueprint lookups: {}", bot.lookup_counts());
+    println!("Abstraction tracking: {}", bot.tracking_counts());
 }
 
 fn run_slumbot(args: &[String]) {

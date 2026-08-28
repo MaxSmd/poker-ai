@@ -26,6 +26,11 @@ impl Bot {
     pub(super) fn decide_blueprint(&mut self, hs: &mut HandState, parsed: &Parsed, board: &[u8]) -> RealMove {
         let facing = parsed.last_bet_size > 0;
         if !hs.hand.expects(&self.game, hs.my_seat, parsed.street) {
+            // No abstract node for this spot: the opponent raised past the
+            // blueprint's cap.  Counted, because a high rate here means the
+            // agent is off its tree rather than playing its strategy badly —
+            // a different diagnosis with a different fix.
+            self.tracking.desynced_decisions += 1;
             hs.pending_self = Some(None);
             return self.decide_desynced(hs, parsed, board);
         }

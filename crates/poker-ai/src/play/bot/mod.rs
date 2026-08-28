@@ -195,12 +195,71 @@ pub struct Bot {
     policy: CompactPolicy,
     cfg: BotConfig,
     rng: u64,
+    tracking: TrackingCounts,
+}
+
+/// How often the agent's abstract mirror of the real hand broke down.
+///
+/// The blueprint's betting abstraction is capped, so an opponent who raises
+/// past the cap produces a real event with **no abstract node**.  Two things
+/// then happen, and neither announces itself:
+///
+/// * the event is skipped, so the opponent's range stops being updated — every
+///   later belief in the hand is conditioned on a strictly incomplete history;
+/// * our own decisions fall through to [`Bot::decide_desynced`], which knows
+///   only pot odds against a frozen range and never raises.
+///
+/// Both degrade play in ways that look exactly like "re-solving is bad", so the
+/// rate has to be measured before any conclusion is drawn about the resolver.
+/// Against a near-equilibrium opponent this should be rare; against one that
+/// raises constantly it need not be.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TrackingCounts {
+    /// Opponent (or our own echoed) events the abstraction could not map.
+    pub unmapped_events: u64,
+    /// Total events fed through the mirror.
+    pub events: u64,
+    /// Our decisions taken on the desynced fallback path.
+    pub desynced_decisions: u64,
+    /// Total decisions we were asked for.
+    pub decisions: u64,
+}
+
+impl TrackingCounts {
+    pub fn desync_rate(&self) -> f64 {
+        match self.decisions {
+            0 => 0.0,
+            n => self.desynced_decisions as f64 / n as f64,
+        }
+    }
+
+    pub fn unmapped_rate(&self) -> f64 {
+        match self.events {
+            0 => 0.0,
+            n => self.unmapped_events as f64 / n as f64,
+        }
+    }
+}
+
+impl std::fmt::Display for TrackingCounts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}/{} decisions desynced ({:.2}%), {}/{} events unmappable ({:.2}%)",
+            self.desynced_decisions,
+            self.decisions,
+            100.0 * self.desync_rate(),
+            self.unmapped_events,
+            self.events,
+            100.0 * self.unmapped_rate()
+        )
+    }
 }
 
 impl Bot {
     pub fn new(game: BlueprintHoldem, policy: CompactPolicy, cfg: BotConfig) -> Self {
         let rng = cfg.seed | 1;
-        Self { game, policy, cfg, rng }
+        Self { game, policy, cfg, rng, tracking: TrackingCounts::default() }
     }
 
     /// How the blueprint lookups behind this bot's decisions have resolved.
@@ -212,6 +271,11 @@ impl Bot {
     /// [`crate::play::policy::LookupStats`].
     pub fn lookup_counts(&self) -> crate::play::policy::LookupCounts {
         self.policy.lookup_counts()
+    }
+
+    /// How often the abstract mirror broke down — see [`TrackingCounts`].
+    pub fn tracking_counts(&self) -> TrackingCounts {
+        self.tracking
     }
 
     /// xorshift64* uniform in `[0, 1)`.
@@ -262,6 +326,10 @@ impl Bot {
             ));
         }
 
+        // Counted here rather than in the decision functions: `decide_resolve`
+        // can fall through to `decide_blueprint`, and this is the one entry
+        // point every decision passes through exactly once.
+        self.tracking.decisions += 1;
         let mv = if self.should_resolve(parsed.street, board) {
             self.decide_resolve(hs, &parsed, board)
         } else {
@@ -338,9 +406,16 @@ impl Bot {
         );
         self.rng = rng;
 
+        self.tracking.events += 1;
         if let MapOutcome::Index(idx) = mapped {
             self.update_range(hs, seat, idx);
             hs.hand.apply(&self.game, idx);
+        } else {
+            // Post-cap aggression: no abstract node, so the range update for
+            // this event never happens.  Counted, because a high rate here
+            // means the beliefs every resolve starts from are conditioned on a
+            // truncated history.
+            self.tracking.unmapped_events += 1;
         }
     }
 
