@@ -689,6 +689,7 @@ fn run_slumbot(args: &[String]) {
     );
     let lookups = bot.lookup_counts();
     println!("Blueprint lookups: {lookups}");
+    println!("Abstraction tracking: {}", bot.tracking_counts());
     // A low hit rate invalidates the match rather than reporting it: the bot was
     // playing uniform-random in the abstract game and feeding the range tracker
     // likelihoods the blueprint never produced.  Loud, because the failure mode
