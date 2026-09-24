@@ -24,13 +24,23 @@
 # RNG stream, so every arm sees the IDENTICAL 3000 deals regardless of how the
 # agent played.  The ablations are therefore paired comparisons, which is worth
 # far more than extra hands.
+#
+# ## Selecting arms
+#
+#   ARMS="lbr_river_only lbr_no_continual" OUT=data/evals_20260822_0030 \
+#       scripts/overnight_evals.sh
+#
+# ARMS limits the run to the named arms (default: all).  Pointing OUT at an
+# earlier sweep adds the new arms beside it, which keeps them paired with the
+# old ones as long as HANDS and SEED match.
 set -u
 
 cd "$(dirname "$0")/.." || exit 1
 BIN=./target/release/play
 HANDS=${HANDS:-3000}
 SEED=${SEED:-1}
-OUT="data/evals_$(date +%Y%m%d_%H%M)"
+OUT=${OUT:-"data/evals_$(date +%Y%m%d_%H%M)"}
+ARMS=${ARMS:-}
 
 [ -x "$BIN" ] || { echo "missing $BIN — run: cargo build --release"; exit 1; }
 mkdir -p "$OUT" || exit 1
@@ -40,11 +50,14 @@ echo
 run() {
     name=$1
     shift
+    if [ -n "$ARMS" ] && [[ " $ARMS " != *" $name "* ]]; then
+        return
+    fi
     printf '=== %s  START  %-22s  %s\n' "$(date +%H:%M:%S)" "$name" "$*"
     nice -n 19 "$BIN" "$@" > "$OUT/$name.log" 2>&1
     rc=$?
     printf '=== %s  DONE   %-22s  exit %d\n' "$(date +%H:%M:%S)" "$name" "$rc"
-    grep -E "lower bound|Abstract-game exploitability|Blueprint lookups" "$OUT/$name.log" \
+    grep -E "lower bound|LBR LOST|luck-adjusted|Abstract-game exploitability|Blueprint lookups|Abstraction tracking" "$OUT/$name.log" \
         | sed 's/^/      /'
     echo
 }
@@ -71,10 +84,24 @@ run lbr_purify0       lbr "$HANDS" --cap=2 --purify=0.0 --lbr-seed="$SEED"
 #    resolve specifically — the most expensive one at 2.1 s/decision.
 run lbr_no_flop       lbr "$HANDS" --cap=2 --no-resolve-flop --lbr-seed="$SEED"
 
+# 6-8. Why does re-solving lose ground to LBR?  Each of (1)->(5) re-solved
+#    another street and the agent won less; these isolate the suspects.
+#    River only: between (1) and (5), so it prices the river resolve alone.
+run lbr_river_only    lbr "$HANDS" --cap=2 --no-resolve-turn --no-resolve-flop --lbr-seed="$SEED"
+
+#    Continual off: every resolve starts unconstrained.  If the gadget or the
+#    values it carries are at fault, this closes the gap to (1).
+run lbr_no_continual  lbr "$HANDS" --cap=2 --no-continual --lbr-seed="$SEED"
+
+#    Resolve cap 2: the resolves default to 3 raises a street against a cap-2
+#    blueprint, so they solve a different betting game than the one the
+#    ranges entering them came from.
+run lbr_river_cap2    lbr "$HANDS" --cap=2 --river-cap=2 --lbr-seed="$SEED"
+
 echo "================================ SUMMARY ================================"
 for f in "$OUT"/*.log; do
     printf '%-24s ' "$(basename "$f" .log)"
-    grep -hE "lower bound|Abstract-game exploitability" "$f" | tail -1 \
+    grep -hE "LBR luck-adjusted|lower bound|Abstract-game exploitability" "$f" | tail -1 \
         || echo "(no result — check the log)"
 done
 echo "========================================================================="
