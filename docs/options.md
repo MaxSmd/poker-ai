@@ -149,7 +149,7 @@ resets the magnitude.
 | `evaluation::exploitability::push_fold_exploitability` | Push/fold benchmarks | Decoupled estimator (removes max-over-noise bias); reads slightly negative within noise near Nash |
 | `validation::evaluation::local_br` (sampled BR) | Non-enumerable games `vector_br` can't drive (it is `BlueprintHoldem`-specific) — e.g. future multiway | Lower bound; needs large sample counts to be meaningful (its in-loop `--expl` trainer flag was removed for exactly that reason); commit argmax per *info set*, never per node (clairvoyance trap) |
 | `evaluation::vector_br` (`play expl`) | **The blueprint quality metric**: abstract-game BR — betting/ranges exact, flops + turn/river Monte-Carlo (`--board-samples`, default 2). Exact turn/river enumeration (`--board-samples=0`) is refused above 6 bb: the deep tree × 48 × 44 runouts does not finish | Sampling makes the BR-max mildly upward-biased; use a fixed seed so old-vs-new A/Bs share the bias. Abstract-game number, not full-NLHE exploitability |
-| `play::luck` (luck-adjusted scoring, always on in `play slumbot`) | Match A/Bs | Unbiased AIVAT-style chance correction; adjusted bb/100 CIs shrink with pot-swing luck removed |
+| `play::luck` + action luck (luck-adjusted scoring, always on in `play slumbot` and `play lbr`) | Match A/Bs | Unbiased AIVAT-style corrections: card luck at each reveal, plus `v(chosen) − Σπ·v` at each of our re-solved decisions (values from the resolve); adjusted bb/100 CIs shrink with both removed |
 | `validation::evaluation::aivat` | Conceptual oracle for `play::luck` (validated on enumerable games) | ~3× tighter stderr **[measured on Leduc: 0.0080 vs 0.0247]**, unbiased |
 
 ## 11. CLI & environment quick reference

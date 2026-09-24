@@ -226,6 +226,44 @@ impl VectorCfr {
         Some(self.opponent_cfvs_at(child, &reach_me))
     }
 
+    /// Our hand `hand`'s value (bb) after each root action, under the emitted
+    /// average profile against the opponent's prior range — the value function
+    /// for the AIVAT action-luck term.  Indexed like the root's actions.
+    ///
+    /// Only differences between entries are used downstream, so the common
+    /// reference point of the terminal payoffs cancels.  `None` if `hand`
+    /// shares a card with the board or with every opponent hand in range.
+    pub fn root_action_values(&mut self, hand: usize) -> Option<Vec<f64>> {
+        let NodeKind::Decision { player, children, .. } = &self.kinds[self.inner_root] else {
+            panic!("resolve root is not a decision node");
+        };
+        let me = *player;
+        let children = children.clone();
+        let reach_opp = if me == 0 { self.reach1 } else { self.reach0 };
+        let mut mass = [0.0; NUM_COMBOS];
+        valid_reach_into(&self.board, &reach_opp, &mut mass);
+        if mass[hand] <= 0.0 {
+            return None;
+        }
+        let env = Env {
+            kinds: &self.kinds,
+            board: &self.board,
+            runout: self.runout.as_ref(),
+            runout_sample: self.runout_sample,
+            prepared: &self.prepared,
+            cards: &self.cards,
+            carried: self.carried.as_deref(),
+            chooser: self.chooser,
+        };
+        let mut raw = vec![0.0; NUM_COMBOS];
+        let mut out = Vec::with_capacity(children.len());
+        for child in children {
+            Self::eval_average(&env, &self.stores, &mut self.scratch, child, &reach_opp, me, &mut raw);
+            out.push(raw[hand] / mass[hand]);
+        }
+        Some(out)
+    }
+
     /// Opponent CFVs at `node` with our reach `reach_me`, normalized per
     /// opponent hand by our valid (card-compatible) reach mass.
     fn opponent_cfvs_at(&mut self, node: usize, reach_me: &[f64; NUM_COMBOS]) -> [f64; NUM_COMBOS] {

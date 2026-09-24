@@ -26,15 +26,22 @@ BIG_BLIND = 100
 
 # When the log carries per-hand "luck" (the AIVAT-style chance correction from
 # `play::luck`, in chips), every breakdown uses luck-ADJUSTED winnings
-# (winnings - luck): same expectation, materially tighter CIs.  --raw disables.
+# (winnings - luck - action_luck): same expectation, materially tighter CIs.
+# "action_luck" is the AIVAT term for the bot's own re-solved decisions; logs
+# older than it simply lack the field and count it as 0.  --raw disables.
 ADJUSTED = True
+
+
+def total_luck(r):
+    """Card luck plus our action luck for one hand, in chips."""
+    return (r.get("luck") or 0.0) + (r.get("action_luck") or 0.0)
 
 
 def val(r):
     """Per-hand result in bb - luck-adjusted when enabled and available."""
     w = r["winnings"]
     if ADJUSTED:
-        w = w - (r.get("luck") or 0.0)
+        w = w - total_luck(r)
     return w / BIG_BLIND
 
 
@@ -144,7 +151,7 @@ def main():
         return
 
     TOTAL = len(rows)
-    have_luck = any(r.get("luck") for r in rows)
+    have_luck = any(r.get("luck") or r.get("action_luck") for r in rows)
     if ADJUSTED and not have_luck:
         ADJUSTED = False  # old log without luck data - fall back to raw
 
@@ -153,12 +160,14 @@ def main():
     print(f"\n=== {path}: {TOTAL} hands ===")
     print(f"Overall (raw):      {m_raw:.1f} ± {ci_raw:.1f} bb/100   net {sum(raw):.1f} bb")
     if have_luck:
-        adj = [(r["winnings"] - (r.get("luck") or 0.0)) / BIG_BLIND for r in rows]
+        adj = [(r["winnings"] - total_luck(r)) / BIG_BLIND for r in rows]
         m_adj, ci_adj = bb100(adj)
         shrink = ci_raw / ci_adj if ci_adj > 0 else float("inf")
-        total_luck = sum(r.get("luck") or 0.0 for r in rows) / BIG_BLIND
+        card_luck = sum(r.get("luck") or 0.0 for r in rows) / BIG_BLIND
+        action_luck = sum(r.get("action_luck") or 0.0 for r in rows) / BIG_BLIND
         print(f"Overall (luck-adj): {m_adj:.1f} ± {ci_adj:.1f} bb/100   "
-              f"(CI x{shrink:.2f} tighter; card luck {total_luck:+.1f} bb)")
+              f"(CI x{shrink:.2f} tighter; card luck {card_luck:+.1f} bb, "
+              f"action luck {action_luck:+.1f} bb)")
         which = "luck-ADJUSTED" if ADJUSTED else "RAW (--raw)"
         print(f"Breakdowns below use {which} values.")
     allv = [val(r) for r in rows]
@@ -212,7 +221,7 @@ def main():
     biggest = sorted(rows, key=val)[:5]
     print("\n5 biggest losses" + (" (luck-adjusted)" if ADJUSTED else "") + ":")
     for r in biggest:
-        luck_bb = (r.get("luck") or 0.0) / BIG_BLIND
+        luck_bb = total_luck(r) / BIG_BLIND
         print(f"  {val(r):>7.1f} bb (raw {r['winnings']/BIG_BLIND:>7.1f}, luck {luck_bb:>+6.1f})  "
               f"pos={r['pos']}  hole={r.get('hole')}  bot={r.get('bot_hole')}  "
               f"board={r.get('board')}  {r.get('action','')}")

@@ -193,6 +193,22 @@ pub struct HandState {
     /// decisions; refreshed after every resolve.  `None` until a street's
     /// first (bootstrap) resolve: it is dropped at every board reveal.
     carried_cfvs: Option<Box<[f64; NUM_COMBOS]>>,
+    /// AIVAT action-luck term for our own decisions this hand (bb): the sum
+    /// over re-solved decisions of `v(chosen) − Σ_a π(a)·v(a)`, with `π` the
+    /// distribution the action was drawn from and `v` the resolve's value of
+    /// each root action for our actual hand.  Zero-mean per decision given
+    /// everything before it, so subtracting it from winnings stays unbiased
+    /// while removing the variance of our own mixing.  Blueprint decisions
+    /// have no per-action values and contribute nothing (also unbiased).
+    action_luck_bb: f64,
+}
+
+impl HandState {
+    /// The AIVAT action-luck term for this hand in Slumbot chips (see
+    /// `action_luck_bb`).  Adjusted winnings = raw − card luck − this.
+    pub fn action_luck_chips(&self) -> f64 {
+        self.action_luck_bb * crate::play::protocol::BIG_BLIND as f64
+    }
 }
 
 /// The playing agent. One instance plays many hands (per-hand state lives in
@@ -321,6 +337,7 @@ impl Bot {
             board_seen: 0,
             pending_self: None,
             carried_cfvs: None,
+            action_luck_bb: 0.0,
         }
     }
 

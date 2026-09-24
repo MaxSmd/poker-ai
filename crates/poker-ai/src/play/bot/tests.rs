@@ -378,6 +378,7 @@ fn resolved_decision_updates_our_range_from_the_resolve() {
         .any(|(&p, &q)| (q / p - 1.0).abs() > 1e-3);
     assert!(reshaped, "the resolve's strategy must reshape our range");
     assert!(hs.carried_cfvs.is_some(), "a check or bet leaves a carry for the next resolve");
+    assert!(hs.action_luck_chips().is_finite(), "a resolved decision records an action-luck term");
 }
 
 /// A desynced postflop spot is re-solved even when that street's re-solving

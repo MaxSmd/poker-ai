@@ -964,3 +964,46 @@ fn child_carries_decompose_the_root_carry() {
     }
     assert!(any_differs, "child values should differ from the root's somewhere");
 }
+
+/// The AIVAT value function: our per-action values, weighted by the emitted
+/// strategy and by our range (times card-compatible opponent mass), must
+/// reproduce the explicit oracle's profile value for our seat.  Pins the
+/// action indexing and the bb units the action-luck term relies on.
+#[test]
+fn root_action_values_reproduce_the_oracle_profile_value() {
+    let beliefs = duel_ranges();
+    let root = public_root(river_board(), 20);
+    let me = root.current_player();
+    let opp = 1 - me;
+    let mut solver = VectorCfr::new(&root, &beliefs);
+    solver.run(1_000);
+    let resolved = solver.resolved();
+    let board = root.board;
+
+    let mut opp_prior = [0.0f64; NUM_COMBOS];
+    for (i, p) in opp_prior.iter_mut().enumerate() {
+        let [a, b] = combo_cards(i);
+        *p = beliefs[opp].prob(a, b);
+    }
+    let opp_mass = valid_reach(&board, &opp_prior);
+    let (mut num, mut den) = (0.0, 0.0);
+    for (h, &om) in opp_mass.iter().enumerate() {
+        let [a, b] = combo_cards(h);
+        let p = beliefs[me].prob(a, b);
+        if p <= 0.0 {
+            continue;
+        }
+        let values = solver.root_action_values(h).expect("in-range hand has values");
+        let sigma = resolved.strategy.get(&subgame_info_key(me, [a, b], &board, &[])).expect("emitted");
+        assert_eq!(values.len(), sigma.len(), "one value per root action");
+        let v: f64 = sigma.iter().zip(&values).map(|(s, x)| s * x).sum();
+        num += p * om * v;
+        den += p * om;
+    }
+    let mean = num / den;
+
+    let leaf = CheckdownLeafEval::new();
+    let oracle = Subgame::new(root.clone(), &beliefs, &leaf);
+    let pv = profile_value(&oracle, &resolved.strategy, me);
+    assert!((mean - pv).abs() < 0.02, "value-weighted mean {mean:.4} vs oracle profile value {pv:.4}");
+}

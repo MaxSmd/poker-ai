@@ -534,18 +534,22 @@ fn run_lbr(args: &[String]) {
     let t0 = std::time::Instant::now();
     let out = poker_ai::evaluation::lbr::run_lbr(&mut bot, hands, lbr_seed, |o| {
         println!(
-            "  {:>6} hands   LBR {:>8.1} ± {:.1} bb/100   ({:.0} mbb/hand)",
+            "  {:>6} hands   LBR {:>8.1} ± {:.1} bb/100   ({:.0} mbb/hand)   luck-adj {:>8.1} ± {:.1} bb/100",
             o.hands,
             o.bb100(),
             o.ci95(),
-            o.mbb_per_hand()
+            o.mbb_per_hand(),
+            o.adj_bb100(),
+            o.adj_ci95()
         );
         println!(
-            "@wandb {{\"lbr_hand\":{},\"lbr_bb100\":{:.2},\"lbr_bb100_ci\":{:.2},\"lbr_mbb\":{:.1}}}",
+            "@wandb {{\"lbr_hand\":{},\"lbr_bb100\":{:.2},\"lbr_bb100_ci\":{:.2},\"lbr_mbb\":{:.1},\"lbr_adj_bb100\":{:.2},\"lbr_adj_bb100_ci\":{:.2}}}",
             o.hands,
             o.bb100(),
             o.ci95(),
-            o.mbb_per_hand()
+            o.mbb_per_hand(),
+            o.adj_bb100(),
+            o.adj_ci95()
         );
     });
     if out.mbb_per_hand() <= 0.0 {
@@ -560,8 +564,9 @@ fn run_lbr(args: &[String]) {
         println!(
             "  Exploitability lower bound certified: 0.0 mbb/hand — a responder that loses \n               proves nothing about the agent.  The win rate above is still a valid head-to-head \n               against a fixed benchmark opponent, which is what makes the ablation arms comparable."
         );
+        println!("LBR luck-adjusted: {:+.1} ± {:.1} bb/100", out.adj_bb100(), out.adj_ci95());
         println!("Blueprint lookups: {}", bot.lookup_counts());
-    println!("Abstraction tracking: {}", bot.tracking_counts());
+        println!("Abstraction tracking: {}", bot.tracking_counts());
         return;
     }
     println!(
@@ -573,6 +578,7 @@ fn run_lbr(args: &[String]) {
         out.errors,
         t0.elapsed().as_secs_f64()
     );
+    println!("LBR luck-adjusted: {:+.1} ± {:.1} bb/100", out.adj_bb100(), out.adj_ci95());
     println!("Blueprint lookups: {}", bot.lookup_counts());
     println!("Abstraction tracking: {}", bot.tracking_counts());
 }
@@ -639,7 +645,7 @@ fn run_slumbot(args: &[String]) {
                 let bb = winnings as f64 / BIG_BLIND as f64;
                 net_bb += bb;
                 sumsq_bb += bb * bb;
-                let adj = (winnings as f64 - rec.luck) / BIG_BLIND as f64;
+                let adj = (winnings as f64 - rec.luck - rec.action_luck) / BIG_BLIND as f64;
                 adj_net_bb += adj;
                 adj_sumsq_bb += adj * adj;
                 if let Some(f) = csv.as_mut() {
@@ -751,8 +757,12 @@ struct HandRecord {
     board: Vec<String>,
     action: String,
     /// AIVAT-style chance correction in chips (`play::luck`); 0 when not
-    /// computable.  Adjusted winnings = `winnings - luck`.
+    /// computable.
     luck: f64,
+    /// AIVAT action-luck term for our own re-solved decisions, in chips
+    /// (`HandState::action_luck_chips`).  Adjusted winnings =
+    /// `winnings - luck - action_luck`.
+    action_luck: f64,
 }
 
 impl HandRecord {
@@ -768,6 +778,7 @@ impl HandRecord {
             "pos": self.client_pos,
             "winnings": self.winnings,
             "luck": self.luck,
+            "action_luck": self.action_luck,
             "reached_street": reached,
             "hole": self.hole_cards,
             "bot_hole": self.bot_hole_cards,
@@ -807,6 +818,7 @@ fn play_one_hand(
                 board: r.board.clone().unwrap_or_default(),
                 action: r.action.clone().unwrap_or_default(),
                 luck: 0.0,
+                action_luck: hs.action_luck_chips(),
             });
         }
         let action = r.action.clone().ok_or("response missing action")?;

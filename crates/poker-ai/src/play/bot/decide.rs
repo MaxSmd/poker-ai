@@ -178,8 +178,16 @@ impl Bot {
             return self.decide_blueprint(hs, parsed, board);
         };
 
-        let idx = self.draw(&self.play_distribution(&probs));
+        let played = self.play_distribution(&probs);
+        // AIVAT: value each root action for our hand BEFORE the draw, so the
+        // term below is a pure function of the pre-draw state and the draw.
+        let values = solver.root_action_values(me_idx);
+        let idx = self.draw(&played);
         let action = acts[idx];
+        if let Some(v) = values {
+            let expected: f64 = played.iter().zip(&v).map(|(p, x)| p * x).sum();
+            hs.action_luck_bb += v[idx] - expected;
+        }
 
         // Every later resolve this hand starts from our range, so it must be
         // conditioned on the strategy we actually played — this resolve's,
