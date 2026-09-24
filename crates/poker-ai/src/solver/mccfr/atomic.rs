@@ -33,7 +33,7 @@
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use super::parallel::splitmix;
+use crate::util::rng::splitmix_stream;
 use crate::games::{CursorGame, IndexedGame};
 use crate::solver::variant::Variant;
 use crate::solver::regret_table::{sr_add_with, RegretTable};
@@ -269,7 +269,7 @@ pub(super) struct AtomicRun {
 
 /// Run `run.iters` lock-free iterations over `run.threads` OS threads,
 /// mutating `table` in place.  Returns the total node visits.  Each
-/// iteration's RNG stream is `splitmix(seed, t)` — the same scheme as the
+/// iteration's RNG stream is `splitmix_stream(seed, t)` — the same scheme as the
 /// deterministic parallel path.
 pub(super) fn run_atomic<G: IndexedGame + Sync>(
     game: &G,
@@ -314,11 +314,11 @@ pub(super) fn run_atomic<G: IndexedGame + Sync>(
                         discount: matches!(variant, Variant::Dcfr(_)),
                         strategy_weight,
                     };
-                    let mut rng = splitmix(seed, t);
+                    let mut rng = splitmix_stream(seed, t);
                     // Rounding draws come from a stream of their own, so the
                     // trajectories a seed explores do not depend on how the
                     // strategy sum is stored.
-                    let mut sr = splitmix(seed ^ SR_STREAM, t);
+                    let mut sr = splitmix_stream(seed ^ SR_STREAM, t);
                     for traverser in 0..players {
                         traverse(&ctx, &mut cursor, traverser, &mut rng, &mut sr, &mut visited);
                     }

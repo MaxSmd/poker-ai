@@ -46,10 +46,9 @@ mod blueprint;
 mod harness;
 mod pushfold;
 
-use std::path::PathBuf;
-
 use poker_ai::solver::pruning::PruningConfig;
-use poker_ai::util::cli::validate_flags;
+pub use poker_ai::util::cli::data_dir;
+use poker_ai::util::cli::{flag, validate_flags};
 
 pub const BIG_BLIND: u32 = 2;
 pub const SMALL_BLIND: u32 = 1;
@@ -103,30 +102,9 @@ pub struct Cadence {
 /// Parse `--chunk=N` (iterations per progress line; default ~1% of `iters`) and
 /// `--expl-every=N` (run the exploitability eval every Nth chunk; default 10).
 pub fn parse_cadence(args: &[String], iters: u64) -> Cadence {
-    let chunk = args
-        .iter()
-        .find_map(|a| a.strip_prefix("--chunk="))
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or((iters / 100).max(1))
-        .max(1);
-    let expl_every = args
-        .iter()
-        .find_map(|a| a.strip_prefix("--expl-every="))
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(10)
-        .max(1);
+    let chunk = flag(args, "chunk").unwrap_or((iters / 100).max(1)).max(1);
+    let expl_every = flag(args, "expl-every").unwrap_or(10).max(1);
     Cadence { chunk, expl_every }
-}
-
-/// Artifact directory (`--data=DIR`, default `data/`): where bucket maps are
-/// loaded from and checkpoints/blueprints are written.  Overridable so a
-/// quota-limited box can point the bulk artifacts at scratch space without a
-/// symlink.
-pub fn data_dir(args: &[String]) -> PathBuf {
-    args.iter()
-        .find_map(|a| a.strip_prefix("--data="))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("data"))
 }
 
 /// Cadence/output flags every mode understands.

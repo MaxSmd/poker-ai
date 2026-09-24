@@ -602,11 +602,9 @@ mod runout_denominator_tests {
     /// on combos that use board cards (which the sums must exclude).
     fn lumpy_reach() -> [f64; 1326] {
         let mut reach = [0.0; 1326];
-        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut state = crate::util::rng::GOLDEN_GAMMA;
         for (i, r) in reach.iter_mut().enumerate() {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
+            let x = crate::util::rng::xorshift64_plain_next_u64(&mut state);
             *r = if i % 7 == 0 { 0.0 } else { (x >> 40) as f64 / 1024.0 };
         }
         reach

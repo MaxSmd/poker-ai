@@ -35,12 +35,7 @@ fn cards(list: &[&str]) -> Vec<u8> {
 fn emits_legal_increments_over_random_hands() {
     let mut b = bot(false);
     let mut rng = 0xBADC_0FFEu64;
-    let mut unit = move || {
-        rng ^= rng >> 12;
-        rng ^= rng << 25;
-        rng ^= rng >> 27;
-        (rng.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
-    };
+    let mut unit = move || crate::util::rng::xorshift_next_unit(&mut rng);
 
     let full_board = cards(&["Qs", "4s", "3h", "Th", "8c"]);
     for hand_no in 0..40u32 {

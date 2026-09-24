@@ -62,6 +62,69 @@ pub struct VectorResolved {
     pub public_nodes: usize,
 }
 
+/// How a vectorized resolve shapes its public tree and evaluates its leaves.
+///
+/// The [`Default`] is the unbounded, exact, single-continuation solve the
+/// oracle gates check against; play-time resolving sets a cap and, on the
+/// turn and flop, continuations and a runout sample.
+#[derive(Clone, Debug)]
+pub struct ResolveConfig {
+    /// Maximum raises in the subgame (`u32::MAX` = the engine's unbounded
+    /// re-raising).  Past the cap voluntary aggression (raise / voluntary
+    /// all-in) is pruned, exactly mirroring the blueprint's betting abstraction
+    /// (`BlueprintHoldem::capped_legal`) — a forced all-in call always stays.
+    /// Deep-stacked resolving needs a finite cap: the unbounded re-raise chain
+    /// makes the public tree explode.
+    pub raise_cap: u32,
+    /// Rest-of-hand pot scales for a **multi-valued depth-limit leaf** (finding
+    /// #1): at each turn/flop depth cut the opponent picks among these
+    /// continuations, so the resolve is robust to the opponent adapting past
+    /// the leaf rather than overfitting one check-down.  The first entry should
+    /// be `0.0` (the normal check-down); `[0.0]` alone builds no chooser nodes.
+    pub continuations: Vec<f64>,
+    /// **Full-river turn resolve** (turn roots only): a turn street close deals
+    /// the river as an explicit `NodeKind::Chance` and solves the real river
+    /// betting below it — exact to showdown, no leaf model on that boundary —
+    /// instead of cutting with a check-down / continuation leaf.  ~48× the tree
+    /// of a leaf-cut turn resolve; budget iterations accordingly.  All-in
+    /// run-outs stay exact check-downs, and a flop root still cuts at the turn
+    /// reveal with the `continuations` leaf.
+    pub full_river: bool,
+    /// Evaluate only this many of the depth-cut leaves' board completions per
+    /// training iteration, instead of all of them (`0` = exact, the default).
+    ///
+    /// This is the lever that makes turn and flop re-solving affordable live.
+    /// A flop leaf enumerates C(49,2)=1176 turn+river completions and a turn
+    /// leaf 48, against ONE for a river leaf — which is the entire reason a
+    /// flop resolve costs ~350× a river resolve per iteration despite building
+    /// an identically sized tree. Sampling cuts that factor directly.
+    ///
+    /// It costs accuracy per iteration and **not** accuracy in the emitted
+    /// strategy: total leaf work is `iters × sample`, so the averaged strategy
+    /// integrates over far more completions than exist, while each individual
+    /// iteration sees a noisier estimate. `PreparedRunout::evaluate_sampled`
+    /// carries the full argument, including why the schedule is systematic
+    /// rather than random (determinism, and even coverage).
+    ///
+    /// CFV extraction stays exact regardless — it runs once per resolve, where
+    /// the exact sweep is affordable, and its output is the safety guarantee
+    /// the next continual resolve is constrained by.
+    pub runout_sample: usize,
+}
+
+impl Default for ResolveConfig {
+    fn default() -> Self {
+        Self { raise_cap: u32::MAX, continuations: vec![0.0], full_river: false, runout_sample: 0 }
+    }
+}
+
+impl ResolveConfig {
+    /// The default with the subgame's aggression bounded at `raise_cap` raises.
+    pub fn capped(raise_cap: u32) -> Self {
+        Self { raise_cap, ..Self::default() }
+    }
+}
+
 
 /// The vectorized public-tree solver.
 pub struct VectorCfr {
@@ -81,7 +144,7 @@ pub struct VectorCfr {
     runout: Option<PreparedRunout>,
     /// Runout completions evaluated per training iteration at each depth-cut
     /// leaf, or `0` for the exact sweep (the default).  See
-    /// [`Self::with_runout_sample`].
+    /// [`ResolveConfig::runout_sample`].
     runout_sample: usize,
     /// Pre-sorted complete boards for `Showdown` leaves: one entry for a river
     /// resolve, one per live river card for a full-river turn resolve.  Built
@@ -123,50 +186,13 @@ pub struct VectorCfr {
 
 impl VectorCfr {
 
-    /// Build the public tree rooted at `root` (a river *or* turn public state)
-    /// over the two belief ranges.  Solved with CFR⁺ (RM⁺ + linear averaging).
-    pub fn new(root: &GameState, beliefs: &[BeliefState]) -> Self {
-        Self::new_capped(root, beliefs, u32::MAX)
-    }
-
-    /// [`new`](Self::new) with the subgame's aggression bounded at `raise_cap`
-    /// raises: past the cap voluntary aggression (raise / voluntary all-in) is
-    /// pruned, exactly mirroring the blueprint's betting abstraction
-    /// (`BlueprintHoldem::capped_legal`) — a forced all-in call always stays.
-    pub fn new_capped(root: &GameState, beliefs: &[BeliefState], raise_cap: u32) -> Self {
-        Self::new_capped_multi(root, beliefs, raise_cap, vec![0.0])
-    }
-
-    /// [`new_capped`](Self::new_capped) with a **multi-valued depth-limit leaf**
-    /// at each turn/flop depth cut the opponent picks among the
-    /// `scales` continuations (rest-of-hand pot inflations), so the resolve is
-    /// robust to the opponent adapting past the leaf rather than overfitting one
-    /// check-down.  `scales[0]` should be `0.0` (the normal check-down); a single
-    /// `[0.0]` reproduces [`new_capped`](Self::new_capped) with no chooser nodes.
-    pub fn new_capped_multi(
-        root: &GameState,
-        beliefs: &[BeliefState],
-        raise_cap: u32,
-        scales: Vec<f64>,
-    ) -> Self {
-        Self::new_full(root, beliefs, raise_cap, scales, false)
-    }
-
-    /// The general constructor.  With `full_river` (turn roots only), a turn
-    /// street close deals the river as an explicit `NodeKind::Chance` and
-    /// solves the **real river betting** below it — no leaf model at all on
-    /// that boundary — instead of cutting with a check-down / continuation
-    /// leaf.  All-in run-outs (no betting left) stay exact check-downs, and a
-    /// flop root still cuts at the turn reveal with the `scales` leaf.
-    pub fn new_full(
-        root: &GameState,
-        beliefs: &[BeliefState],
-        raise_cap: u32,
-        scales: Vec<f64>,
-        full_river: bool,
-    ) -> Self {
+    /// Build the public tree rooted at `root` (a river, turn *or* flop public
+    /// state) over the two belief ranges, shaped by `cfg`.  Solved with CFR⁺
+    /// (RM⁺ + linear averaging).
+    pub fn new(root: &GameState, beliefs: &[BeliefState], cfg: &ResolveConfig) -> Self {
         assert_eq!(beliefs.len(), 2, "heads-up vectorized resolving needs two ranges");
-        assert!(!scales.is_empty(), "need at least one continuation");
+        let ResolveConfig { raise_cap, continuations, full_river, runout_sample } = cfg.clone();
+        assert!(!continuations.is_empty(), "need at least one continuation");
         let board = root.board;
         let chooser = 1 - root.current_player();
         let big_blind = root.big_blind as f64;
@@ -207,13 +233,13 @@ impl VectorCfr {
             reach1,
             board,
             runout,
-            runout_sample: 0,
+            runout_sample,
             prepared: Vec::new(),
             full_river,
             cards: (0..NUM_COMBOS).map(combo_cards).collect(),
             big_blind,
             raise_cap,
-            scales,
+            scales: continuations,
             chooser,
             inner_root: 0,
             carried: None,
@@ -231,30 +257,6 @@ impl VectorCfr {
         me.root = me.build(root.clone(), Vec::new(), 0, root_prep);
         me.inner_root = me.root;
         me
-    }
-
-    /// Evaluate only `sample` of the depth-cut leaves' board completions per
-    /// training iteration, instead of all of them (`0` = exact, the default).
-    ///
-    /// This is the lever that makes turn and flop re-solving affordable live.
-    /// A flop leaf enumerates C(49,2)=1176 turn+river completions and a turn
-    /// leaf 48, against ONE for a river leaf — which is the entire reason a
-    /// flop resolve costs ~350× a river resolve per iteration despite building
-    /// an identically sized tree. Sampling cuts that factor directly.
-    ///
-    /// It costs accuracy per iteration and **not** accuracy in the emitted
-    /// strategy: total leaf work is `iters × sample`, so the averaged strategy
-    /// integrates over far more completions than exist, while each individual
-    /// iteration sees a noisier estimate. `PreparedRunout::evaluate_sampled`
-    /// carries the full argument, including why the schedule is systematic
-    /// rather than random (determinism, and even coverage).
-    ///
-    /// CFV extraction stays exact regardless — it runs once per resolve, where
-    /// the exact sweep is affordable, and its output is the safety guarantee
-    /// the next continual resolve is constrained by.
-    pub fn with_runout_sample(mut self, sample: usize) -> Self {
-        self.runout_sample = sample;
-        self
     }
 
     /// Constrain this resolve with the opponent's **carried counterfactual
@@ -287,63 +289,22 @@ impl VectorCfr {
 }
 
 /// Convenience: build, run, and emit in one call (mirrors `SubgameSolver::solve_for_iters`).
-pub fn solve_vectorized(root: &GameState, beliefs: &[BeliefState], iters: u64) -> VectorResolved {
-    let mut solver = VectorCfr::new(root, beliefs);
-    solver.run(iters);
-    solver.into_resolved()
-}
-
-/// [`solve_vectorized`] with the subgame's aggression bounded at `raise_cap`
-/// raises — required for deep-stacked play-time resolving, where the unbounded
-/// re-raise chain makes the public tree explode (see [`VectorCfr::new_capped`]).
-pub fn solve_vectorized_capped(
+pub fn solve_vectorized(
     root: &GameState,
     beliefs: &[BeliefState],
+    cfg: &ResolveConfig,
     iters: u64,
-    raise_cap: u32,
 ) -> VectorResolved {
-    let mut solver = VectorCfr::new_capped(root, beliefs, raise_cap);
-    solver.run(iters);
-    solver.into_resolved()
-}
-
-/// [`solve_vectorized_capped`] with a **multi-valued depth-limit leaf** (finding
-/// #1): the opponent picks among the `scales` continuations at each turn/flop
-/// depth cut, making the resolve robust to post-leaf adaptation.  `scales[0]`
-/// should be `0.0`; `[0.0]` reproduces [`solve_vectorized_capped`].
-pub fn solve_vectorized_multi(
-    root: &GameState,
-    beliefs: &[BeliefState],
-    iters: u64,
-    raise_cap: u32,
-    scales: Vec<f64>,
-) -> VectorResolved {
-    let mut solver = VectorCfr::new_capped_multi(root, beliefs, raise_cap, scales);
-    solver.run(iters);
-    solver.into_resolved()
-}
-
-/// A **full-river turn resolve**: the river is dealt as an explicit chance
-/// node and the real river betting is solved below it — exact to showdown, no
-/// leaf model on the turn/river boundary (all-in run-outs are exact
-/// check-downs).  ~48× the tree of a leaf-cut turn resolve; budget iterations
-/// accordingly.  For turn roots; other roots behave like
-/// [`solve_vectorized_capped`] (`scales` still applies to a flop root's cut).
-pub fn solve_vectorized_full_river(
-    root: &GameState,
-    beliefs: &[BeliefState],
-    iters: u64,
-    raise_cap: u32,
-) -> VectorResolved {
-    let mut solver = VectorCfr::new_full(root, beliefs, raise_cap, vec![0.0], true);
+    let mut solver = VectorCfr::new(root, beliefs, cfg);
     solver.run(iters);
     solver.into_resolved()
 }
 
 /// The action menu at the **root** of a capped vectorized subgame —
-/// index-aligned with the per-hand distributions [`solve_vectorized_capped`]
-/// emits at the root key (empty history).  Play-time resolving samples an
-/// index from the resolved distribution and looks the concrete action up here.
+/// index-aligned with the per-hand distributions a resolve with this
+/// `raise_cap` emits at the root key (empty history).  Play-time resolving
+/// samples an index from the resolved distribution and looks the concrete
+/// action up here.
 pub fn capped_root_actions(root: &GameState, raise_cap: u32) -> Vec<poker_core::action::Action> {
     use poker_core::action::Action;
     let full = legal_actions(root);

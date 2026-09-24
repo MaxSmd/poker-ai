@@ -17,6 +17,7 @@ use super::{COMBOS, FLOP_CONSISTENT_RATE, FLOP_SUBTREES_DONE};
 use crate::abstraction::features::{combo_cards, PreparedShowdown};
 use crate::games::blueprint::BlueprintHoldem;
 use crate::play::CompactPolicy;
+use crate::util::rng::{splitmix_next_unit, GOLDEN_GAMMA};
 
 /// One best-response pass.  Holds the per-pass policy-probability cache
 /// (info keys depend on betting history and bucket, not on raw cards, so the
@@ -260,11 +261,11 @@ impl<'a> Ctx<'a> {
                 } else {
                     // Deterministic per-path stream: seed from the board prefix
                     // so parallel flops stay reproducible.
-                    let mut st = splitmix(self.seed ^ (prefix.wrapping_mul(0x9E37_79B9_7F4A_7C15)));
+                    let mut st = self.seed ^ prefix.wrapping_mul(GOLDEN_GAMMA);
                     let mut pool = live;
                     let len = pool.len();
                     for i in 0..self.board_samples {
-                        let j = i + (next_unit(&mut st) * (len - i) as f64) as usize;
+                        let j = i + (splitmix_next_unit(&mut st) * (len - i) as f64) as usize;
                         pool.swap(i, j.min(len - 1));
                     }
                     pool.truncate(self.board_samples);
@@ -389,21 +390,6 @@ fn consistent_rate(live_len: usize) -> f64 {
 /// Bitmask of `cards`.
 pub(super) fn card_mask(cards: &[u8]) -> u64 {
     cards.iter().fold(0u64, |m, &c| m | 1 << c)
-}
-
-/// SplitMix64 state initializer (identity — the first [`next_unit`] advances).
-fn splitmix(seed: u64) -> u64 {
-    seed
-}
-
-/// One SplitMix64 draw in `[0, 1)`, advancing `state` in place.
-fn next_unit(state: &mut u64) -> f64 {
-    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut z = *state;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^= z >> 31;
-    (z >> 11) as f64 / (1u64 << 53) as f64
 }
 
 /// `reach` with every combo that uses one of `cards` zeroed.

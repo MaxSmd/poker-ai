@@ -37,6 +37,7 @@ use crate::play::policy::CompactPolicy;
 use crate::play::protocol::{parse_action, Event, Parsed};
 use crate::play::tracker::{AbstractHand, MapOutcome};
 use crate::resolving::belief_state::{combo_cards, BeliefState, NUM_COMBOS};
+use crate::util::rng::xorshift_next_unit;
 
 /// Tunables for the playing agent.
 #[derive(Clone, Debug)]
@@ -308,10 +309,7 @@ impl Bot {
 
     /// xorshift64* uniform in `[0, 1)`.
     fn unit(&mut self) -> f64 {
-        self.rng ^= self.rng >> 12;
-        self.rng ^= self.rng << 25;
-        self.rng ^= self.rng >> 27;
-        (self.rng.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
+        xorshift_next_unit(&mut self.rng)
     }
 
     /// Begin a hand as `client_pos` (Slumbot convention) holding `hole`.
@@ -319,14 +317,7 @@ impl Bot {
         let my_seat = 1 - client_pos as usize;
         let mut ranges = [BeliefState::uniform(), BeliefState::uniform()];
         // The opponent can never hold our cards — filter them out up front.
-        let mut mask = vec![1.0; NUM_COMBOS];
-        for (i, m) in mask.iter_mut().enumerate() {
-            let [a, b] = combo_cards(i);
-            if a == hole[0] || a == hole[1] || b == hole[0] || b == hole[1] {
-                *m = 0.0;
-            }
-        }
-        ranges[1 - my_seat].update(&mask);
+        ranges[1 - my_seat].update(&hole_mask(hole));
         HandState {
             my_pos: client_pos,
             my_seat,
@@ -438,18 +429,12 @@ impl Bot {
         }
 
         let mut rng = self.rng;
-        let mut unit = || {
-            rng ^= rng >> 12;
-            rng ^= rng << 25;
-            rng ^= rng >> 27;
-            (rng.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
-        };
         let mapped = hs.hand.map_real(
             &self.game,
             ev.kind,
             ev.pot_before as f64,
             ev.bet_before as f64,
-            &mut unit,
+            &mut || xorshift_next_unit(&mut rng),
         );
         self.rng = rng;
 
@@ -499,6 +484,21 @@ impl Bot {
 
 /// Whether `board` holds exactly the cards `street` has revealed — the guard
 /// every re-solve needs, since the root synthesis assumes they agree.
+/// Per-combo mask that zeroes every hand sharing a card with `hole` — the
+/// hands an opponent can never hold against us.
+fn hole_mask(hole: [u8; 2]) -> Vec<f64> {
+    (0..NUM_COMBOS)
+        .map(|i| {
+            let [a, b] = combo_cards(i);
+            if a == hole[0] || a == hole[1] || b == hole[0] || b == hole[1] {
+                0.0
+            } else {
+                1.0
+            }
+        })
+        .collect()
+}
+
 fn board_matches(street: u8, board: &[u8]) -> bool {
     match street {
         1 => board.len() == 3,

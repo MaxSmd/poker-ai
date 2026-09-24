@@ -245,22 +245,16 @@ impl VectorCfr {
         if mass[hand] <= 0.0 {
             return None;
         }
-        let env = Env {
-            kinds: &self.kinds,
-            board: &self.board,
-            runout: self.runout.as_ref(),
-            runout_sample: self.runout_sample,
-            prepared: &self.prepared,
-            cards: &self.cards,
-            carried: self.carried.as_deref(),
-            chooser: self.chooser,
-        };
         let mut raw = vec![0.0; NUM_COMBOS];
-        let mut out = Vec::with_capacity(children.len());
-        for child in children {
-            Self::eval_average(&env, &self.stores, &mut self.scratch, child, &reach_opp, me, &mut raw);
-            out.push(raw[hand] / mass[hand]);
-        }
+        let out = self.with_env(|env, stores, scratch| {
+            children
+                .into_iter()
+                .map(|child| {
+                    Self::eval_average(env, stores, scratch, child, &reach_opp, me, &mut raw);
+                    raw[hand] / mass[hand]
+                })
+                .collect()
+        });
         Some(out)
     }
 
@@ -269,26 +263,10 @@ impl VectorCfr {
     fn opponent_cfvs_at(&mut self, node: usize, reach_me: &[f64; NUM_COMBOS]) -> [f64; NUM_COMBOS] {
         let opp = self.chooser;
         let reach_opp = if opp == 0 { self.reach0 } else { self.reach1 };
-        let env = Env {
-            kinds: &self.kinds,
-            board: &self.board,
-            runout: self.runout.as_ref(),
-            runout_sample: self.runout_sample,
-            prepared: &self.prepared,
-            cards: &self.cards,
-            carried: self.carried.as_deref(),
-            chooser: self.chooser,
-        };
         let mut raw = vec![0.0; NUM_COMBOS];
-        Self::eval_average(
-            &env,
-            &self.stores,
-            &mut self.scratch,
-            node,
-            reach_me,
-            opp,
-            &mut raw,
-        );
+        self.with_env(|env, stores, scratch| {
+            Self::eval_average(env, stores, scratch, node, reach_me, opp, &mut raw)
+        });
         let mut mass = [0.0; NUM_COMBOS];
         valid_reach_into(&self.board, reach_me, &mut mass);
         let mut out = [0.0; NUM_COMBOS];
@@ -340,22 +318,14 @@ impl VectorCfr {
                 out.fill(0.0);
                 let mut cv = scratch.take(NUM_COMBOS);
                 for &(c, child) in children {
-                    let mut ro = *reach_other;
-                    for (h, cards) in env.cards.iter().enumerate() {
-                        if cards[0] == c || cards[1] == c {
-                            ro[h] = 0.0;
-                        }
-                    }
+                    let ro = without_card(reach_other, c, env.cards);
                     Self::eval_average(env, stores, scratch, child, &ro, player, &mut cv);
-                    for (h, cards) in env.cards.iter().enumerate() {
-                        if cards[0] != c && cards[1] != c {
-                            out[h] += cv[h];
-                        }
-                    }
+                    zero_card(&mut cv, c, env.cards);
+                    add_into(out, &cv);
                 }
                 scratch.give(cv);
                 for x in out.iter_mut() {
-                    *x /= 44.0;
+                    *x /= CONSISTENT_RIVERS;
                 }
             }
             NodeKind::Decision { player: p, store, children, .. } => {
@@ -421,29 +391,29 @@ impl VectorCfr {
             let traverser = ((self.t - 1) % 2) as usize;
             let (reach0, reach1) = (self.reach0, self.reach1);
             let (reach_tr, reach_op) = if traverser == 0 { (reach0, reach1) } else { (reach1, reach0) };
-            let env = Env {
-                kinds: &self.kinds,
-                board: &self.board,
-                runout: self.runout.as_ref(),
-            runout_sample: self.runout_sample,
-                prepared: &self.prepared,
-                cards: &self.cards,
-                    carried: self.carried.as_deref(),
-                chooser: self.chooser,
-            };
-            Self::cfr(
-                &env,
-                &self.stores,
-                &mut self.scratch,
-                self.root,
-                &reach_tr,
-                &reach_op,
-                traverser,
-                self.t,
-                0,
-                &mut root_value,
-            );
+            let (root, t) = (self.root, self.t);
+            self.with_env(|env, stores, scratch| {
+                let out = &mut root_value;
+                Self::cfr(env, stores, scratch, root, &reach_tr, &reach_op, traverser, t, 0, out)
+            });
         }
+    }
+
+    /// Run `f` over the read-only traversal environment, the node stores and
+    /// the scratch pool — the split borrow of `self` every traversal entry
+    /// point needs.
+    fn with_env<R>(&mut self, f: impl FnOnce(&Env<'_>, &[Mutex<NodeStore>], &mut Scratch) -> R) -> R {
+        let env = Env {
+            kinds: &self.kinds,
+            board: &self.board,
+            runout: self.runout.as_ref(),
+            runout_sample: self.runout_sample,
+            prepared: &self.prepared,
+            cards: &self.cards,
+            carried: self.carried.as_deref(),
+            chooser: self.chooser,
+        };
+        f(&env, &self.stores, &mut self.scratch)
     }
 
     /// The regret block for a decision node.
@@ -527,89 +497,25 @@ impl VectorCfr {
             NodeKind::Chance { children } => {
                 // River reveal: mask both reaches per branch, sum, divide by
                 // the per-pair-consistent count (44) — see `NodeKind::Chance`.
-                if depth < par_depth() {
-                    // One independent subtree per live river card — the widest
-                    // and most even split in the whole tree, and the reason a
-                    // full-river turn resolve parallelises well.  Each branch
-                    // zeroes its own blocked combos before returning, so the
-                    // fold below is a plain ordered sum.
-                    let partials: Vec<Vec<f64>> = children
-                        .par_iter()
-                        .map(|&(c, child)| {
-                            let mut rt = *reach_tr;
-                            let mut ro = *reach_op;
-                            for (h, cards) in env.cards.iter().enumerate() {
-                                if cards[0] == c || cards[1] == c {
-                                    rt[h] = 0.0;
-                                    ro[h] = 0.0;
-                                }
-                            }
-                            let mut cv = vec![0.0; NUM_COMBOS];
-                            let mut local = Scratch::default();
-                            Self::cfr(
-                                env,
-                                stores,
-                                &mut local,
-                                child,
-                                &rt,
-                                &ro,
-                                traverser,
-                                t,
-                                depth + 1,
-                                &mut cv,
-                            );
-                            for (h, cards) in env.cards.iter().enumerate() {
-                                if cards[0] == c || cards[1] == c {
-                                    cv[h] = 0.0;
-                                }
-                            }
-                            cv
-                        })
-                        .collect();
-                    out.fill(0.0);
-                    for cv in &partials {
-                        for (o, &v) in out.iter_mut().zip(cv.iter()) {
-                            *o += v;
-                        }
-                    }
-                } else {
-                    out.fill(0.0);
-                    let mut cv = scratch.take(NUM_COMBOS);
-                    for &(c, child) in children {
-                        let mut rt = *reach_tr;
-                        let mut ro = *reach_op;
-                        for (h, cards) in env.cards.iter().enumerate() {
-                            if cards[0] == c || cards[1] == c {
-                                rt[h] = 0.0;
-                                ro[h] = 0.0;
-                            }
-                        }
-                        Self::cfr(
-                            env,
-                            stores,
-                            scratch,
-                            child,
-                            &rt,
-                            &ro,
-                            traverser,
-                            t,
-                            depth + 1,
-                            &mut cv,
-                        );
-                        for (h, cards) in env.cards.iter().enumerate() {
-                            if cards[0] != c && cards[1] != c {
-                                out[h] += cv[h];
-                            }
-                        }
-                    }
-                    scratch.give(cv);
-                }
+                // One independent subtree per live river card is the widest and
+                // most even split in the whole tree, and the reason a
+                // full-river turn resolve parallelises well.  Each branch zeroes
+                // its own blocked combos, so the fold below is a plain sum.
+                out.fill(0.0);
+                Self::sum_children(scratch, depth < par_depth(), children.len(), out, |i, sc, cv| {
+                    let (c, child) = children[i];
+                    let rt = without_card(reach_tr, c, env.cards);
+                    let ro = without_card(reach_op, c, env.cards);
+                    Self::cfr(env, stores, sc, child, &rt, &ro, traverser, t, depth + 1, cv);
+                    zero_card(cv, c, env.cards);
+                });
                 for x in out.iter_mut() {
-                    *x /= 44.0;
+                    *x /= CONSISTENT_RIVERS;
                 }
             }
             NodeKind::Decision { player, store, children, .. } => {
                 let a = children.len();
+                let parallel = depth < par_depth() && a > 1;
                 let mut sigma = scratch.take(a * NUM_COMBOS);
                 let mut total = scratch.take(NUM_COMBOS);
                 Self::store(stores, *store).strategy_into(&mut sigma, &mut total);
@@ -640,80 +546,29 @@ impl VectorCfr {
                                 .expect("a runout leaf requires the resolve's runout table")
                                 .evaluate_sampled(reach_op, 1.0, u, t, env.runout_sample);
                         }
-                        for (ai, &child) in children.iter().enumerate() {
+                        for (slot, &child) in child_v.chunks_mut(NUM_COMBOS).zip(children) {
                             let NodeKind::RunoutShowdown { half_pot } = &env.kinds[child] else {
                                 unreachable!("all_runout_leaves checked every child")
                             };
-                            let span = ai * NUM_COMBOS..(ai + 1) * NUM_COMBOS;
-                            for (c, &v) in child_v[span.clone()].iter_mut().zip(unit.iter()) {
+                            for (c, &v) in slot.iter_mut().zip(unit.iter()) {
                                 *c = half_pot * v;
-                            }
-                            for ((o, &s), &c) in
-                                out.iter_mut().zip(&sigma[span.clone()]).zip(&child_v[span])
-                            {
-                                *o += s * c;
                             }
                         }
                         scratch.give(unit);
-                    } else if depth < par_depth() && a > 1 {
-                        // Each action's subtree writes only its own slot of the
-                        // action-major `child_v`, and touches only stores that
-                        // no sibling can reach.
-                        child_v
-                            .par_chunks_mut(NUM_COMBOS)
-                            .zip(children.par_iter())
-                            .zip(sigma.par_chunks(NUM_COMBOS))
-                            .for_each(|((cv, &child), sg)| {
-                                let mut rt = *reach_tr;
-                                for (r, &s) in rt.iter_mut().zip(sg) {
-                                    *r *= s;
-                                }
-                                let mut local = Scratch::default();
-                                Self::cfr(
-                                    env,
-                                    stores,
-                                    &mut local,
-                                    child,
-                                    &rt,
-                                    reach_op,
-                                    traverser,
-                                    t,
-                                    depth + 1,
-                                    cv,
-                                );
-                            });
-                        for ai in 0..a {
-                            let span = ai * NUM_COMBOS..(ai + 1) * NUM_COMBOS;
-                            for ((o, &s), &c) in
-                                out.iter_mut().zip(&sigma[span.clone()]).zip(&child_v[span])
-                            {
-                                *o += s * c;
-                            }
-                        }
                     } else {
-                        for (ai, &child) in children.iter().enumerate() {
-                            let span = ai * NUM_COMBOS..(ai + 1) * NUM_COMBOS;
+                        Self::for_each_child(scratch, parallel, &mut child_v, |i, sc, slot| {
                             let mut rt = *reach_tr;
-                            for (r, &s) in rt.iter_mut().zip(&sigma[span.clone()]) {
+                            let sg = &sigma[i * NUM_COMBOS..(i + 1) * NUM_COMBOS];
+                            for (r, &s) in rt.iter_mut().zip(sg) {
                                 *r *= s;
                             }
-                            Self::cfr(
-                                env,
-                                stores,
-                                scratch,
-                                child,
-                                &rt,
-                                reach_op,
-                                traverser,
-                                t,
-                                depth + 1,
-                                &mut child_v[span.clone()],
-                            );
-                            for ((o, &s), &c) in
-                                out.iter_mut().zip(&sigma[span.clone()]).zip(&child_v[span])
-                            {
-                                *o += s * c;
-                            }
+                            let child = children[i];
+                            Self::cfr(env, stores, sc, child, &rt, reach_op, traverser, t, depth + 1, slot);
+                        });
+                    }
+                    for (sg, cv) in sigma.chunks(NUM_COMBOS).zip(child_v.chunks(NUM_COMBOS)) {
+                        for ((o, &s), &c) in out.iter_mut().zip(sg).zip(cv) {
+                            *o += s * c;
                         }
                     }
                     Self::store(stores, *store).update(&sigma, &child_v, out, reach_tr, t);
@@ -751,71 +606,85 @@ impl VectorCfr {
                     env.runout
                         .expect("a runout leaf requires the resolve's runout table")
                         .evaluate_sampled(&blend, 1.0, o, t, env.runout_sample);
-                } else if depth < par_depth() && a > 1 {
-                    // Opponent node, parallel: same reach push per action, but
-                    // each subtree returns its own vector so the sum below can
-                    // stay in action order.
-                    let partials: Vec<Vec<f64>> = children
-                        .par_iter()
-                        .zip(sigma.par_chunks(NUM_COMBOS))
-                        .map(|(&child, sg)| {
-                            let mut ro = *reach_op;
-                            for (r, &s) in ro.iter_mut().zip(sg) {
-                                *r *= s;
-                            }
-                            let mut cv = vec![0.0; NUM_COMBOS];
-                            let mut local = Scratch::default();
-                            Self::cfr(
-                                env,
-                                stores,
-                                &mut local,
-                                child,
-                                reach_tr,
-                                &ro,
-                                traverser,
-                                t,
-                                depth + 1,
-                                &mut cv,
-                            );
-                            cv
-                        })
-                        .collect();
-                    for cv in &partials {
-                        for (o, &c) in out.iter_mut().zip(cv.iter()) {
-                            *o += c;
-                        }
-                    }
                 } else {
                     // Opponent node: push the opponent's reach by σ (folding it
                     // into the counterfactual weight) and sum over actions.
-                    let mut cv = scratch.take(NUM_COMBOS);
-                    for (ai, &child) in children.iter().enumerate() {
-                        let span = ai * NUM_COMBOS..(ai + 1) * NUM_COMBOS;
+                    Self::sum_children(scratch, parallel, a, out, |i, sc, cv| {
                         let mut ro = *reach_op;
-                        for (r, &s) in ro.iter_mut().zip(&sigma[span]) {
+                        let sg = &sigma[i * NUM_COMBOS..(i + 1) * NUM_COMBOS];
+                        for (r, &s) in ro.iter_mut().zip(sg) {
                             *r *= s;
                         }
-                        Self::cfr(
-                            env,
-                            stores,
-                            scratch,
-                            child,
-                            reach_tr,
-                            &ro,
-                            traverser,
-                            t,
-                            depth + 1,
-                            &mut cv,
-                        );
-                        for (o, &c) in out.iter_mut().zip(cv.iter()) {
-                            *o += c;
-                        }
-                    }
-                    scratch.give(cv);
+                        let child = children[i];
+                        Self::cfr(env, stores, sc, child, reach_tr, &ro, traverser, t, depth + 1, cv);
+                    });
                 }
                 scratch.give(total);
                 scratch.give(sigma);
             }
+        }
+    }
+
+    /// Evaluate each child subtree into its own `NUM_COMBOS` slot of `slots`
+    /// (child-major): `visit(i, scratch, slot)` fills child `i`'s slot.  For
+    /// callers that need every child's values at once (the regret update);
+    /// [`sum_children`](Self::sum_children) is the cheaper form when only
+    /// their sum is wanted.
+    ///
+    /// With `parallel`, the children run concurrently, each on a fresh scratch
+    /// pool; otherwise in order on the caller's, which is what keeps the deep
+    /// levels allocation-free.  Either way every child writes only its own slot
+    /// and touches only stores no sibling can reach, and every caller combines
+    /// the slots serially in child order afterwards — so the thread schedule
+    /// never re-associates a float addition, and the result is bit-identical
+    /// whichever way (and on however many threads) the children ran.
+    fn for_each_child(
+        scratch: &mut Scratch,
+        parallel: bool,
+        slots: &mut [f64],
+        visit: impl Fn(usize, &mut Scratch, &mut [f64]) + Sync,
+    ) {
+        if parallel {
+            slots
+                .par_chunks_mut(NUM_COMBOS)
+                .enumerate()
+                .for_each(|(i, slot)| visit(i, &mut Scratch::default(), slot));
+        } else {
+            for (i, slot) in slots.chunks_mut(NUM_COMBOS).enumerate() {
+                visit(i, scratch, slot);
+            }
+        }
+    }
+
+    /// `out += Σᵢ` child `i`'s values, `i` in `0..n`, where `visit(i, scratch,
+    /// cv)` writes child `i`'s values into `cv`.
+    ///
+    /// Serially this streams every child through one reused buffer — no
+    /// per-child slots, which at the deep levels is most of the tree's
+    /// buffer traffic.  In parallel it evaluates into slots via
+    /// [`for_each_child`](Self::for_each_child) and adds them in the same
+    /// child order, so the sum is bit-identical either way.
+    fn sum_children(
+        scratch: &mut Scratch,
+        parallel: bool,
+        n: usize,
+        out: &mut [f64],
+        visit: impl Fn(usize, &mut Scratch, &mut [f64]) + Sync,
+    ) {
+        if parallel {
+            let mut slots = scratch.take(n * NUM_COMBOS);
+            Self::for_each_child(scratch, true, &mut slots, visit);
+            for cv in slots.chunks(NUM_COMBOS) {
+                add_into(out, cv);
+            }
+            scratch.give(slots);
+        } else {
+            let mut cv = scratch.take(NUM_COMBOS);
+            for i in 0..n {
+                visit(i, scratch, &mut cv);
+                add_into(out, &cv);
+            }
+            scratch.give(cv);
         }
     }
 
@@ -853,5 +722,35 @@ impl VectorCfr {
         }
         let info_sets = strategy.len();
         VectorResolved { strategy, info_sets, public_nodes }
+    }
+}
+
+/// Rivers consistent with any two disjoint holdings on a turn board: 48 unseen
+/// cards minus the 4 in the two hands.  A chance node's per-branch sum divided
+/// by this is each hand pair's exact conditional expectation — see
+/// `NodeKind::Chance`.
+const CONSISTENT_RIVERS: f64 = 44.0;
+
+/// `reach` with every combo holding card `c` zeroed — the reach down the
+/// chance branch that deals `c`.
+fn without_card(reach: &[f64; NUM_COMBOS], c: u8, cards: &[[u8; 2]]) -> [f64; NUM_COMBOS] {
+    let mut out = *reach;
+    zero_card(&mut out, c, cards);
+    out
+}
+
+/// Zero the entries of every combo holding card `c`.
+fn zero_card(values: &mut [f64], c: u8, cards: &[[u8; 2]]) {
+    for (v, hand) in values.iter_mut().zip(cards) {
+        if hand[0] == c || hand[1] == c {
+            *v = 0.0;
+        }
+    }
+}
+
+/// `out += values`, elementwise.
+fn add_into(out: &mut [f64], values: &[f64]) {
+    for (o, &v) in out.iter_mut().zip(values) {
+        *o += v;
     }
 }

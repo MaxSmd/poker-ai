@@ -20,13 +20,7 @@ fn rotate_suit(c: u8) -> u8 {
 /// A tiny deterministic unit source for driving `sample_chance` directly.
 fn unit_stream(seed: u64) -> impl FnMut() -> f64 {
     let mut s = seed | 1;
-    move || {
-        s ^= s >> 12;
-        s ^= s << 25;
-        s ^= s >> 27;
-        let v = s.wrapping_mul(0x2545_F491_4F6C_DD1D);
-        (v >> 11) as f64 / (1u64 << 53) as f64
-    }
+    move || crate::util::rng::xorshift_next_unit(&mut s)
 }
 
 #[test]
@@ -331,12 +325,7 @@ fn indexed_blueprint_postflop_and_soa() {
     // decision node on every street.
     let mut by_key: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
     let mut rng = 0x00C0_FFEEu64;
-    let mut next = || {
-        rng ^= rng >> 12;
-        rng ^= rng << 25;
-        rng ^= rng >> 27;
-        (rng.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
-    };
+    let mut next = || crate::util::rng::xorshift_next_unit(&mut rng);
     for _ in 0..3000 {
         let mut c = CursorGame::root(&game);
         CursorGame::sample_chance(&game, &mut c, &mut next);

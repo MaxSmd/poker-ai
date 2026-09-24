@@ -21,7 +21,7 @@ path = "src/bin/memory_estimate.rs"
 
 [[bin]]
 name = "play"
-path = "src/bin/play.rs"
+path = "src/bin/play/main.rs"
 
 [dependencies]
 poker-core = { path = "../poker-core" }

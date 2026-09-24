@@ -320,12 +320,7 @@ mod tests {
         // Drive a few sampled hands to terminal and check chips are conserved.
         let game = PushFoldHoldem::new(50, 2, 1, 0);
         let mut rng = 0x1234_5678u64;
-        let mut next = || {
-            rng ^= rng >> 12;
-            rng ^= rng << 25;
-            rng ^= rng >> 27;
-            (rng.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
-        };
+        let mut next = || crate::util::rng::xorshift_next_unit(&mut rng);
         for _ in 0..50 {
             let mut st = game.sample_chance(&game.root(), &mut next);
             while !game.is_terminal(&st) {

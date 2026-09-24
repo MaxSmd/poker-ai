@@ -55,6 +55,16 @@ fn public_root(board: [u8; 5], stack: u32) -> GameState {
     public_root_at(board, stack, 3)
 }
 
+/// The default resolve with a multi-valued depth-limit leaf over `scales`.
+fn with_continuations(scales: Vec<f64>) -> ResolveConfig {
+    ResolveConfig { continuations: scales, ..ResolveConfig::default() }
+}
+
+/// A full-river turn resolve capped at `raise_cap` raises.
+fn full_river_cfg(raise_cap: u32) -> ResolveConfig {
+    ResolveConfig { full_river: true, ..ResolveConfig::capped(raise_cap) }
+}
+
 fn duel_ranges() -> [BeliefState; 2] {
     [
         BeliefState::from_hands(&[
@@ -75,7 +85,12 @@ fn vectorized_resolve_agrees_with_explicit_oracle() {
     // strategy, scored inside the explicit oracle by exact best response,
     // must reach the same near-optimal exploitability.
     let beliefs = duel_ranges();
-    let resolved = solve_vectorized(&public_root(river_board(), 20), &beliefs, 1_200);
+    let resolved = solve_vectorized(
+        &public_root(river_board(), 20),
+        &beliefs,
+        &ResolveConfig::default(),
+        1_200,
+    );
     assert!(resolved.info_sets > 0, "must emit strategy");
 
     let leaf = CheckdownLeafEval::new(); // unused on a complete board
@@ -98,7 +113,7 @@ fn vectorized_turn_resolve_agrees_with_explicit_oracle() {
     let root = public_root_at(turn_board(), 20, 2);
     assert_eq!(root.street, 2, "root should be on the turn");
 
-    let resolved = solve_vectorized(&root, &beliefs, 1_500);
+    let resolved = solve_vectorized(&root, &beliefs, &ResolveConfig::default(), 1_500);
     assert!(resolved.info_sets > 0, "must emit strategy");
 
     let leaf = CheckdownLeafEval::new();
@@ -120,7 +135,7 @@ fn k_continuation_inserts_a_chooser_node_owned_by_the_opponent() {
     let chooser = 1 - root.current_player();
     let scales = vec![0.0, 0.75, 1.5, 3.0];
 
-    let solver = VectorCfr::new_capped_multi(&root, &beliefs, u32::MAX, scales.clone());
+    let solver = VectorCfr::new(&root, &beliefs, &with_continuations(scales.clone()));
     let mut choosers = 0;
     for k in &solver.kinds {
         let NodeKind::Decision { player, children, marker: MARKER_CONTINUATION, .. } = k else {
@@ -143,7 +158,7 @@ fn k_continuation_inserts_a_chooser_node_owned_by_the_opponent() {
     assert!(choosers > 0, "a K > 1 turn resolve must contain a continuation-choice node");
 
     // K = 1 stays a plain leaf — no chooser nodes.
-    let single = VectorCfr::new(&root, &beliefs);
+    let single = VectorCfr::new(&root, &beliefs, &ResolveConfig::default());
     assert!(
         !single.kinds.iter().any(|k| matches!(k, NodeKind::Decision { marker: MARKER_CONTINUATION, .. })),
         "a single-continuation resolve must not insert chooser nodes"
@@ -151,7 +166,7 @@ fn k_continuation_inserts_a_chooser_node_owned_by_the_opponent() {
 
     // The emitted strategy (chooser nodes included) is valid — a handful of
     // iterations suffices, the strategy-sum normalizes at any count.
-    let resolved = solve_vectorized_multi(&root, &beliefs, 20, u32::MAX, scales);
+    let resolved = solve_vectorized(&root, &beliefs, &with_continuations(scales), 20);
     for probs in resolved.strategy.values() {
         let sum: f64 = probs.iter().sum();
         assert!((sum - 1.0).abs() < 1e-9, "strategy must be a distribution, got {sum}");
@@ -175,8 +190,8 @@ fn vectorized_multi_continuation_is_more_robust_than_single() {
     let root = || public_root_at(turn_board(), 20, 2);
 
     // A: resolved aware of the K = 4 choice.  B: resolved assuming one.
-    let a = solve_vectorized_multi(&root(), &beliefs, 2_000, u32::MAX, scales.clone());
-    let b = solve_vectorized(&root(), &beliefs, 2_000);
+    let a = solve_vectorized(&root(), &beliefs, &with_continuations(scales.clone()), 2_000);
+    let b = solve_vectorized(&root(), &beliefs, &ResolveConfig::default(), 2_000);
 
     // Both scored in the SAME multi-valued oracle (the adapting opponent).
     let leaf = MultiContinuationLeaf::with_scales(scales);
@@ -209,12 +224,11 @@ fn resolve_is_bit_identical_across_thread_counts() {
             .build()
             .expect("thread pool");
         pool.install(|| {
-            solve_vectorized_multi(
+            solve_vectorized(
                 &public_root_at(turn_board(), 20, 2),
                 &beliefs,
+                &with_continuations(scales.clone()),
                 200,
-                u32::MAX,
-                scales.clone(),
             )
         })
     };
@@ -267,13 +281,13 @@ fn continuation_count_robustness_sweep() {
 
     let mut results = Vec::new();
     for (label, scales) in candidates {
-        let solved = solve_vectorized_multi(&root(), &beliefs, 2_000, u32::MAX, scales);
+        let solved = solve_vectorized(&root(), &beliefs, &with_continuations(scales), 2_000);
         let expl = exploitability(&game, &solved.strategy);
         println!("continuation sweep — {label:<22} {expl:.5} bb");
         results.push((label, expl));
     }
 
-    let single = solve_vectorized(&root(), &beliefs, 2_000);
+    let single = solve_vectorized(&root(), &beliefs, &ResolveConfig::default(), 2_000);
     let expl_single = exploitability(&game, &single.strategy);
     println!("continuation sweep — {:<22} {expl_single:.5} bb", "K=1 (check-down)");
 
@@ -304,7 +318,7 @@ fn vectorized_flop_resolve_agrees_with_explicit_oracle() {
     let root = public_root_at(flop_board(), 6, 1);
     assert_eq!(root.street, 1, "root should be on the flop");
 
-    let resolved = solve_vectorized(&root, &beliefs, 600);
+    let resolved = solve_vectorized(&root, &beliefs, &ResolveConfig::default(), 600);
     assert!(resolved.info_sets > 0, "must emit strategy");
 
     let leaf = CheckdownLeafEval::new();
@@ -322,7 +336,12 @@ fn single_hand_each_is_solved() {
         BeliefState::from_hands(&[[make_card(12, 1), make_card(12, 2)]]), // trips
         BeliefState::from_hands(&[[make_card(8, 0), make_card(8, 1)]]),   // pair
     ];
-    let resolved = solve_vectorized(&public_root(river_board(), 20), &beliefs, 1_000);
+    let resolved = solve_vectorized(
+        &public_root(river_board(), 20),
+        &beliefs,
+        &ResolveConfig::default(),
+        1_000,
+    );
     let leaf = CheckdownLeafEval::new();
     let oracle = Subgame::new(public_root(river_board(), 20), &beliefs, &leaf);
     let expl = exploitability(&oracle, &resolved.strategy);
@@ -343,7 +362,12 @@ fn vectorized_solves_full_ranges_the_explicit_solver_cannot() {
     b1.remove_board(&river_board());
 
     let start = Instant::now();
-    let resolved = solve_vectorized(&public_root(river_board(), 20), &[b0, b1], 200);
+    let resolved = solve_vectorized(
+        &public_root(river_board(), 20),
+        &[b0, b1],
+        &ResolveConfig::default(),
+        200,
+    );
     let elapsed = start.elapsed();
     println!(
         "vectorized full-range river: {} public nodes, {} info sets, 200 iters in {:?}",
@@ -391,7 +415,12 @@ fn river_resolve_iteration_budget_sweep() {
     let mut expl_at = Vec::new();
     for &iters in &BUDGETS {
         let t0 = Instant::now();
-        let resolved = solve_vectorized(&public_root(river_board(), 20), &beliefs, iters);
+        let resolved = solve_vectorized(
+            &public_root(river_board(), 20),
+            &beliefs,
+            &ResolveConfig::default(),
+            iters,
+        );
         let solve_s = t0.elapsed().as_secs_f64();
         let expl = exploitability(&oracle, &resolved.strategy);
         println!("  {iters:>5} iters   expl {expl:>8.5} bb   ({solve_s:>5.2}s)");
@@ -411,7 +440,7 @@ fn river_resolve_iteration_budget_sweep() {
 
     println!("\n== B. 200bb full-range river (cap 3), drift from the 3000-iter reference ==");
     let t0 = Instant::now();
-    let reference = solve_vectorized_capped(&root, &ranges, 3_000, 3);
+    let reference = solve_vectorized(&root, &ranges, &ResolveConfig::capped(3), 3_000);
     println!(
         "  reference: 3000 iters, {} public nodes, {} info sets ({:.1}s)",
         reference.public_nodes,
@@ -422,7 +451,7 @@ fn river_resolve_iteration_budget_sweep() {
     let mut drift_at = Vec::new();
     for &iters in &BUDGETS {
         let t0 = Instant::now();
-        let resolved = solve_vectorized_capped(&root, &ranges, iters, 3);
+        let resolved = solve_vectorized(&root, &ranges, &ResolveConfig::capped(3), iters);
         let solve_s = t0.elapsed().as_secs_f64();
 
         // Mean/max total-variation distance per info set against the reference.
@@ -470,11 +499,11 @@ fn raise_cap_bounds_the_public_tree() {
     let beliefs = duel_ranges();
     let root = public_root(river_board(), 200);
     let capped = {
-        let mut s = VectorCfr::new_capped(&root, &beliefs, 1);
+        let mut s = VectorCfr::new(&root, &beliefs, &ResolveConfig::capped(1));
         s.run(200);
         s.into_resolved()
     };
-    let uncapped = solve_vectorized(&root, &beliefs, 200);
+    let uncapped = solve_vectorized(&root, &beliefs, &ResolveConfig::default(), 200);
     assert!(
         capped.public_nodes < uncapped.public_nodes,
         "cap-1 tree ({}) must be smaller than uncapped ({})",
@@ -485,17 +514,16 @@ fn raise_cap_bounds_the_public_tree() {
         let sum: f64 = probs.iter().sum();
         assert!((sum - 1.0).abs() < 1e-9);
     }
-    let generous = VectorCfr::new_capped(&root, &beliefs, 1_000);
+    let generous = VectorCfr::new(&root, &beliefs, &ResolveConfig::capped(1_000));
     assert_eq!(
         generous.kinds.len(),
-        VectorCfr::new(&root, &beliefs).kinds.len(),
+        VectorCfr::new(&root, &beliefs, &ResolveConfig::default()).kinds.len(),
         "a cap the tree never reaches changes nothing"
     );
     // The root menu helper is index-aligned with the built tree's root.
     let acts = capped_root_actions(&root, 1);
-    let NodeKind::Decision { children, .. } = &VectorCfr::new_capped(&root, &beliefs, 1).kinds
-        [VectorCfr::new_capped(&root, &beliefs, 1).root]
-    else {
+    let capped = VectorCfr::new(&root, &beliefs, &ResolveConfig::capped(1));
+    let NodeKind::Decision { children, .. } = &capped.kinds[capped.root] else {
         panic!("root is a decision node");
     };
     assert_eq!(acts.len(), children.len(), "root menu width matches the tree");
@@ -504,7 +532,12 @@ fn raise_cap_bounds_the_public_tree() {
 #[test]
 fn strategies_are_valid_distributions() {
     let beliefs = duel_ranges();
-    let resolved = solve_vectorized(&public_root(river_board(), 20), &beliefs, 500);
+    let resolved = solve_vectorized(
+        &public_root(river_board(), 20),
+        &beliefs,
+        &ResolveConfig::default(),
+        500,
+    );
     for probs in resolved.strategy.values() {
         let sum: f64 = probs.iter().sum();
         assert!((sum - 1.0).abs() < 1e-9, "strategy must be a distribution, got {sum}");
@@ -778,8 +811,8 @@ fn full_river_turn_resolve_is_near_equilibrium_in_the_true_game() {
     // bound 0.05 — huge slack); the cut arm only needs to be *worse*,
     // which it is by three orders of magnitude (~1.4 bb: it cannot
     // express river play at all).
-    let full = solve_vectorized_full_river(&root, &beliefs, 150, cap);
-    let cut = solve_vectorized_capped(&root, &beliefs, 150, cap);
+    let full = solve_vectorized(&root, &beliefs, &full_river_cfg(cap), 150);
+    let cut = solve_vectorized(&root, &beliefs, &ResolveConfig::capped(cap), 150);
     assert!(
         full.public_nodes > cut.public_nodes,
         "full-river tree must contain the river betting ({} vs {})",
@@ -820,7 +853,7 @@ fn gadget_resolve_is_safe_and_true_cfvs_do_not_distort() {
     let beliefs = duel_ranges();
     let root = public_root(river_board(), 20);
 
-    let mut boot = VectorCfr::new(&root, &beliefs);
+    let mut boot = VectorCfr::new(&root, &beliefs, &ResolveConfig::default());
     boot.run(1_000);
     let cfvs = boot.opponent_cfvs();
     let me = root.current_player();
@@ -857,7 +890,11 @@ fn gadget_resolve_is_safe_and_true_cfvs_do_not_distort() {
     );
 
     // (2)+(3) Gadget re-solve constrained by the carried values.
-    let mut gadget = VectorCfr::new(&root, &beliefs).with_opponent_gadget(cfvs);
+    let mut gadget = VectorCfr::new(
+        &root,
+        &beliefs,
+        &ResolveConfig::default()).with_opponent_gadget(cfvs,
+    );
     gadget.run(1_000);
     let strat_b = gadget.into_resolved().strategy;
 
@@ -889,7 +926,7 @@ fn full_river_strategies_are_valid_distributions() {
     let (s0, s1) = turn_supports();
     let beliefs = [BeliefState::from_hands(&s0), BeliefState::from_hands(&s1)];
     let root = public_root_at(turn_board(), 20, 2);
-    let resolved = solve_vectorized_full_river(&root, &beliefs, 50, 1);
+    let resolved = solve_vectorized(&root, &beliefs, &full_river_cfg(1), 50);
     assert!(resolved.info_sets > 0);
     for probs in resolved.strategy.values() {
         let sum: f64 = probs.iter().sum();
@@ -911,7 +948,7 @@ fn child_carries_decompose_the_root_carry() {
     let beliefs = duel_ranges();
     let root = public_root(river_board(), 20);
     let me = root.current_player();
-    let mut solver = VectorCfr::new(&root, &beliefs);
+    let mut solver = VectorCfr::new(&root, &beliefs, &ResolveConfig::default());
     solver.run(1_000);
     let root_cfvs = solver.opponent_cfvs();
     let resolved = solver.resolved();
@@ -975,7 +1012,7 @@ fn root_action_values_reproduce_the_oracle_profile_value() {
     let root = public_root(river_board(), 20);
     let me = root.current_player();
     let opp = 1 - me;
-    let mut solver = VectorCfr::new(&root, &beliefs);
+    let mut solver = VectorCfr::new(&root, &beliefs, &ResolveConfig::default());
     solver.run(1_000);
     let resolved = solver.resolved();
     let board = root.board;

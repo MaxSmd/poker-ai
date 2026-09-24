@@ -76,6 +76,7 @@ use crate::play::equity::equity_vs_range;
 use crate::play::luck::luck_adjustment;
 use crate::play::protocol::{BIG_BLIND, SMALL_BLIND, STACK_SIZE};
 use crate::resolving::belief_state::BeliefState;
+use crate::util::rng::xorshift64_plain_next_u64;
 
 /// Result of an LBR match, in big blinds.
 #[derive(Clone, Copy, Debug, Default)]
@@ -157,19 +158,12 @@ fn ci95_bb100(net: f64, sumsq: f64, hands: u64) -> f64 {
     1.96 * (var / n).sqrt() * 100.0
 }
 
-fn next_u64(s: &mut u64) -> u64 {
-    *s ^= *s << 13;
-    *s ^= *s >> 7;
-    *s ^= *s << 17;
-    *s
-}
-
 /// Nine distinct cards: two per player, five board.
 fn deal(rng: &mut u64) -> ([[u8; 2]; 2], [u8; 5]) {
     let mut deck: [u8; 52] = std::array::from_fn(|i| i as u8);
     // Partial Fisher–Yates: only the first nine slots are needed.
     for i in 0..9 {
-        let j = i + (next_u64(rng) % (52 - i as u64)) as usize;
+        let j = i + (xorshift64_plain_next_u64(rng) % (52 - i as u64)) as usize;
         deck.swap(i, j);
     }
     ([[deck[0], deck[1]], [deck[2], deck[3]]], [deck[4], deck[5], deck[6], deck[7], deck[8]])

@@ -8,7 +8,8 @@ use std::path::Path;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use super::parallel::{record_baseline, record_strategy_delta, record_traverser_delta, splitmix, Delta};
+use super::parallel::{record_baseline, record_strategy_delta, record_traverser_delta, Delta};
+use crate::util::rng::splitmix_stream;
 use super::BASELINE_RATE;
 use crate::games::{CursorGame, IndexedGame};
 use crate::solver::variant::Variant;
@@ -252,7 +253,7 @@ impl<G: IndexedGame> SoaMccfr<G, RegretTable> {
                 .into_par_iter()
                 .map(|i| {
                     let t = base + i + 1;
-                    let mut rng = splitmix(self.rng, t);
+                    let mut rng = splitmix_stream(self.rng, t);
                     let mut delta = Delta::default();
                     let mut cursor = CursorGame::root(&self.game);
                     for traverser in 0..players {

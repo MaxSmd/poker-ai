@@ -15,7 +15,7 @@
 use std::time::Instant;
 
 use poker_ai::resolving::belief_state::BeliefState;
-use poker_ai::resolving::vector_cfr::VectorCfr;
+use poker_ai::resolving::vector_cfr::{ResolveConfig, VectorCfr};
 use poker_core::action::Action;
 use poker_core::legal_actions;
 use poker_core::state::{GameState, MAX_PLAYERS, NO_CARD};
@@ -149,40 +149,26 @@ fn main() {
     }
 
     let r = public_root_at(river, 3);
-    bench("river (exact, 1500 it)", || VectorCfr::new_capped(&r, &ranges, 3), 1500);
+    bench("river (exact, 1500 it)", || VectorCfr::new(&r, &ranges, &ResolveConfig::capped(3)), 1500);
 
+    let cut = ResolveConfig {
+        raise_cap: 3,
+        continuations: vec![0.0, 0.75, 1.5, 3.0],
+        runout_sample: runout_sample(),
+        ..ResolveConfig::default()
+    };
     let t = public_root_at(turn, 2);
-    bench(
-        "turn checkdown K=4 (500 it)",
-        || VectorCfr::new_capped_multi(&t, &ranges, 3, vec![0.0, 0.75, 1.5, 3.0])
-            .with_runout_sample(runout_sample()),
-        500,
-    );
+    bench("turn checkdown K=4 (500 it)", || VectorCfr::new(&t, &ranges, &cut), 500);
     let f = public_root_at(flop, 1);
-    bench(
-        "flop checkdown K=4 (500 it)",
-        || VectorCfr::new_capped_multi(&f, &ranges, 3, vec![0.0, 0.75, 1.5, 3.0])
-            .with_runout_sample(runout_sample()),
-        500,
-    );
+    bench("flop checkdown K=4 (500 it)", || VectorCfr::new(&f, &ranges, &cut), 500);
 
     if !heavy {
         return;
     }
-    bench(
-        "turn FULL-RIVER (500 it)  [default]",
-        || VectorCfr::new_full(&t, &ranges, 3, vec![0.0], true),
-        500,
-    );
-    bench(
-        "turn FULL-RIVER (100 it)",
-        || VectorCfr::new_full(&t, &ranges, 3, vec![0.0], true),
-        100,
-    );
-    bench(
-        "turn FULL-RIVER cap1 (500 it)",
-        || VectorCfr::new_full(&t, &ranges, 1, vec![0.0], true),
-        500,
-    );
+    let full_river = |cap| ResolveConfig { full_river: true, ..ResolveConfig::capped(cap) };
+    let (full3, full1) = (full_river(3), full_river(1));
+    bench("turn FULL-RIVER (500 it)  [default]", || VectorCfr::new(&t, &ranges, &full3), 500);
+    bench("turn FULL-RIVER (100 it)", || VectorCfr::new(&t, &ranges, &full3), 100);
+    bench("turn FULL-RIVER cap1 (500 it)", || VectorCfr::new(&t, &ranges, &full1), 500);
 
 }

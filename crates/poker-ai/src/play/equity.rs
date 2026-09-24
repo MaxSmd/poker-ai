@@ -18,19 +18,12 @@ use poker_core::state::NO_CARD;
 
 use crate::abstraction::features::{board_cfvs, combo_cards, combo_index};
 use crate::resolving::belief_state::{BeliefState, NUM_COMBOS};
+use crate::util::rng::xorshift_next_unit;
 
 /// Runouts drawn when the remaining board is too wide to enumerate (preflop).
 /// Each sample already averages over the opponent's whole range, so the
 /// residual noise is in the runout only and 200 draws put it well under 1%.
 const PREFLOP_SAMPLES: usize = 200;
-
-/// xorshift64* uniform in `[0, 1)`, matching the agent's sampler.
-fn unit(rng: &mut u64) -> f64 {
-    *rng ^= *rng >> 12;
-    *rng ^= *rng << 25;
-    *rng ^= *rng >> 27;
-    (rng.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
-}
 
 /// Equity of `hole` against `opp`'s range on `board` (0, 3, 4, or 5 cards),
 /// in `[0, 1]`, ties counted as a half win.
@@ -112,7 +105,7 @@ pub fn equity_vs_range(hole: [u8; 2], board: &[u8], opp: &BeliefState, rng: &mut
             for _ in 0..PREFLOP_SAMPLES {
                 let mut avail = deck.clone();
                 for slot in pick.iter_mut() {
-                    let k = (unit(rng) * avail.len() as f64) as usize;
+                    let k = (xorshift_next_unit(rng) * avail.len() as f64) as usize;
                     *slot = avail.swap_remove(k.min(avail.len() - 1));
                 }
                 full.copy_from_slice(&pick);

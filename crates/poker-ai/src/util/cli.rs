@@ -1,4 +1,4 @@
-//! Command-line argument validation shared by the binaries.
+//! Command-line flag parsing and validation shared by the binaries.
 //!
 //! Every tool here hand-scans `argv` for the flags it cares about, which means
 //! an unrecognised flag is *silently ignored* by default.  That is a real
@@ -49,6 +49,37 @@ pub fn validate_flags(args: &[String], skip: usize, allowed: &[&str], max_positi
             std::process::exit(2);
         }
     }
+}
+
+/// The value of `--name=VALUE` parsed as `T` (the first occurrence), or `None`
+/// when the flag is absent **or does not parse** — the lenient reader, for
+/// flags whose default is a safe fallback.
+pub fn flag<T: std::str::FromStr>(args: &[String], name: &str) -> Option<T> {
+    args.iter().find_map(|a| a.strip_prefix(&format!("--{name}="))).and_then(|v| v.parse().ok())
+}
+
+/// [`flag`], but a value that is present and does not parse exits with status
+/// 2 and the parser's message.  For flags where a silent default would change
+/// what gets built or loaded — `--cap` is the case in point: a defaulted cap
+/// loads a differently shaped game, and the only symptom is a collapsed
+/// lookup hit rate.
+pub fn strict_flag<T>(args: &[String], name: &str) -> Option<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    let raw = args.iter().find_map(|a| a.strip_prefix(&format!("--{name}=")))?;
+    Some(raw.parse().unwrap_or_else(|e| {
+        eprintln!("--{name}: {e}");
+        std::process::exit(2)
+    }))
+}
+
+/// Artifact directory: `--data=DIR`, default `data/` — where bucket maps and
+/// blueprints are read and written.  Overridable so a quota-limited box can
+/// point the bulk artifacts at scratch space without a symlink.
+pub fn data_dir(args: &[String]) -> std::path::PathBuf {
+    flag::<String>(args, "data").unwrap_or_else(|| "data".into()).into()
 }
 
 #[cfg(test)]

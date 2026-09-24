@@ -172,7 +172,7 @@ line up. Without the wrapper the trainer's output is unchanged.
 
 ## Playing against Slumbot
 
-`bin/play.rs` wires the trained blueprint into a live agent for
+`bin/play/` wires the trained blueprint into a live agent for
 [Slumbot](https://www.slumbot.com) (heads-up NLHE, 200 bb, blinds 50/100 — the
 standard public benchmark bot):
 
@@ -209,7 +209,7 @@ Flags: `--iters=N` (resolve iterations), `--river-cap=N`, `--purify=X`
 (drop sub-X action probabilities), `--seed=N`, `--no-resolve`,
 `--no-resolve-turn`, `--no-resolve-flop`, `--runout-sample=N` (completions per
 iteration at a depth-cut leaf; `0` = exact),
-`--token=`/`--username=`/`--password=` — see the header of `src/bin/play.rs`.
+`--token=`/`--username=`/`--password=` — see the header of `src/bin/play/main.rs`.
 
 The rest of the resolving stack (`crates/poker-ai/src/validation/resolving/`,
 the explicit-deal oracle the vectorized solver is gated against) — CFV-gadget

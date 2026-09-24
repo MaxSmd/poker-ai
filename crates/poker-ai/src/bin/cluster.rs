@@ -39,7 +39,7 @@
 //!   POKER_AI_RIVER_OCHS       1/true → OCHS river feature (default scalar)
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
 use rayon::prelude::*;
@@ -50,7 +50,7 @@ use poker_ai::abstraction::features::{
     board_equities, board_histograms, board_ochs, combo_index, ochs_opponent_clusters, OCHS_K,
 };
 use poker_ai::abstraction::hand_index::HandIndexer;
-use poker_ai::util::cli::validate_flags;
+use poker_ai::util::cli::{data_dir, validate_flags};
 
 /// Histogram resolution for flop/turn (plan: 50-bin equity histograms).
 const BINS: usize = 50;
@@ -211,11 +211,7 @@ fn main() {
     // A full build is hours of work; a typo'd flag must fail before it starts.
     // Positionals: [cap] [seed] [flop_k] [turn_k] [river_k].
     validate_flags(&args, 1, &["data"], 5);
-    let dir: PathBuf = args
-        .iter()
-        .find_map(|a| a.strip_prefix("--data="))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("data"));
+    let dir = data_dir(&args);
     // Positional args are the numeric ones; flags start with `--`.
     let nums: Vec<&String> = args[1..].iter().filter(|a| !a.starts_with("--")).collect();
     let cap: usize = nums.first().and_then(|s| s.parse().ok()).unwrap_or(300);

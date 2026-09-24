@@ -14,19 +14,15 @@ use poker_ai::solver::variant::Variant;
 use poker_ai::solver::dcfr::Discount;
 use poker_ai::solver::mccfr::Mccfr;
 
+use poker_ai::util::cli::strict_flag;
+
 use crate::harness::{run_chunked, CursorTrainer, SoaMode, SoaTrainer};
 use crate::{data_dir, emit_metric, parse_cadence, BIG_BLIND, SMALL_BLIND};
 
 /// `--cap=N` (every street) or `--cap=P,F,T,R` (per street), default 1.  A
 /// value that does not parse exits rather than silently training cap-1.
 fn parse_caps(args: &[String]) -> RaiseCaps {
-    match args.iter().find_map(|a| a.strip_prefix("--cap=")) {
-        None => RaiseCaps::uniform(1),
-        Some(s) => s.parse().unwrap_or_else(|e| {
-            eprintln!("--cap: {e}");
-            std::process::exit(2)
-        }),
-    }
+    strict_flag(args, "cap").unwrap_or(RaiseCaps::uniform(1))
 }
 
 /// The `raise_cap` W&B config value: a number for a uniform cap, as every

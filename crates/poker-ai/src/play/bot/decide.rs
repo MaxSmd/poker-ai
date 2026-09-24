@@ -15,10 +15,12 @@ use crate::games::blueprint::BlueprintHoldem;
 use crate::play::equity::equity_vs_range;
 use crate::play::protocol::{EventKind, Parsed, BIG_BLIND, SMALL_BLIND, STACK_SIZE};
 use crate::play::tracker::{MapOutcome, RealMove};
-use crate::resolving::belief_state::{combo_cards, combo_index, NUM_COMBOS};
+use super::hole_mask;
+use crate::resolving::belief_state::{combo_cards, combo_index, BeliefState, NUM_COMBOS};
 use crate::resolving::vector_cfr::{
-    capped_root_actions, subgame_info_key, VectorCfr, VectorResolved,
+    capped_root_actions, subgame_info_key, ResolveConfig, VectorCfr, VectorResolved,
 };
+use crate::util::rng::xorshift_next_unit;
 
 impl Bot {
 
@@ -93,71 +95,21 @@ impl Bot {
     /// exact to showdown on the river, cut at the undealt street on turn/flop
     /// (runout leaves with K continuations).  Dispatched by [`Self::should_resolve`].
     pub(super) fn decide_resolve(&mut self, hs: &mut HandState, parsed: &Parsed, board: &[u8]) -> RealMove {
-        let street = parsed.street;
         let root = self.resolve_root(hs, parsed, board);
         let acts = capped_root_actions(&root, self.cfg.river_cap);
         if acts.is_empty() {
             return self.decide_blueprint(hs, parsed, board);
         }
 
-        // Ranges: card removal, opponent additionally filtered by our cards,
-        // and our actual hand floored to nonzero mass so the resolve always
-        // covers it.
-        let opp_seat = 1 - hs.my_seat;
-        let mut beliefs = [hs.ranges[0].clone(), hs.ranges[1].clone()];
-        for b in &mut beliefs {
-            b.remove_board(board);
-        }
-        let mut mask = vec![1.0; NUM_COMBOS];
-        for (i, m) in mask.iter_mut().enumerate() {
-            let [a, b] = combo_cards(i);
-            if a == hs.my_hole[0] || a == hs.my_hole[1] || b == hs.my_hole[0] || b == hs.my_hole[1] {
-                *m = 0.0;
-            }
-        }
-        beliefs[opp_seat].update(&mask);
-        let me_idx = combo_index(hs.my_hole[0], hs.my_hole[1]);
-        let floor = beliefs[hs.my_seat].probs.iter().cloned().fold(0.0, f64::max) * 0.02;
-        if beliefs[hs.my_seat].probs[me_idx] < floor {
-            beliefs[hs.my_seat].probs[me_idx] = floor.max(1e-6);
-            let ones = vec![1.0; NUM_COMBOS];
-            beliefs[hs.my_seat].update(&ones); // renormalize
-        }
-
-        // River: exact showdown terminals.  Turn (full-river mode): the river
-        // is dealt as a chance node and the real river betting solved below —
-        // exact to showdown, no leaf model.  Otherwise turn/flop cut at the
-        // undealt street with the K-continuation check-down leaf.
-        let (mut solver, iters) = if board.len() == 5 {
-            (VectorCfr::new_capped(&root, &beliefs, self.cfg.river_cap), self.cfg.river_iters)
-        } else if board.len() == 4 && self.cfg.turn_full_river {
-            (
-                VectorCfr::new_full(&root, &beliefs, self.cfg.river_cap, vec![0.0], true),
-                self.cfg.turn_iters,
-            )
-        } else {
-            // Turn and flop cut at the undealt street, so every leaf pays for a
-            // runout sweep once per iteration — 48 completions on the turn and
-            // 1176 on the flop.  `runout_sample` is what keeps that inside a
-            // live clock; the river arm above never reaches here (a complete
-            // board has no runout to sample).
-            (
-                VectorCfr::new_capped_multi(
-                    &root,
-                    &beliefs,
-                    self.cfg.river_cap,
-                    self.cfg.continuations.clone(),
-                )
-                .with_runout_sample(self.cfg.runout_sample),
-                self.cfg.turn_iters,
-            )
-        };
+        let beliefs = resolve_beliefs(hs, board);
+        let (cfg, iters) = self.resolve_config(board.len());
+        let mut solver = VectorCfr::new(&root, &beliefs, &cfg);
         // Continual re-solving: constrain by the opponent CFVs carried from
         // our previous resolve this hand (the first resolve bootstraps).  The
         // carry is refreshed below, once our action is known.
         if self.cfg.continual {
             if let Some(cfvs) = &hs.carried_cfvs {
-                solver = solver.with_opponent_gadget(*cfvs.clone());
+                solver = solver.with_opponent_gadget(**cfvs);
             }
         }
         solver.run(iters);
@@ -181,21 +133,65 @@ impl Bot {
         let played = self.play_distribution(&probs);
         // AIVAT: value each root action for our hand BEFORE the draw, so the
         // term below is a pure function of the pre-draw state and the draw.
-        let values = solver.root_action_values(me_idx);
+        let values = solver.root_action_values(combo_index(hs.my_hole[0], hs.my_hole[1]));
         let idx = self.draw(&played);
-        let action = acts[idx];
         if let Some(v) = values {
             let expected: f64 = played.iter().zip(&v).map(|(p, x)| p * x).sum();
             hs.action_luck_bb += v[idx] - expected;
         }
 
-        // Every later resolve this hand starts from our range, so it must be
-        // conditioned on the strategy we actually played — this resolve's,
-        // purified as sampled — not on the blueprint's likelihood of the
-        // nearest abstract action, which is a different strategy on every
-        // re-solved street.  The carry is taken at the child we chose, with
-        // the same likelihood, so the two describe one strategy.
-        let likelihood = self.resolve_likelihood(&resolved, hs.my_seat, &board5, idx);
+        self.condition_on_resolve(hs, &mut solver, &resolved, &board5, idx);
+        let mv = root_move(&root, hs.my_seat, acts[idx], parsed.last_bet_size > 0);
+        self.mirror_own_move(hs, parsed, mv);
+        mv
+    }
+
+    /// The resolve's tree shape and iteration budget for a board of
+    /// `board_len` cards.
+    ///
+    /// River: exact showdown terminals.  Turn (full-river mode): the river is
+    /// dealt as a chance node and the real river betting solved below — exact
+    /// to showdown, no leaf model.  Otherwise turn/flop cut at the undealt
+    /// street with the K-continuation check-down leaf.
+    fn resolve_config(&self, board_len: usize) -> (ResolveConfig, u64) {
+        let capped = ResolveConfig::capped(self.cfg.river_cap);
+        if board_len == 5 {
+            (capped, self.cfg.river_iters)
+        } else if board_len == 4 && self.cfg.turn_full_river {
+            (ResolveConfig { full_river: true, ..capped }, self.cfg.turn_iters)
+        } else {
+            // Turn and flop cut at the undealt street, so every leaf pays for a
+            // runout sweep once per iteration — 48 completions on the turn and
+            // 1176 on the flop.  `runout_sample` is what keeps that inside a
+            // live clock; the river arm above never reaches here (a complete
+            // board has no runout to sample).
+            let cfg = ResolveConfig {
+                continuations: self.cfg.continuations.clone(),
+                runout_sample: self.cfg.runout_sample,
+                ..capped
+            };
+            (cfg, self.cfg.turn_iters)
+        }
+    }
+
+    /// Condition everything carried forward on root action `idx`, which we
+    /// just played from `resolved`.
+    ///
+    /// Every later resolve this hand starts from our range, so it must be
+    /// conditioned on the strategy we actually played — this resolve's,
+    /// purified as sampled — not on the blueprint's likelihood of the nearest
+    /// abstract action, which is a different strategy on every re-solved
+    /// street.  The carry is taken at the child we chose, with the same
+    /// likelihood, so the two describe one strategy.
+    fn condition_on_resolve(
+        &self,
+        hs: &mut HandState,
+        solver: &mut VectorCfr,
+        resolved: &VectorResolved,
+        board5: &[u8; 5],
+        idx: usize,
+    ) {
+        let likelihood = self.resolve_likelihood(resolved, hs.my_seat, board5, idx);
         if self.cfg.continual {
             hs.carried_cfvs = solver.opponent_cfvs_after(idx, &likelihood).map(Box::new);
         }
@@ -204,62 +200,37 @@ impl Bot {
         if updated.probs.iter().any(|&p| p > 0.0) {
             hs.ranges[hs.my_seat] = updated;
         }
+    }
 
-        // Keep the abstract tracker and our range coherent with what we do:
-        // map the real move back into the abstract game as if observed.
-        let facing = parsed.last_bet_size > 0;
-        let mv = match action {
-            Action::Fold => RealMove::Fold,
-            Action::Check => RealMove::Check,
-            Action::Call => RealMove::Call,
-            Action::Raise(level) => RealMove::BetTo(level_to_pos_level(&root, hs.my_seat, level)),
-            Action::AllIn => {
-                let gs = &root;
-                let level = gs.street_bets[hs.my_seat] + gs.stacks[hs.my_seat];
-                if level <= gs.current_bet {
-                    if facing {
-                        RealMove::Call
-                    } else {
-                        RealMove::Check
-                    }
-                } else {
-                    RealMove::BetTo(level)
-                }
-            }
-        };
+    /// Keep the abstract tracker coherent with what we do: map our real move
+    /// back into the abstract game as if observed.  Tracker only — our range
+    /// was already conditioned on the resolve.
+    fn mirror_own_move(&mut self, hs: &mut HandState, parsed: &Parsed, mv: RealMove) {
+        if !hs.hand.expects(&self.game, hs.my_seat, parsed.street) {
+            hs.pending_self = Some(None);
+            return;
+        }
         let kind = match mv {
             RealMove::Fold => EventKind::Fold,
             RealMove::Check => EventKind::Check,
             RealMove::Call => EventKind::Call,
             RealMove::BetTo(n) => EventKind::BetTo(n),
         };
-        if hs.hand.expects(&self.game, hs.my_seat, street) {
-            let mut rng = self.rng;
-            let mut unit = || {
-                rng ^= rng >> 12;
-                rng ^= rng << 25;
-                rng ^= rng >> 27;
-                (rng.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64
-            };
-            let mapped = hs.hand.map_real(
-                &self.game,
-                kind,
-                parsed.pot() as f64,
-                parsed.street_last_bet_to as f64,
-                &mut unit,
-            );
-            self.rng = rng;
-            if let MapOutcome::Index(i) = mapped {
-                // Tracker only: our range was already updated from the resolve.
-                hs.hand.apply(&self.game, i);
-                hs.pending_self = Some(Some(i));
-            } else {
-                hs.pending_self = Some(None);
-            }
+        let mut rng = self.rng;
+        let mapped = hs.hand.map_real(
+            &self.game,
+            kind,
+            parsed.pot() as f64,
+            parsed.street_last_bet_to as f64,
+            &mut || xorshift_next_unit(&mut rng),
+        );
+        self.rng = rng;
+        if let MapOutcome::Index(i) = mapped {
+            hs.hand.apply(&self.game, i);
+            hs.pending_self = Some(Some(i));
         } else {
             hs.pending_self = Some(None);
         }
-        mv
     }
 
     /// Synthesize the real postflop public state (Slumbot chips) as an engine
@@ -382,9 +353,44 @@ impl Bot {
     }
 }
 
-/// An engine `Raise(level)` at the resolve root is already the actor's new
-/// street-bet level in real chips — identical to Slumbot's `b<level>`
-/// semantics.  Kept as a named function to make that unit statement explicit.
-fn level_to_pos_level(_root: &GameState, _seat: usize, level: u32) -> u32 {
-    level
+/// Both ranges as a resolve needs them: board cards removed, the opponent's
+/// additionally filtered by our hole cards, and our actual hand floored to
+/// nonzero mass so the resolve always covers it.
+fn resolve_beliefs(hs: &HandState, board: &[u8]) -> [BeliefState; 2] {
+    let mut beliefs = [hs.ranges[0].clone(), hs.ranges[1].clone()];
+    for b in &mut beliefs {
+        b.remove_board(board);
+    }
+    beliefs[1 - hs.my_seat].update(&hole_mask(hs.my_hole));
+    let mine = &mut beliefs[hs.my_seat];
+    let me_idx = combo_index(hs.my_hole[0], hs.my_hole[1]);
+    let floor = mine.probs.iter().cloned().fold(0.0, f64::max) * 0.02;
+    if mine.probs[me_idx] < floor {
+        mine.probs[me_idx] = floor.max(1e-6);
+        mine.update(&vec![1.0; NUM_COMBOS]); // renormalize
+    }
+    beliefs
+}
+
+/// Our root `action` in Slumbot's terms.  An engine `Raise(level)` is already
+/// the actor's new street-bet level in real chips — identical to Slumbot's
+/// `b<level>` semantics — while an all-in that does not exceed the current
+/// bet is really a call (or a check when nothing is `facing` us).
+fn root_move(root: &GameState, seat: usize, action: Action, facing: bool) -> RealMove {
+    match action {
+        Action::Fold => RealMove::Fold,
+        Action::Check => RealMove::Check,
+        Action::Call => RealMove::Call,
+        Action::Raise(level) => RealMove::BetTo(level),
+        Action::AllIn => {
+            let level = root.street_bets[seat] + root.stacks[seat];
+            if level > root.current_bet {
+                RealMove::BetTo(level)
+            } else if facing {
+                RealMove::Call
+            } else {
+                RealMove::Check
+            }
+        }
+    }
 }

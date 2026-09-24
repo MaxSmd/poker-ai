@@ -15,7 +15,7 @@
 //!   full-range vectorized river re-solving
 //! * [`slumbot`] — the HTTP client
 //!
-//! The match runner lives in `bin/play.rs` (`play slumbot <hands>`).
+//! The match runner lives in `bin/play/` (`play slumbot <hands>`).
 
 pub mod bot;
 pub mod cards;

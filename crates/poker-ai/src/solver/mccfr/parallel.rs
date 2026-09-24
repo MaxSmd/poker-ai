@@ -12,7 +12,7 @@ use rayon::prelude::*;
 use super::{Mccfr, Node, BASELINE_RATE};
 use crate::games::Game;
 use crate::solver::variant::Variant;
-use crate::util::rng::{sample_index, xorshift_next_unit};
+use crate::util::rng::{sample_index, splitmix_stream, xorshift_next_unit};
 
 impl<G: Game> Mccfr<G> {
     // ── Parallel (batched) training ──────────────────────────────────────────
@@ -59,7 +59,7 @@ impl<G: Game> Mccfr<G> {
                 .into_par_iter()
                 .map(|i| {
                     let t = base + i + 1;
-                    let mut rng = splitmix(self.rng, t);
+                    let mut rng = splitmix_stream(self.rng, t);
                     let mut delta = Delta::default();
                     for traverser in 0..players {
                         let root = self.game.root();
@@ -278,13 +278,4 @@ pub(super) fn record_strategy_delta(delta: &mut Delta, key: u64, weight: f64, st
     for (acc_a, &s) in acc.iter_mut().zip(strategy) {
         *acc_a += weight * s;
     }
-}
-
-/// SplitMix64-derived per-iteration RNG seed, so parallel workers get
-/// independent, reproducible streams from the solver's base seed.
-pub(super) fn splitmix(seed: u64, iter: u64) -> u64 {
-    let mut z = seed ^ iter.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    (z ^ (z >> 31)) | 1
 }
