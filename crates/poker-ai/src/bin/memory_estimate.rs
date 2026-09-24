@@ -42,7 +42,8 @@
 //!
 //! Bucket defaults track `cluster`'s (see its `main`), so a no-arg run reports
 //! the abstraction `cluster` actually builds. Pre-flop is always the 169
-//! canonical classes. `POKER_AI_ESTIMATE_STATES` caps the memo (default
+//! canonical classes. `POKER_AI_ESTIMATE_CAPS` picks the cap rows (default
+//! `1;2;3`; per-street specs like `4,3,2,1` allowed). `POKER_AI_ESTIMATE_STATES` caps the memo (default
 //! 15M states ≈ a few GB); a config that exceeds it is reported as truncated.
 
 use std::collections::HashMap;
@@ -50,7 +51,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use poker_ai::abstraction::bucket_map::BucketMap;
-use poker_ai::games::blueprint::BlueprintHoldem;
+use poker_ai::games::blueprint::{BlueprintHoldem, RaiseCaps};
 use poker_ai::games::IndexedGame;
 use poker_ai::util::cli::validate_flags;
 use poker_core::action::{Action, ActionList};
@@ -190,7 +191,7 @@ fn next_raises(prev: u8, old_street: u8, old_bet: u32, gs: &GameState) -> u8 {
 }
 
 struct Walker {
-    raise_cap: u32,
+    raise_caps: RaiseCaps,
     rule: CapRule,
     memo: HashMap<PublicKey, Counts>,
     limit: usize,
@@ -212,7 +213,7 @@ impl Walker {
             self.truncated = true;
             return Counts::default();
         }
-        let acts = capped_legal(gs, street_raises, self.raise_cap, self.rule);
+        let acts = capped_legal(gs, street_raises, self.raise_caps.at(gs.street), self.rule);
         let s = gs.street as usize;
         let mut c = Counts::default();
         c.nodes[s] = 1;
@@ -254,10 +255,9 @@ struct Measurement {
     secs: f64,
 }
 
-fn enumerate_tree(num_players: u8, stack_bb: u32, cap: u32, limit: usize, rule: CapRule) -> Measurement {
+fn enumerate_tree(num_players: u8, stack_bb: u32, caps: RaiseCaps, limit: usize, rule: CapRule) -> Measurement {
     let mut gs = skeleton(num_players, stack_bb * BIG_BLIND);
-    let mut w =
-        Walker { raise_cap: cap.max(1), rule, memo: HashMap::new(), limit, truncated: false };
+    let mut w = Walker { raise_caps: caps, rule, memo: HashMap::new(), limit, truncated: false };
     let t = Instant::now();
     let counts = w.count(&mut gs, 0);
     Measurement { counts, states: w.memo.len(), truncated: w.truncated, secs: t.elapsed().as_secs_f64() }
@@ -333,7 +333,7 @@ fn cross_check_hu(dir: &Path, limit: usize, rule: CapRule) {
     }
     let game = game.with_indexing();
     let real = game.info_set_capacity() as u64;
-    let (walked, _) = table_size(&enumerate_tree(2, 20, 2, limit, rule).counts, buckets);
+    let (walked, _) = table_size(&enumerate_tree(2, 20, RaiseCaps::uniform(2), limit, rule).counts, buckets);
     assert_eq!(walked, real, "walker disagrees with the real dense index — investigate before trusting the matrix");
     println!("Cross-check vs the real BlueprintHoldem dense index (HU 20bb cap-2): {} info sets — exact match.\n", fmt_count(real));
 }
@@ -367,6 +367,22 @@ fn main() {
     // Comma lists, e.g. POKER_AI_ESTIMATE_STACKS=20,100,200 POKER_AI_ESTIMATE_PLAYERS=2
     let stacks = env_list("POKER_AI_ESTIMATE_STACKS", vec![20, 50, 100]);
     let players_list = env_list("POKER_AI_ESTIMATE_PLAYERS", vec![2, 6]);
+    // Semicolon list of cap specs, each `N` or per-street `P,F,T,R`, e.g.
+    // POKER_AI_ESTIMATE_CAPS="2;3;4,3,2,1".  A spec that does not parse exits,
+    // since a silently dropped row reads as "this config was not asked for".
+    let cap_list: Vec<RaiseCaps> = match std::env::var("POKER_AI_ESTIMATE_CAPS") {
+        Ok(v) => v
+            .split(';')
+            .filter(|x| !x.trim().is_empty())
+            .map(|x| {
+                x.trim().parse().unwrap_or_else(|e| {
+                    eprintln!("POKER_AI_ESTIMATE_CAPS: {e}");
+                    std::process::exit(2)
+                })
+            })
+            .collect(),
+        Err(_) => (1..=3).map(RaiseCaps::uniform).collect(),
+    };
 
     println!("Blueprint memory — EXACT abstract betting-tree enumeration (real poker-core engine).");
     println!(
@@ -388,17 +404,17 @@ fn main() {
         let players = players as u8;
         println!("── {players}-player ─────────────────────────────────────────────────────────────────────────");
         println!(
-            "{:>7} {:>4}  {:>26}  {:>10}  {:>10}  {:>10}  {:>10}  {:>8}  {:>7}",
+            "{:>7} {:>7}  {:>26}  {:>10}  {:>10}  {:>10}  {:>10}  {:>8}  {:>7}",
             "stack", "cap", "betting nodes pf/f/t/r", "info sets", "slots", "f32 RAM", "lean RAM", "DAG", "walk"
         );
         for &stack_bb in &stacks {
-            for cap in 1..=3u32 {
+            for &cap in &cap_list {
                 let m = enumerate_tree(players, stack_bb, cap, limit, rule);
                 if m.truncated {
                     println!(
-                        "{:>5}bb {:>4}  aborted: > {} public states (raise POKER_AI_ESTIMATE_STATES)",
+                        "{:>5}bb {:>7}  aborted: > {} public states (raise POKER_AI_ESTIMATE_STATES)",
                         stack_bb,
-                        cap,
+                        cap.to_string(),
                         fmt_count(limit as u64)
                     );
                     continue;
@@ -412,9 +428,9 @@ fn main() {
                     .collect::<Vec<_>>()
                     .join("/");
                 println!(
-                    "{:>5}bb {:>4}  {:>26}  {:>10}  {:>10}  {:>10}  {:>10}  {:>8}  {:>6.1}s",
+                    "{:>5}bb {:>7}  {:>26}  {:>10}  {:>10}  {:>10}  {:>10}  {:>8}  {:>6.1}s",
                     stack_bb,
-                    cap,
+                    cap.to_string(),
                     nodes,
                     fmt_count(info_sets),
                     fmt_count(slots),
@@ -446,12 +462,12 @@ mod tests {
     fn walker_reproduces_the_measured_hu_blueprint() {
         // The legacy tree is the one the server measured; the walker must still
         // reproduce it exactly, which pins the shared recursion.
-        let old = enumerate_tree(2, 20, 2, usize::MAX, CapRule::Legacy);
+        let old = enumerate_tree(2, 20, RaiseCaps::uniform(2), usize::MAX, CapRule::Legacy);
         assert!(!old.truncated);
         let (old_info_sets, _) = table_size(&old.counts, [169, 500, 500, 800]);
         assert_eq!(old_info_sets, 5_448_070);
 
-        let m = enumerate_tree(2, 20, 2, usize::MAX, CapRule::AllInAtCap);
+        let m = enumerate_tree(2, 20, RaiseCaps::uniform(2), usize::MAX, CapRule::AllInAtCap);
         assert!(!m.truncated);
         let (info_sets, slots) = table_size(&m.counts, [169, 500, 500, 800]);
         assert_eq!(info_sets, 5_893_436);
@@ -461,18 +477,43 @@ mod tests {
         assert!((0.18e9..0.22e9).contains(&bytes), "got {}", fmt_bytes(bytes as u64));
     }
 
+    /// Per-street caps are exact per street: a cap only bounds decisions made
+    /// on its own street, so lowering the river's leaves every earlier
+    /// street's node count untouched and shrinks the river's.  A uniform
+    /// per-street spec is the scalar cap.
+    #[test]
+    fn per_street_caps_only_change_their_own_street() {
+        let run = |caps| {
+            let m = enumerate_tree(2, 20, caps, usize::MAX, CapRule::AllInAtCap);
+            assert!(!m.truncated);
+            m.counts
+        };
+        let uniform = run(RaiseCaps::uniform(2));
+        assert_eq!(run(RaiseCaps([2, 2, 2, 2])).nodes, uniform.nodes);
+
+        let river1 = run(RaiseCaps([2, 2, 2, 1]));
+        assert_eq!(river1.nodes[..3], uniform.nodes[..3], "pre-river streets unchanged");
+        assert!(river1.nodes[3] < uniform.nodes[3], "river cap 1 has fewer river nodes");
+
+        // Raising only the preflop cap multiplies every later street, since
+        // each preflop line roots its own postflop tree.
+        let pf3 = run(RaiseCaps([3, 2, 2, 2]));
+        assert!(pf3.nodes[0] > uniform.nodes[0]);
+        assert!(pf3.nodes[3] > uniform.nodes[3]);
+    }
+
     /// 6-max plumbing smoke test: micro stacks collapse the tree to a
     /// shove-fest that must terminate quickly with a non-empty pre-flop street.
     #[test]
     fn six_max_walker_terminates_on_micro_stacks() {
-        let m = enumerate_tree(6, 2, 1, usize::MAX, CapRule::AllInAtCap);
+        let m = enumerate_tree(6, 2, RaiseCaps::uniform(1), usize::MAX, CapRule::AllInAtCap);
         assert!(!m.truncated);
         assert!(m.counts.nodes[0] > 0);
     }
 
     #[test]
     fn truncation_is_flagged_not_silent() {
-        let m = enumerate_tree(2, 20, 2, 10, CapRule::AllInAtCap);
+        let m = enumerate_tree(2, 20, RaiseCaps::uniform(2), 10, CapRule::AllInAtCap);
         assert!(m.truncated);
     }
 

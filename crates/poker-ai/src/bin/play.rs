@@ -18,7 +18,8 @@
 //!                      DATA/blueprint_holdem.bin (the path training writes
 //!                      to, so a preserved run needs this)
 //!   --stack-bb=N       blueprint stack depth in bb (default 200 — Slumbot's)
-//!   --cap=N            blueprint raise cap (default 3 — must match training)
+//!   --cap=N            blueprint raise cap (default 3 — must match training);
+//!                      --cap=P,F,T,R for a per-street-capped blueprint
 //!   --no-resolve       blueprint-only (skip the vectorized re-solve entirely)
 //!   --no-resolve-turn  blueprint on the turn (re-solving is ON by default)
 //!   --no-resolve-flop  blueprint on the flop (re-solving is ON by default)
@@ -53,7 +54,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use poker_ai::abstraction::bucket_map::BucketMap;
-use poker_ai::games::blueprint::BlueprintHoldem;
+use poker_ai::games::blueprint::{BlueprintHoldem, RaiseCaps};
 use poker_ai::games::Game;
 use poker_ai::evaluation::vector_br::{all_flops, best_response_value, sample_flops};
 use poker_ai::play::cards::parse_cards;
@@ -71,6 +72,19 @@ const ABSTRACT_SB: u32 = 1;
 
 fn flag<T: std::str::FromStr>(args: &[String], name: &str) -> Option<T> {
     args.iter().find_map(|a| a.strip_prefix(&format!("--{name}="))).and_then(|v| v.parse().ok())
+}
+
+/// `--cap=N` or `--cap=P,F,T,R` (default 3).  Unlike [`flag`], a value that
+/// does not parse exits: a silently defaulted cap loads a differently shaped
+/// game, and the only symptom is a collapsed lookup hit rate.
+fn cap_flag(args: &[String]) -> RaiseCaps {
+    match args.iter().find_map(|a| a.strip_prefix("--cap=")) {
+        None => RaiseCaps::uniform(3),
+        Some(s) => s.parse().unwrap_or_else(|e| {
+            eprintln!("--cap: {e}");
+            std::process::exit(2)
+        }),
+    }
 }
 
 /// Reject unknown flags and stray positionals (shared with the other binaries),
@@ -115,12 +129,12 @@ fn main() {
 /// them; the river-heavy cap-3 tree costs on the order of CPU-hours per
 /// hundred flops — a milestone metric, not a per-checkpoint one.
 ///
-///   play expl [--flops=N|all --seed=S --data=DIR --stack-bb=N --cap=N --policy=PATH]
+///   play expl [--flops=N|all --seed=S --data=DIR --stack-bb=N --cap=N|P,F,T,R --policy=PATH]
 fn run_expl(args: &[String]) {
     validate(args, &["data", "stack-bb", "cap", "policy", "flops", "seed", "board-samples"], 0);
     let dir = PathBuf::from(flag::<String>(args, "data").unwrap_or_else(|| "data".into()));
     let stack_bb: u32 = flag(args, "stack-bb").unwrap_or(200);
-    let cap: u32 = flag(args, "cap").unwrap_or(3);
+    let cap = cap_flag(args);
     let seed: u64 = flag(args, "seed").unwrap_or(1);
     let flops = match flag::<String>(args, "flops").as_deref() {
         Some("all") => all_flops(),
@@ -298,7 +312,7 @@ fn run_chart(args: &[String]) {
     validate(args, &["data", "stack-bb", "cap", "policy"], 0);
     let dir = PathBuf::from(flag::<String>(args, "data").unwrap_or_else(|| "data".into()));
     let stack_bb: u32 = flag(args, "stack-bb").unwrap_or(200);
-    let cap: u32 = flag(args, "cap").unwrap_or(3);
+    let cap = cap_flag(args);
 
     println!("Loading abstraction from {} ({stack_bb}bb, cap-{cap})", dir.display());
     let game = load_game(&dir, stack_bb, cap);
@@ -405,9 +419,9 @@ fn run_chart(args: &[String]) {
 /// Load the abstract game exactly as it was trained (same stack, cap, and
 /// bucket maps) — key compatibility with `data/blueprint_holdem.bin` depends
 /// on all three.
-fn load_game(dir: &Path, stack_bb: u32, cap: u32) -> BlueprintHoldem {
+fn load_game(dir: &Path, stack_bb: u32, cap: RaiseCaps) -> BlueprintHoldem {
     let mut game =
-        BlueprintHoldem::new(stack_bb * ABSTRACT_BB, ABSTRACT_BB, ABSTRACT_SB, 0).with_raise_cap(cap);
+        BlueprintHoldem::new(stack_bb * ABSTRACT_BB, ABSTRACT_BB, ABSTRACT_SB, 0).with_raise_caps(cap);
     for (street, name) in ["flop_buckets.bin", "turn_buckets.bin", "river_buckets.bin"]
         .iter()
         .enumerate()
@@ -434,7 +448,7 @@ fn load_game(dir: &Path, stack_bb: u32, cap: u32) -> BlueprintHoldem {
 /// configuring different bots and producing incomparable numbers.
 fn build_bot(args: &[String], dir: &Path) -> Bot {
     let stack_bb: u32 = flag(args, "stack-bb").unwrap_or(200);
-    let cap: u32 = flag(args, "cap").unwrap_or(3);
+    let cap = cap_flag(args);
     let continuations: Vec<f64> = flag::<String>(args, "continuations")
         .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect::<Vec<f64>>())
         .filter(|v| !v.is_empty())

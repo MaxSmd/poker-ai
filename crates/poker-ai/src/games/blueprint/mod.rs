@@ -57,18 +57,78 @@ pub struct BlueprintHoldem {
     /// Dense hand indexers per post-flop street (`[2,3] / [2,4] / [2,5]`), used
     /// for the unabstracted fallback key when a street has no bucket map.
     indexers: [HandIndexer; 3],
-    /// Maximum number of **raises per street** the betting abstraction allows.
+    /// Maximum number of **raises per street** the betting abstraction allows,
+    /// set separately for each street.
     /// This is the dominant tree-size / memory lever (see `memory_estimate`):
     /// `poker_core` itself caps nothing (it re-offers reraises until stacks
     /// deplete), so bounding it is a blueprint-abstraction choice that lives
-    /// here, not in the faithful engine.  `u32::MAX` (the `new` default) means
-    /// uncapped — identical to the raw engine behaviour.
-    raise_cap: u32,
+    /// here, not in the faithful engine.  [`RaiseCaps::UNCAPPED`] (the `new`
+    /// default) is identical to the raw engine behaviour.
+    raise_caps: RaiseCaps,
     /// Dense info-set indexing for the flat SoA regret store, built by
     /// [`with_indexing`](BlueprintHoldem::with_indexing).  `None` until then;
     /// only the `HashMap`-keyed [`Game`]/[`crate::games::CursorGame`] paths work without
     /// it.  Present ⇒ the game also implements [`crate::games::IndexedGame`].
     indexing: Option<Indexing>,
+}
+
+/// Raises allowed per street, indexed `preflop = 0, flop = 1, turn = 2,
+/// river = 3` (the engine's `GameState::street`).
+///
+/// Separate caps exist because a street's betting nodes cost very different
+/// amounts: at 200 bb a river node multiplies into ~75× the info sets of a
+/// flop node, and a resolved street barely needs a blueprint at all.  Parsed
+/// from `"2"` (every street) or `"4,3,2,1"` (per street); prints the same way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RaiseCaps(pub [u32; 4]);
+
+impl RaiseCaps {
+    /// No cap on any street — the raw engine tree.
+    pub const UNCAPPED: RaiseCaps = RaiseCaps([u32::MAX; 4]);
+
+    /// The same cap on every street.  `0` is treated as `1` (at least the
+    /// opening raise must stay legal or the tree degenerates to check/call).
+    pub fn uniform(cap: u32) -> Self {
+        RaiseCaps([cap.max(1); 4])
+    }
+
+    /// The cap on `street`.  Terminal (`4`) has no decisions, so it maps to
+    /// the river's cap rather than panicking.
+    pub fn at(&self, street: u8) -> u32 {
+        self.0[(street as usize).min(3)]
+    }
+
+    /// Whether every street is capped — required for the dense SoA index.
+    pub fn is_finite(&self) -> bool {
+        self.0.iter().all(|&c| c != u32::MAX)
+    }
+}
+
+impl std::str::FromStr for RaiseCaps {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        let parts: Vec<u32> = s
+            .split(',')
+            .map(|p| p.trim().parse::<u32>().map_err(|_| format!("bad raise cap {p:?} in {s:?}")))
+            .collect::<Result<_, _>>()?;
+        match parts[..] {
+            [c] => Ok(Self::uniform(c)),
+            [p, f, t, r] => Ok(RaiseCaps([p.max(1), f.max(1), t.max(1), r.max(1)])),
+            _ => Err(format!("raise caps {s:?}: give one cap or four (preflop,flop,turn,river)")),
+        }
+    }
+}
+
+impl std::fmt::Display for RaiseCaps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let [p, fl, t, r] = self.0;
+        if p == fl && fl == t && t == r {
+            write!(f, "{p}")
+        } else {
+            write!(f, "{p},{fl},{t},{r}")
+        }
+    }
 }
 
 /// A node: the pre-deal chance root (`gs == None`) or a play node wrapping a
@@ -78,7 +138,7 @@ pub struct BlueprintState {
     gs: Option<GameState>,
     history: Vec<u8>,
     /// Raises made so far on the **current** street (resets each street) — drives
-    /// the [`BlueprintHoldem::raise_cap`] betting abstraction.
+    /// the [`BlueprintHoldem::raise_caps`] betting abstraction.
     street_raises: u8,
 }
 
@@ -118,7 +178,7 @@ impl BlueprintHoldem {
                 HandIndexer::new(&[2, 4]),
                 HandIndexer::new(&[2, 5]),
             ],
-            raise_cap: u32::MAX,
+            raise_caps: RaiseCaps::UNCAPPED,
             indexing: None,
         }
     }
@@ -136,8 +196,21 @@ impl BlueprintHoldem {
     /// `0` is treated as `1` (at least the opening raise must stay legal or the
     /// tree degenerates to check/call only).
     pub fn with_raise_cap(mut self, cap: u32) -> Self {
-        self.raise_cap = cap.max(1);
+        self.raise_caps = RaiseCaps::uniform(cap);
         self
+    }
+
+    /// Cap each street separately (see [`RaiseCaps`]).  With equal caps this
+    /// is exactly [`with_raise_cap`](Self::with_raise_cap), so a uniform
+    /// `RaiseCaps` builds the same tree and keys as the scalar form.
+    pub fn with_raise_caps(mut self, caps: RaiseCaps) -> Self {
+        self.raise_caps = caps;
+        self
+    }
+
+    /// The per-street raise caps this game was built with.
+    pub fn raise_caps(&self) -> RaiseCaps {
+        self.raise_caps
     }
 
     /// Build the dense info-set `Indexing` so the game can drive the flat SoA
@@ -153,8 +226,9 @@ impl BlueprintHoldem {
     /// [`with_street_bucket`](BlueprintHoldem::with_street_bucket).
     pub fn with_indexing(mut self) -> Self {
         assert!(
-            self.raise_cap != u32::MAX,
-            "SoA indexing needs a finite raise cap (call with_raise_cap first); \
+            self.raise_caps.is_finite(),
+            "SoA indexing needs a finite raise cap on every street (call \
+             with_raise_cap or with_raise_caps first); \
              the uncapped betting tree is unbounded"
         );
         assert!(
@@ -179,10 +253,11 @@ impl BlueprintHoldem {
     /// under opponent aggression: a shove past the cap could not be translated
     /// at all, and the playing agent was left with no node to act from.
     fn capped_legal(&self, gs: &GameState, street_raises: u8) -> ActionList {
-        Self::capped_legal_at(gs, street_raises, self.raise_cap)
+        Self::capped_legal_at(gs, street_raises, self.raise_caps.at(gs.street))
     }
 
-    /// The raise-cap filter as a pure function of `(state, raise count, cap)`.
+    /// The raise-cap filter as a pure function of `(state, raise count, cap)`,
+    /// where `raise_cap` is the cap for `gs`'s street.
     /// Public so `bin/memory_estimate` enumerates the tree with **this exact
     /// policy** rather than a copy that could drift from the trained game.
     pub fn capped_legal_at(gs: &GameState, street_raises: u8, raise_cap: u32) -> ActionList {

@@ -154,6 +154,85 @@ fn raise_cap_removes_sized_raises_but_never_the_all_in() {
     assert!(uncapped.capped_legal(&gs, 9).iter().any(|a| matches!(a, Action::Raise(_))));
 }
 
+#[test]
+fn raise_caps_parse_one_cap_or_four_and_print_back() {
+    assert_eq!("2".parse::<RaiseCaps>(), Ok(RaiseCaps([2; 4])));
+    assert_eq!("4,3,2,1".parse::<RaiseCaps>(), Ok(RaiseCaps([4, 3, 2, 1])));
+    assert_eq!(" 4, 3 ,2,1".parse::<RaiseCaps>(), Ok(RaiseCaps([4, 3, 2, 1])));
+    // 0 means 1, as with_raise_cap always did: the opening raise stays legal.
+    assert_eq!("0".parse::<RaiseCaps>(), Ok(RaiseCaps([1; 4])));
+    assert_eq!("3,0,2,1".parse::<RaiseCaps>(), Ok(RaiseCaps([3, 1, 2, 1])));
+    for bad in ["", "x", "1,2", "1,2,3", "1,2,3,4,5", "-1"] {
+        assert!(bad.parse::<RaiseCaps>().is_err(), "{bad:?} must not parse");
+    }
+    // A uniform cap prints as the scalar every earlier run and log used.
+    assert_eq!(RaiseCaps::uniform(2).to_string(), "2");
+    assert_eq!(RaiseCaps([4, 3, 2, 1]).to_string(), "4,3,2,1");
+    assert!(!RaiseCaps::UNCAPPED.is_finite());
+    assert!(RaiseCaps([4, 3, 2, 1]).is_finite());
+}
+
+/// Each street reads its own cap: a river cap of 1 removes the river re-raise
+/// while the preflop, capped at 3, still offers one after the same one raise.
+#[test]
+fn per_street_caps_apply_to_their_own_street() {
+    let per_street = BlueprintHoldem::new(400, 2, 1, 0).with_raise_caps(RaiseCaps([3, 3, 3, 1]));
+    let uniform = BlueprintHoldem::new(400, 2, 1, 0).with_raise_cap(3);
+    let holes = [[make_card(12, 0), make_card(11, 0)], [make_card(5, 1), make_card(5, 2)]];
+    let board = [make_card(2, 3), make_card(7, 2), make_card(9, 1), make_card(0, 0), make_card(3, 3)];
+
+    let index_of = |game: &BlueprintHoldem, st: &BlueprintState, want: fn(&Action) -> bool| {
+        game.actions(st).iter().position(want).unwrap_or_else(|| panic!("no such action in {:?}", game.actions(st)))
+    };
+    let is_raise = |a: &Action| matches!(a, Action::Raise(_));
+    let is_passive = |a: &Action| matches!(a, Action::Call | Action::Check);
+
+    // After one preflop raise, both games still allow a re-raise (cap 3).
+    for game in [&per_street, &uniform] {
+        let st = game.play_state(holes, board);
+        let st = game.apply(&st, index_of(game, &st, is_raise));
+        assert!(game.actions(&st).iter().any(is_raise), "preflop re-raise under cap 3");
+    }
+
+    // Call/check down to the river, then open-bet once.
+    let river_after_bet = |game: &BlueprintHoldem| {
+        let mut st = game.play_state(holes, board);
+        while game.game_state(&st).street < 3 {
+            st = game.apply(&st, index_of(game, &st, is_passive));
+        }
+        game.apply(&st, index_of(game, &st, is_raise))
+    };
+    let st = river_after_bet(&per_street);
+    let acts = per_street.actions(&st);
+    assert!(acts.iter().all(|a| !is_raise(a)), "river capped at 1: no sized re-raise, got {acts:?}");
+    assert!(acts.iter().any(|a| matches!(a, Action::AllIn)), "all-in survives the cap, got {acts:?}");
+    let st = river_after_bet(&uniform);
+    assert!(uniform.actions(&st).iter().any(is_raise), "uniform cap 3 still re-raises on the river");
+}
+
+/// A uniform `RaiseCaps` is the scalar cap: same menus, so same keys and
+/// the same trained artifact.  Checked along a whole call-down line.
+#[test]
+fn uniform_raise_caps_match_the_scalar_cap() {
+    let a = BlueprintHoldem::new(400, 2, 1, 0).with_raise_cap(2);
+    let b = BlueprintHoldem::new(400, 2, 1, 0).with_raise_caps(RaiseCaps::uniform(2));
+    let holes = [[make_card(12, 0), make_card(11, 0)], [make_card(5, 1), make_card(5, 2)]];
+    let board = [make_card(2, 3), make_card(7, 2), make_card(9, 1), make_card(0, 0), make_card(3, 3)];
+    let (mut sa, mut sb) = (a.play_state(holes, board), b.play_state(holes, board));
+    // Raise wherever possible, else take the last action: walks through the
+    // cap on every street and ends the hand.
+    while !a.is_terminal(&sa) {
+        let (ma, mb) = (a.actions(&sa), b.actions(&sb));
+        assert_eq!(ma.iter().collect::<Vec<_>>(), mb.iter().collect::<Vec<_>>());
+        assert_eq!(a.info_key(&sa), b.info_key(&sb));
+        let i = ma.iter().position(|x| matches!(x, Action::Raise(_))).unwrap_or(ma.len() - 1);
+        let i = if matches!(ma[i], Action::AllIn) { ma.iter().position(|x| matches!(x, Action::Call | Action::Check)).unwrap() } else { i };
+        sa = a.apply(&sa, i);
+        sb = b.apply(&sb, i);
+    }
+    assert!(b.is_terminal(&sb));
+}
+
 /// The property the fix exists for: from any node, however many raises have
 /// already gone in, the acting player can still put the rest of the stack
 /// in.  Nothing an opponent does can leave the abstraction without an

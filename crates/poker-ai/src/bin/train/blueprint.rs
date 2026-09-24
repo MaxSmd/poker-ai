@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use poker_ai::abstraction::bucket_map::BucketMap;
-use poker_ai::games::blueprint::BlueprintHoldem;
+use poker_ai::games::blueprint::{BlueprintHoldem, RaiseCaps};
 use poker_ai::play::policy::write_policy;
 use poker_ai::solver::variant::Variant;
 use poker_ai::solver::dcfr::Discount;
@@ -17,12 +17,35 @@ use poker_ai::solver::mccfr::Mccfr;
 use crate::harness::{run_chunked, CursorTrainer, SoaMode, SoaTrainer};
 use crate::{data_dir, emit_metric, parse_cadence, BIG_BLIND, SMALL_BLIND};
 
+/// `--cap=N` (every street) or `--cap=P,F,T,R` (per street), default 1.  A
+/// value that does not parse exits rather than silently training cap-1.
+fn parse_caps(args: &[String]) -> RaiseCaps {
+    match args.iter().find_map(|a| a.strip_prefix("--cap=")) {
+        None => RaiseCaps::uniform(1),
+        Some(s) => s.parse().unwrap_or_else(|e| {
+            eprintln!("--cap: {e}");
+            std::process::exit(2)
+        }),
+    }
+}
+
+/// The `raise_cap` W&B config value: a number for a uniform cap, as every
+/// earlier run logged it, and a string for per-street caps.
+fn cap_metric(cap: RaiseCaps) -> String {
+    let text = cap.to_string();
+    if text.contains(',') {
+        format!("{text:?}")
+    } else {
+        text
+    }
+}
+
 /// Build the blueprint game at `stack` chips and `cap` raises/street, with every
 /// per-street `{flop,turn,river}_buckets.bin` map found in `dir`
 /// attached (a missing map leaves that street unabstracted — correct, but its
 /// info sets won't plateau, which is the signal that the abstraction is needed).
-pub fn load_blueprint_game(dir: &Path, stack: u32, cap: u32, verbose: bool) -> BlueprintHoldem {
-    let mut game = BlueprintHoldem::new(stack, BIG_BLIND, SMALL_BLIND, 0).with_raise_cap(cap);
+pub fn load_blueprint_game(dir: &Path, stack: u32, cap: RaiseCaps, verbose: bool) -> BlueprintHoldem {
+    let mut game = BlueprintHoldem::new(stack, BIG_BLIND, SMALL_BLIND, 0).with_raise_caps(cap);
     for (street, name) in [(0usize, "flop"), (1, "turn"), (2, "river")] {
         let path = dir.join(format!("{name}_buckets.bin"));
         match BucketMap::load(&path) {
@@ -52,7 +75,8 @@ pub fn load_blueprint_game(dir: &Path, stack: u32, cap: u32, verbose: bool) -> B
 ///
 /// ```text
 /// train blueprint [iters] [stack_bb] [seed] [flags]
-///   --cap=N            raises per street (default 1)
+///   --cap=N            raises per street (default 1); --cap=P,F,T,R sets
+///                      preflop/flop/turn/river separately
 ///   --soa              flat SoA regret store (~10× smaller; needs full-coverage
 ///                      maps + finite cap)
 ///   --optimistic       predictive regret updates (serial path only; not --soa)
@@ -78,8 +102,7 @@ pub fn run_blueprint(args: &[String]) {
     let stack = stack_bb * BIG_BLIND;
 
     let flag = |name: &str| args.iter().any(|a| a == name);
-    let cap: u32 =
-        args.iter().find_map(|a| a.strip_prefix("--cap=")).and_then(|s| s.parse().ok()).unwrap_or(1);
+    let cap = parse_caps(args);
     let parallel_batch = args.iter().find_map(|a| {
         a.strip_prefix("--parallel")
             .map(|rest| rest.strip_prefix('=').and_then(|b| b.parse().ok()).unwrap_or(256))
@@ -125,7 +148,7 @@ pub fn run_blueprint(args: &[String]) {
             ("iters", iters.to_string()),
             ("stack_bb", stack_bb.to_string()),
             ("seed", seed.to_string()),
-            ("raise_cap", cap.to_string()),
+            ("raise_cap", cap_metric(cap)),
             ("resume", resume.to_string()),
             ("features", format!("{feat:?}")),
         ],
@@ -163,8 +186,7 @@ pub fn run_blueprint_soa(args: &[String]) {
     let seed: u64 = nums.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
     let stack = stack_bb * BIG_BLIND;
 
-    let cap: u32 =
-        args.iter().find_map(|a| a.strip_prefix("--cap=")).and_then(|s| s.parse().ok()).unwrap_or(1);
+    let cap = parse_caps(args);
     let parallel_batch = args.iter().find_map(|a| {
         a.strip_prefix("--parallel")
             .map(|rest| rest.strip_prefix('=').and_then(|b| b.parse().ok()).unwrap_or(256))
@@ -213,7 +235,7 @@ pub fn run_blueprint_soa(args: &[String]) {
             ("iters", iters.to_string()),
             ("stack_bb", stack_bb.to_string()),
             ("seed", seed.to_string()),
-            ("raise_cap", cap.to_string()),
+            ("raise_cap", cap_metric(cap)),
             ("info_sets", solver.capacity().to_string()),
             ("resume", resume.to_string()),
             ("features", format!("{feat:?}")),

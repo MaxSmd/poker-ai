@@ -164,7 +164,7 @@ train [iters] [stack_bb] [seed]            push/fold trainer (HashMap path)
       --chunk=N --expl-every=N             progress/checkpoint/eval cadence
       --data=DIR                           artifact directory (default data/)
 train blueprint [iters] [stack] [seed]     full HU blueprint
-      --cap=N --soa --atomic --data=DIR    (see README §3; measure with play expl)
+      --cap=N|P,F,T,R --soa --atomic --data=DIR    (see README §3; measure with play expl)
 train compare                              before/after table of the refinements
 cluster [cap] [seed] [flop turn river]     card abstraction build
       --data=DIR                           output directory (default data/)
@@ -172,8 +172,10 @@ cluster [cap] [seed] [flop turn river]     card abstraction build
       POKER_AI_RIVER_OCHS=1                OCHS river feature
 memory_estimate [flop turn river]          exact footprint matrix (2p + 6-max)
       POKER_AI_ESTIMATE_STATES=N           betting-tree memo cap
+      POKER_AI_ESTIMATE_CAPS="2;3;3,2,2,1" cap rows (per-street specs allowed)
 play slumbot [hands]                       live match vs slumbot.com (raw + luck-adjusted bb/100 ± CI)
-      --no-resolve --resolve-turn --resolve-flop --turn-checkdown --no-continual
+      --cap=N|P,F,T,R --no-resolve --no-resolve-turn --no-resolve-flop
+      --turn-full-river --runout-sample=N --no-continual
       --iters=N --turn-iters=N --river-cap=N --continuations=L --purify=X --seed=N
       --log-hands=PATH --token=T | --username=U --password=P
 play expl                                  abstract-game exploitability (vectorized BR)

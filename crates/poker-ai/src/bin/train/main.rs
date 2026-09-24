@@ -36,7 +36,7 @@
 //!   Trains the full abstracted heads-up NLHE blueprint, loading the
 //!   `cluster`-built card abstraction from data/ and capping the betting
 //!   abstraction at `--cap=N` raises/street (default 1 — the memory
-//!   feasibility lever).
+//!   feasibility lever; `--cap=P,F,T,R` caps each street separately).
 //! ```
 //!
 //! See [`blueprint::run_blueprint`] for the full `train blueprint` flag list,

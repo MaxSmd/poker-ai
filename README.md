@@ -126,7 +126,10 @@ cores — and everything it produced are in
 [docs/summary.md](docs/summary.md#headline-results). Keep the numbers there and
 cite them from here; two copies drift.
 
-- `--cap=N` — betting abstraction: max raises per street (the tree-size lever)
+- `--cap=N` — betting abstraction: max raises per street (the tree-size lever);
+  `--cap=P,F,T,R` caps preflop/flop/turn/river separately. Size a per-street
+  tree first with `POKER_AI_ESTIMATE_CAPS="3,2,2,1" memory_estimate`, and pass
+  the same `--cap` to every `play` command.
 - `--soa` — flat structure-of-arrays regret store (12 B per (info set, action)
   slot — 24 B/info set at 2 actions — vs ~350 B/info set on the HashMap path;
   all three accumulators `f32`, the strategy sum accumulated with stochastic
