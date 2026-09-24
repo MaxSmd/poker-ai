@@ -231,6 +231,9 @@ fn a_desynced_bot_folds_trash_and_calls_a_monster() {
     let board = cards(&["2c", "7h", "9s"]);
     for (hole, expected) in [(["3d", "4d"], "f"), (["Ac", "Ad"], "c")] {
         let mut b = bot(false);
+        // Pin the pot-odds fallback itself; by default a desynced postflop
+        // spot is re-solved instead (next test).
+        b.cfg.resolve_desynced = false;
         let h = [parse_card(hole[0]).unwrap(), parse_card(hole[1]).unwrap()];
         let mut hs = b.start_hand(1, h);
 
@@ -270,6 +273,7 @@ fn resolve_bot(turn: bool, flop: bool, continuations: Vec<f64>) -> Bot {
             // so they should not also depend on the sampling schedule.
             runout_sample: 0,
             continual: true,
+            resolve_desynced: true,
             purify: 0.0,
             seed: 42,
         },
@@ -342,4 +346,92 @@ fn facing_a_river_shove_resolves_to_a_legal_response() {
     let incr = b.act(&mut hs, action, &board).expect("shove response");
     assert!(incr == "c" || incr == "f", "call or fold vs a shove, got {incr:?}");
     assert!(parse_action(&format!("{action}{incr}")).is_ok());
+}
+
+/// After a re-solved decision our range is conditioned on the strategy the
+/// resolve played, not the blueprint's.  The blueprint here is uniform, so
+/// the old blueprint-likelihood update left the range exactly as it was; a
+/// river resolve mixes differently across hands, so the new one reshapes it.
+/// The carry is then taken at the chosen child and must exist for any
+/// non-fold action.
+#[test]
+fn resolved_decision_updates_our_range_from_the_resolve() {
+    let mut b = bot(true);
+    b.cfg.continual = true;
+    let hole = [parse_card("Ac").unwrap(), parse_card("Kd").unwrap()];
+    let mut hs = b.start_hand(0, hole); // BB, first to act postflop
+    let action = "b200c/kk/kk/";
+    let board = cards(&["Qs", "4s", "3h", "Th", "8c"]);
+    b.sync(&mut hs, &parse_action(action).unwrap(), &board);
+    let before = hs.ranges[hs.my_seat].probs.clone();
+
+    let incr = b.act(&mut hs, action, &board).expect("river decision");
+    assert!(incr == "k" || incr.starts_with('b'), "unopened river: check or bet, got {incr:?}");
+
+    let after = &hs.ranges[hs.my_seat].probs;
+    let total: f64 = after.iter().sum();
+    assert!((total - 1.0).abs() < 1e-9, "range stays normalized, sums to {total}");
+    let reshaped = before
+        .iter()
+        .zip(after)
+        .filter(|(&p, _)| p > 0.0)
+        .any(|(&p, &q)| (q / p - 1.0).abs() > 1e-3);
+    assert!(reshaped, "the resolve's strategy must reshape our range");
+    assert!(hs.carried_cfvs.is_some(), "a check or bet leaves a carry for the next resolve");
+}
+
+/// A desynced postflop spot is re-solved even when that street's re-solving
+/// is off: the abstraction has no node there, so the blueprint cannot play
+/// it and the pot-odds fallback never raises.  The carry the resolve leaves
+/// behind is the observable that the resolver, not the fallback, decided.
+#[test]
+fn a_desynced_flop_spot_is_resolved_even_with_flop_resolving_off() {
+    let action = "b250b750b1657b6750c/b13250";
+    let board = cards(&["2c", "7h", "9s"]);
+    let mut b = resolve_bot(false, false, vec![0.0]);
+    b.cfg.turn_iters = 20;
+    b.cfg.runout_sample = 8;
+    let h = [parse_card("Ac").unwrap(), parse_card("Ad").unwrap()];
+    let mut hs = b.start_hand(1, h);
+    let incr = b.act(&mut hs, action, &board).expect("bot acts");
+    assert!(parse_action(&format!("{action}{incr}")).is_ok(), "legal response, got {incr:?}");
+    assert!(hs.carried_cfvs.is_some(), "the desynced spot went through the resolver");
+    let t = b.tracking_counts();
+    assert_eq!(t.desynced_decisions, 1);
+    // The flop shove arrives after the abstract hand ended: skipped, and
+    // counted — the case the counters used to report as 0%.
+    assert!(t.unmapped_events >= 1, "skipped events must be counted, got {t}");
+
+    // The blueprint-only ablation keeps the fallback.
+    let mut b = resolve_bot(false, false, vec![0.0]);
+    b.cfg.resolve_desynced = false;
+    let mut hs = b.start_hand(1, h);
+    b.act(&mut hs, action, &board).expect("bot acts");
+    assert!(hs.carried_cfvs.is_none(), "--no-resolve must not re-solve");
+    assert_eq!(b.tracking_counts().desynced_decisions, 1);
+}
+
+/// The carry lives within a street.  After a turn decision it exists (the
+/// opponent acts next, same street); the river card drops it, because it
+/// averaged over that card and bounds no specific one; the river's first
+/// resolve then bootstraps a fresh carry.
+#[test]
+fn the_carry_is_dropped_at_a_street_change() {
+    let mut b = resolve_bot(true, false, vec![0.0]);
+    b.cfg.resolve_river = true;
+    b.cfg.river_iters = 60;
+    let hole = [parse_card("Ac").unwrap(), parse_card("Kd").unwrap()];
+    let mut hs = b.start_hand(0, hole); // BB, first to act postflop
+    let turn = "b200c/kk/";
+    let incr = b.act(&mut hs, turn, &cards(&["Qs", "4s", "3h", "Th"])).expect("turn decision");
+    assert!(hs.carried_cfvs.is_some(), "the opponent acts next on the turn: carry kept");
+
+    // The opponent closes the turn (checks behind, or calls our bet).
+    let river = if incr == "k" { format!("{turn}kk/") } else { format!("{turn}{incr}c/") };
+    let river_board = cards(&["Qs", "4s", "3h", "Th", "8c"]);
+    b.sync(&mut hs, &parse_action(&river).unwrap(), &river_board);
+    assert!(hs.carried_cfvs.is_none(), "the river card must drop the turn's carry");
+
+    b.act(&mut hs, &river, &river_board).expect("river decision");
+    assert!(hs.carried_cfvs.is_some(), "the river's bootstrap resolve leaves a new carry");
 }

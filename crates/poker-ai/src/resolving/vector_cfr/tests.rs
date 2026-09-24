@@ -897,3 +897,70 @@ fn full_river_strategies_are_valid_distributions() {
         assert!(probs.iter().all(|&p| p >= 0.0), "no negative probabilities");
     }
 }
+
+/// The carry after our action is the opponent's value at the chosen child,
+/// and the children partition the root: for every opponent hand, the root
+/// CFV times our reach mass equals the sum over our actions of each child's
+/// CFV times the mass of our hands taking that action.  Pins
+/// `opponent_cfvs_after` to the same extraction as `opponent_cfvs`, and
+/// shows the child values really differ from the root's — carrying the root
+/// forward (the old behavior) constrains the next resolve with the wrong
+/// numbers.
+#[test]
+fn child_carries_decompose_the_root_carry() {
+    let beliefs = duel_ranges();
+    let root = public_root(river_board(), 20);
+    let me = root.current_player();
+    let mut solver = VectorCfr::new(&root, &beliefs);
+    solver.run(1_000);
+    let root_cfvs = solver.opponent_cfvs();
+    let resolved = solver.resolved();
+
+    let board = root.board;
+    let my_reach = &beliefs[me];
+    let mut reach_me = [0.0f64; NUM_COMBOS];
+    for (i, r) in reach_me.iter_mut().enumerate() {
+        let [a, b] = combo_cards(i);
+        *r = my_reach.prob(a, b);
+    }
+    let n_actions = resolved
+        .strategy
+        .get(&subgame_info_key(me, combo_cards(reach_me.iter().position(|&r| r > 0.0).unwrap()), &board, &[]))
+        .expect("our root info set is emitted")
+        .len();
+    assert!(n_actions >= 2);
+
+    let mut sum = [0.0f64; NUM_COMBOS];
+    let mut any_differs = false;
+    for a in 0..n_actions {
+        let mut played = [0.0f64; NUM_COMBOS];
+        for (h, p) in played.iter_mut().enumerate() {
+            if let Some(probs) = resolved.strategy.get(&subgame_info_key(me, combo_cards(h), &board, &[])) {
+                *p = probs[a];
+            }
+        }
+        let Some(child) = solver.opponent_cfvs_after(a, &played) else { continue };
+        let mut weighted = reach_me;
+        for (w, &p) in weighted.iter_mut().zip(&played) {
+            *w *= p;
+        }
+        let mass_a = valid_reach(&board, &weighted);
+        for o in 0..NUM_COMBOS {
+            sum[o] += child[o] * mass_a[o];
+            if mass_a[o] > 1e-9 && (child[o] - root_cfvs[o]).abs() > 1e-3 {
+                any_differs = true;
+            }
+        }
+    }
+    let mass = valid_reach(&board, &reach_me);
+    let opp_reach = &beliefs[1 - me];
+    for o in 0..NUM_COMBOS {
+        let [a, b] = combo_cards(o);
+        if opp_reach.prob(a, b) <= 0.0 || mass[o] <= 0.0 {
+            continue;
+        }
+        let whole = root_cfvs[o] * mass[o];
+        assert!((whole - sum[o]).abs() < 1e-6, "hand {o}: root {whole} vs children {}", sum[o]);
+    }
+    assert!(any_differs, "child values should differ from the root's somewhere");
+}

@@ -17,7 +17,7 @@ use crate::play::protocol::{EventKind, Parsed, BIG_BLIND, SMALL_BLIND, STACK_SIZ
 use crate::play::tracker::{MapOutcome, RealMove};
 use crate::resolving::belief_state::{combo_cards, combo_index, NUM_COMBOS};
 use crate::resolving::vector_cfr::{
-    capped_root_actions, subgame_info_key, VectorCfr,
+    capped_root_actions, subgame_info_key, VectorCfr, VectorResolved,
 };
 
 impl Bot {
@@ -27,10 +27,7 @@ impl Bot {
         let facing = parsed.last_bet_size > 0;
         if !hs.hand.expects(&self.game, hs.my_seat, parsed.street) {
             // No abstract node for this spot: the opponent raised past the
-            // blueprint's cap.  Counted, because a high rate here means the
-            // agent is off its tree rather than playing its strategy badly —
-            // a different diagnosis with a different fix.
-            self.tracking.desynced_decisions += 1;
+            // blueprint's cap.  (Counted in `act`, which sees every decision.)
             hs.pending_self = Some(None);
             return self.decide_desynced(hs, parsed, board);
         }
@@ -156,18 +153,15 @@ impl Bot {
             )
         };
         // Continual re-solving: constrain by the opponent CFVs carried from
-        // our previous resolve this hand (the first resolve bootstraps), then
-        // refresh the carry from the new solution.
+        // our previous resolve this hand (the first resolve bootstraps).  The
+        // carry is refreshed below, once our action is known.
         if self.cfg.continual {
             if let Some(cfvs) = &hs.carried_cfvs {
                 solver = solver.with_opponent_gadget(*cfvs.clone());
             }
         }
         solver.run(iters);
-        if self.cfg.continual {
-            hs.carried_cfvs = Some(Box::new(solver.opponent_cfvs()));
-        }
-        let resolved = solver.into_resolved();
+        let resolved = solver.resolved();
 
         let mut hole = hs.my_hole;
         hole.sort_unstable();
@@ -178,12 +172,30 @@ impl Bot {
         let key = subgame_info_key(hs.my_seat, hole, &board5, &[]);
         let Some(probs) = resolved.strategy.get(&key).cloned() else {
             // Unreached in the resolve (shouldn't happen with the floor):
-            // degrade to the blueprint.
+            // degrade to the blueprint.  Its action is not this resolve's, so
+            // no carry describes it — the next resolve bootstraps.
+            hs.carried_cfvs = None;
             return self.decide_blueprint(hs, parsed, board);
         };
 
-        let idx = self.sample(&probs);
+        let idx = self.draw(&self.play_distribution(&probs));
         let action = acts[idx];
+
+        // Every later resolve this hand starts from our range, so it must be
+        // conditioned on the strategy we actually played — this resolve's,
+        // purified as sampled — not on the blueprint's likelihood of the
+        // nearest abstract action, which is a different strategy on every
+        // re-solved street.  The carry is taken at the child we chose, with
+        // the same likelihood, so the two describe one strategy.
+        let likelihood = self.resolve_likelihood(&resolved, hs.my_seat, &board5, idx);
+        if self.cfg.continual {
+            hs.carried_cfvs = solver.opponent_cfvs_after(idx, &likelihood).map(Box::new);
+        }
+        let mut updated = hs.ranges[hs.my_seat].clone();
+        updated.update(&likelihood);
+        if updated.probs.iter().any(|&p| p > 0.0) {
+            hs.ranges[hs.my_seat] = updated;
+        }
 
         // Keep the abstract tracker and our range coherent with what we do:
         // map the real move back into the abstract game as if observed.
@@ -230,7 +242,7 @@ impl Bot {
             );
             self.rng = rng;
             if let MapOutcome::Index(i) = mapped {
-                self.update_range(hs, hs.my_seat, i);
+                // Tracker only: our range was already updated from the resolve.
                 hs.hand.apply(&self.game, i);
                 hs.pending_self = Some(Some(i));
             } else {
@@ -293,29 +305,68 @@ impl Bot {
 
     /// Purify + sample an action index from a distribution.
     fn sample(&mut self, probs: &[f64]) -> usize {
+        let played = self.play_distribution(probs);
+        self.draw(&played)
+    }
+
+    /// The distribution [`sample`](Self::sample) actually draws from:
+    /// actions below `purify` dropped and the rest renormalized, or the
+    /// argmax alone when purification drops everything.  Exposed separately
+    /// because range updates must use what was played, not what was solved.
+    pub(super) fn play_distribution(&self, probs: &[f64]) -> Vec<f64> {
         let mut kept: Vec<f64> = probs.iter().map(|&p| if p < self.cfg.purify { 0.0 } else { p }).collect();
         let total: f64 = kept.iter().sum();
         if total <= 0.0 {
-            // Everything purified away: play the argmax.
-            return probs
+            let argmax = probs
                 .iter()
                 .enumerate()
                 .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
                 .map(|(i, _)| i)
                 .unwrap_or(0);
+            let mut one_hot = vec![0.0; probs.len()];
+            if let Some(p) = one_hot.get_mut(argmax) {
+                *p = 1.0;
+            }
+            return one_hot;
         }
         for p in &mut kept {
             *p /= total;
         }
-        let draw = self.unit();
+        kept
+    }
+
+    /// Draw an index from an already-normalized distribution.
+    fn draw(&mut self, dist: &[f64]) -> usize {
+        let u = self.unit();
         let mut acc = 0.0;
-        for (i, &p) in kept.iter().enumerate() {
+        for (i, &p) in dist.iter().enumerate() {
             acc += p;
-            if draw < acc {
+            if u < acc {
                 return i;
             }
         }
-        kept.len() - 1
+        dist.len().saturating_sub(1)
+    }
+
+    /// Each of our hands' probability of playing root action `idx` under a
+    /// resolve's strategy, purified as [`sample`](Self::sample) would play it —
+    /// the Bayes likelihood for our own range after a re-solved decision.
+    /// Hands the resolve never reached get 0: they carry no range mass.
+    fn resolve_likelihood(
+        &self,
+        resolved: &VectorResolved,
+        seat: usize,
+        board5: &[u8; 5],
+        idx: usize,
+    ) -> [f64; NUM_COMBOS] {
+        let mut out = [0.0; NUM_COMBOS];
+        for (h, l) in out.iter_mut().enumerate() {
+            let key = subgame_info_key(seat, combo_cards(h), board5, &[]);
+            if let Some(probs) = resolved.strategy.get(&key) {
+                *l = self.play_distribution(probs).get(idx).copied().unwrap_or(0.0);
+            }
+        }
+        out
     }
 
     pub fn game(&self) -> &BlueprintHoldem {

@@ -3,10 +3,14 @@
 
 The blueprint's betting tree allows at most `--cap` bet-increases per street
 (`BlueprintHoldem::next_raises` counts *any* action that raises `current_bet`,
-so the opening postflop bet is raise 1).  When the opponent makes one more, the
-abstraction has no node for it: the event cannot be translated, the tracker
-stops advancing, and every later decision in that hand is taken by the fallback
-rather than by the blueprint.
+so the opening postflop bet is raise 1).  All-in stays legal at the cap, so a
+**shove** past it maps cleanly.  A sized raise past it maps onto that all-in
+too — and once it is called, the abstract hand is over while the real one
+continues: every later event is skipped and every later decision is taken off
+the blueprint (re-solved from the real state postflop).  Only those non-all-in
+over-cap raises are flagged here.
+
+Pass the blueprint's `--cap` (a scalar cap; per-street caps are not modelled).
 
 That makes desync hands the *only* population any change to the fallback can
 touch.  Hands without a desync are a control: two runs of the same blueprint
@@ -20,6 +24,7 @@ import math
 import sys
 
 BIG_BLIND = 100
+STACK = 20000
 STREETS = ["preflop", "flop", "turn", "river"]
 
 
@@ -30,6 +35,7 @@ def replay(action, cap=3):
     first preflop, the big blind first on every later street.
     """
     events = []
+    committed = 0  # per player before this street (equal once a street closes)
     for street, s in enumerate(action.split("/")):
         cur = BIG_BLIND if street == 0 else 0
         pos = 1 if street == 0 else 0
@@ -44,7 +50,8 @@ def replay(action, cap=3):
                 over = False
                 if to > cur:
                     raises += 1
-                    over = raises > cap
+                    all_in = committed + to >= STACK
+                    over = raises > cap and not all_in
                     cur = to
                 events.append((street, pos, "b", to, raises, over))
                 i = j
@@ -52,6 +59,7 @@ def replay(action, cap=3):
                 events.append((street, pos, s[i], None, raises, False))
                 i += 1
             pos ^= 1
+        committed += cur
     return events
 
 
@@ -125,7 +133,7 @@ def audit(path, cap):
     line("OVERALL", clean + hit, total)
     print()
     line("no desync (control)", clean, total)
-    line("desync (fallback decided)", hit, total)
+    line("desync (off the blueprint)", hit, total)
 
     if hit:
         print("\n  desync hands, by street of the over-cap raise:")
@@ -142,10 +150,16 @@ def self_check():
     ev = replay("b250b750b1657b6750c", cap=3)
     over = [e for e in ev if e[5]]
     assert len(over) == 1 and over[0][:2] == (0, 0) and over[0][3] == 6750, over
-    # Flop raise war from the AA loss: b947(r1) b2900(r2) b5581(r3) b19300(r4).
-    ev = replay("b200b700c/b947b2900b5581b19300c//", cap=3)
+    # A shove past the cap is NOT a desync: 700 in preflop + 19300 = the stack,
+    # which maps onto the abstract all-in.
+    assert not any(e[5] for e in replay("b200b700c/b947b2900b5581b19300c//", cap=3))
+    # The same war with a sized 4th raise is one.
+    ev = replay("b200b700c/b947b2900b5581b12000c//", cap=3)
     over = [e for e in ev if e[5]]
-    assert len(over) == 1 and over[0][0] == 1 and over[0][3] == 19300, over
+    assert len(over) == 1 and over[0][0] == 1 and over[0][3] == 12000, over
+    # Cap 2 preflop: a sized 4-bet is over; a 4-bet shove is not.
+    assert any(e[5] for e in replay("b250b750b1800c/kk/kk/kk", cap=2))
+    assert not any(e[5] for e in replay("b250b750b20000c", cap=2))
     # A hand that never exceeds the cap has no trigger.
     assert not any(e[5] for e in replay("b200c/kk/kk/kk", cap=3))
     # The opening postflop bet is raise 1, so three postflop bets sit at the cap.

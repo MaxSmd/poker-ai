@@ -168,9 +168,69 @@ impl VectorCfr {
     /// continual resolve.  Evaluated below any gadget wrap, i.e. assuming
     /// Follow, matching how the explicit `ContinualResolver` refreshes.
     pub fn opponent_cfvs(&mut self) -> [f64; NUM_COMBOS] {
+        let reach_me = if self.chooser == 0 { self.reach1 } else { self.reach0 };
+        self.opponent_cfvs_at(self.inner_root, &reach_me)
+    }
+
+    /// The opponent's per-hand counterfactual values at the node our root
+    /// action `action` leads to — the carry for the **next** resolve, which is
+    /// rooted after that action, not at this resolve's root.
+    ///
+    /// DeepStack's continual re-solving rule: after our own action, the carried
+    /// values become the opponent's values at the chosen child, with our reach
+    /// reweighted by each hand's probability of having taken it (`played`,
+    /// the same likelihood our range is updated with, so the carry and the
+    /// next resolve's range describe the same strategy).  Carrying root values
+    /// instead constrains the next resolve with guarantees from a node the
+    /// hand is no longer at.
+    ///
+    /// **Within a street, the opponent's next action leaves the carry
+    /// unchanged** (DeepStack's rule too).  The child is the opponent's
+    /// decision, so each hand's carried value is its average over the actions
+    /// it mixes.  Against a best-responding opponent every action it takes has
+    /// exactly that value, and every action it avoids has at most that — so
+    /// the carry is an **upper bound** on the hand's value after whatever it
+    /// did, which keeps the gadget safe.  The price is conservatism: a hand
+    /// that took a worse-than-average action (say, an unprofitable raise) gets
+    /// a looser constraint than its true value, so the next resolve may concede
+    /// it value rather than exploit the mistake.  Moving the carry to the
+    /// opponent's chosen action would tighten that, but only where the previous
+    /// resolve trained that action's subtree well — not for a rarely-taken
+    /// raise or an off-tree size, which are exactly the cases in question.
+    ///
+    /// **Across a street the carry is not valid** and the bot drops it (see
+    /// `Bot::sync`): at a depth-cut leaf it averages over the next card (or
+    /// over the opponent's continuation choice), which bounds no *specific*
+    /// card — too tight on cards that help the opponent's hand, too loose on
+    /// the rest.  A per-card carry needs per-card leaf values this solver does
+    /// not produce.
+    ///
+    /// `None` when the child is terminal (our fold ends the hand) or no hand
+    /// of ours takes the action.  Panics if the root is not our decision.
+    pub fn opponent_cfvs_after(&mut self, action: usize, played: &[f64; NUM_COMBOS]) -> Option<[f64; NUM_COMBOS]> {
+        let NodeKind::Decision { player, children, .. } = &self.kinds[self.inner_root] else {
+            panic!("resolve root is not a decision node");
+        };
+        assert_ne!(*player, self.chooser, "the root must be our decision, not the opponent's");
+        let child = children[action];
+        if matches!(self.kinds[child], NodeKind::Fold { .. }) {
+            return None;
+        }
+        let mut reach_me = if self.chooser == 0 { self.reach1 } else { self.reach0 };
+        for (r, &p) in reach_me.iter_mut().zip(played) {
+            *r *= p;
+        }
+        if reach_me.iter().all(|&r| r <= 0.0) {
+            return None;
+        }
+        Some(self.opponent_cfvs_at(child, &reach_me))
+    }
+
+    /// Opponent CFVs at `node` with our reach `reach_me`, normalized per
+    /// opponent hand by our valid (card-compatible) reach mass.
+    fn opponent_cfvs_at(&mut self, node: usize, reach_me: &[f64; NUM_COMBOS]) -> [f64; NUM_COMBOS] {
         let opp = self.chooser;
-        let (reach_opp, reach_me) =
-            if opp == 0 { (self.reach0, self.reach1) } else { (self.reach1, self.reach0) };
+        let reach_opp = if opp == 0 { self.reach0 } else { self.reach1 };
         let env = Env {
             kinds: &self.kinds,
             board: &self.board,
@@ -186,13 +246,13 @@ impl VectorCfr {
             &env,
             &self.stores,
             &mut self.scratch,
-            self.inner_root,
-            &reach_me,
+            node,
+            reach_me,
             opp,
             &mut raw,
         );
         let mut mass = [0.0; NUM_COMBOS];
-        valid_reach_into(&self.board, &reach_me, &mut mass);
+        valid_reach_into(&self.board, reach_me, &mut mass);
         let mut out = [0.0; NUM_COMBOS];
         for (o, (&v, (&m, &prior))) in
             out.iter_mut().zip(raw.iter().zip(mass.iter().zip(reach_opp.iter())))
@@ -723,6 +783,12 @@ impl VectorCfr {
 
     /// Emit the deployable average strategy keyed by the explicit `info_key`.
     pub fn into_resolved(self) -> VectorResolved {
+        self.resolved()
+    }
+
+    /// [`into_resolved`](Self::into_resolved) without consuming the solver, so
+    /// the carry can still be extracted once the played action is known.
+    pub fn resolved(&self) -> VectorResolved {
         let mut strategy = HashMap::new();
         let mut public_nodes = 0;
         for kind in &self.kinds {

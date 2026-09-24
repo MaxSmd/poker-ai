@@ -20,7 +20,8 @@
 //!   --stack-bb=N       blueprint stack depth in bb (default 200 — Slumbot's)
 //!   --cap=N            blueprint raise cap (default 3 — must match training);
 //!                      --cap=P,F,T,R for a per-street-capped blueprint
-//!   --no-resolve       blueprint-only (skip the vectorized re-solve entirely)
+//!   --no-resolve       blueprint-only (skip the vectorized re-solve entirely,
+//!                      including for spots the abstraction lost track of)
 //!   --no-resolve-turn  blueprint on the turn (re-solving is ON by default)
 //!   --no-resolve-flop  blueprint on the flop (re-solving is ON by default)
 //!   --runout-sample=N  board completions evaluated per iteration at a
@@ -30,6 +31,8 @@
 //!   --turn-full-river  turn resolves solve the real river betting instead of
 //!                      cutting at the reveal.  Exact, and 798 s/decision —
 //!                      an offline reference, not a playable mode
+//!   --no-continual     solve every decision unconstrained: no CFV gadget and
+//!                      no values carried between a hand's resolves
 //!   --iters=N          CFR⁺ iterations per river resolve (default 1500)
 //!   --turn-iters=N     CFR⁺ iterations per turn/flop resolve (default 500)
 //!   --river-cap=N      raise cap inside a resolve, every street (default 3)
@@ -465,6 +468,7 @@ fn build_bot(args: &[String], dir: &Path) -> Bot {
         turn_full_river: args.iter().any(|a| a == "--turn-full-river"),
         runout_sample: flag(args, "runout-sample").unwrap_or(64),
         continual: !args.iter().any(|a| a == "--no-continual"),
+        resolve_desynced: !no_resolve,
         purify: flag(args, "purify").unwrap_or(0.1),
         seed: flag(args, "seed").unwrap_or(1),
     };

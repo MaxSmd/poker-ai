@@ -135,6 +135,12 @@ pub struct BotConfig {
     /// being recomputed between decisions.  The hand's first resolve is the
     /// unconstrained bootstrap.
     pub continual: bool,
+    /// Re-solve any postflop decision the abstract mirror has lost track of,
+    /// even on a street whose re-solving is off.  Such a spot has no blueprint
+    /// node, and the alternative is the desynced fallback's pot odds against
+    /// a frozen range, which never raises.  Off only for the blueprint-only
+    /// ablation (`--no-resolve`), which must not re-solve anything.
+    pub resolve_desynced: bool,
     /// Purification: drop actions below this probability, renormalize, then
     /// sample (`0.0` = sample the raw mixed strategy).
     pub purify: f64,
@@ -155,6 +161,7 @@ impl Default for BotConfig {
             turn_full_river: false,
             runout_sample: 64,
             continual: true,
+            resolve_desynced: true,
             purify: 0.1,
             seed: 1,
         }
@@ -183,8 +190,8 @@ pub struct HandState {
     /// extracted from our previous resolve this hand (bb, `features`
     /// combo order).  The next resolve is gadget-constrained by these, so the
     /// opponent cannot profit from our strategy being recomputed between
-    /// decisions; refreshed after every resolve.  `None` until the hand's
-    /// first (bootstrap) resolve.
+    /// decisions; refreshed after every resolve.  `None` until a street's
+    /// first (bootstrap) resolve: it is dropped at every board reveal.
     carried_cfvs: Option<Box<[f64; NUM_COMBOS]>>,
 }
 
@@ -206,8 +213,10 @@ pub struct Bot {
 ///
 /// * the event is skipped, so the opponent's range stops being updated — every
 ///   later belief in the hand is conditioned on a strictly incomplete history;
-/// * our own decisions fall through to [`Bot::decide_desynced`], which knows
-///   only pot odds against a frozen range and never raises.
+/// * our own decisions have no blueprint node: postflop they are re-solved
+///   from the real state (unless `BotConfig::resolve_desynced` is off), and
+///   otherwise fall through to `decide_desynced`, which knows only pot odds
+///   against a frozen range and never raises.
 ///
 /// Both degrade play in ways that look exactly like "re-solving is bad", so the
 /// rate has to be measured before any conclusion is drawn about the resolver.
@@ -215,11 +224,14 @@ pub struct Bot {
 /// raises constantly it need not be.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TrackingCounts {
-    /// Opponent (or our own echoed) events the abstraction could not map.
+    /// Opponent (or our own echoed) events the abstraction could not map,
+    /// including every event skipped because the mirror had already lost the
+    /// hand.
     pub unmapped_events: u64,
     /// Total events fed through the mirror.
     pub events: u64,
-    /// Our decisions taken on the desynced fallback path.
+    /// Our decisions made while the abstract mirror had no node for the spot,
+    /// whichever path then decided them (re-solve or the pot-odds fallback).
     pub desynced_decisions: u64,
     /// Total decisions we were asked for.
     pub decisions: u64,
@@ -330,7 +342,13 @@ impl Bot {
         // can fall through to `decide_blueprint`, and this is the one entry
         // point every decision passes through exactly once.
         self.tracking.decisions += 1;
-        let mv = if self.should_resolve(parsed.street, board) {
+        let desynced = !hs.hand.expects(&self.game, hs.my_seat, parsed.street);
+        if desynced {
+            self.tracking.desynced_decisions += 1;
+        }
+        let resolve_desynced =
+            desynced && self.cfg.resolve_desynced && parsed.street > 0 && board_matches(parsed.street, board);
+        let mv = if self.should_resolve(parsed.street, board) || resolve_desynced {
             self.decide_resolve(hs, &parsed, board)
         } else {
             self.decide_blueprint(hs, &parsed, board)
@@ -342,12 +360,13 @@ impl Bot {
     /// the right number of revealed cards for the street (a defensive guard —
     /// the resolve root synthesis assumes the board matches the street).
     fn should_resolve(&self, street: u8, board: &[u8]) -> bool {
-        match street {
-            3 => self.cfg.resolve_river && board.len() == 5,
-            2 => self.cfg.resolve_turn && board.len() == 4,
-            1 => self.cfg.resolve_flop && board.len() == 3,
+        let enabled = match street {
+            3 => self.cfg.resolve_river,
+            2 => self.cfg.resolve_turn,
+            1 => self.cfg.resolve_flop,
             _ => false, // preflop is always blueprint
-        }
+        };
+        enabled && board_matches(street, board)
     }
 
     /// Bring the abstract state, board, and ranges up to date with the
@@ -364,6 +383,11 @@ impl Bot {
             for r in &mut hs.ranges {
                 r.remove_board(board);
             }
+            // The carry was taken before this card and averages over it, so
+            // it constrains no specific card: too tight where the card helps
+            // an opponent hand, too loose where it hurts.  The street's first
+            // resolve bootstraps instead (see `VectorCfr::opponent_cfvs_after`).
+            hs.carried_cfvs = None;
         }
         let events: Vec<Event> = parsed.events[hs.processed..].to_vec();
         for ev in events {
@@ -386,7 +410,13 @@ impl Bot {
         }
 
         // Desync guard: only translate events the abstract game has a node for.
+        // A skipped event is an opponent action the range never sees, so it is
+        // counted as unmapped — the typical desync (a raise past the cap mapped
+        // to all-in and called, abstract hand over, real hand still running)
+        // produces nothing *but* skipped events, and used to read as 0%.
         if !hs.hand.expects(&self.game, seat, ev.street) {
+            self.tracking.events += 1;
+            self.tracking.unmapped_events += 1;
             return;
         }
 
@@ -447,5 +477,16 @@ impl Bot {
             *l = self.policy.probs_or_uniform(key, n)[action_index as usize];
         }
         hs.ranges[seat].update(&likelihood);
+    }
+}
+
+/// Whether `board` holds exactly the cards `street` has revealed — the guard
+/// every re-solve needs, since the root synthesis assumes they agree.
+fn board_matches(street: u8, board: &[u8]) -> bool {
+    match street {
+        1 => board.len() == 3,
+        2 => board.len() == 4,
+        3 => board.len() == 5,
+        _ => false,
     }
 }
