@@ -10,7 +10,7 @@
 use poker_core::action::Action;
 use poker_core::state::{GameState, MAX_PLAYERS, NO_CARD};
 
-use super::{Bot, HandState};
+use super::{Bot, DecisionPath, DecisionTrace, HandState};
 use crate::games::blueprint::BlueprintHoldem;
 use crate::play::equity::equity_vs_range;
 use crate::play::protocol::{EventKind, Parsed, BIG_BLIND, SMALL_BLIND, STACK_SIZE};
@@ -37,19 +37,26 @@ impl Bot {
         let acts = hs.hand.actions(&self.game);
         let key = hs.hand.info_key(&self.game);
         let probs = self.policy.probs_or_uniform(key, acts.len());
-        let idx = self.sample(&probs);
 
         let real_min = parsed.last_bet_size.max(BIG_BLIND);
         let remaining = STACK_SIZE - parsed.total_last_bet_to;
-        let mv = hs.hand.abstract_to_real(
-            &self.game,
-            acts[idx],
-            parsed.pot() as f64,
-            parsed.street_last_bet_to,
-            facing,
-            real_min.min(remaining),
-            remaining,
-        );
+        let moves: Vec<RealMove> = acts
+            .iter()
+            .map(|&a| {
+                hs.hand.abstract_to_real(
+                    &self.game,
+                    a,
+                    parsed.pot() as f64,
+                    parsed.street_last_bet_to,
+                    facing,
+                    real_min.min(remaining),
+                    remaining,
+                )
+            })
+            .collect();
+        let played = self.play_distribution(&probs);
+        let idx = self.choose(DecisionPath::Blueprint, parsed.street, &played, &moves);
+        let mv = moves[idx];
 
         self.update_range(hs, hs.my_seat, idx as u8);
         hs.hand.apply(&self.game, idx as u8);
@@ -74,6 +81,12 @@ impl Bot {
         let stack = STACK_SIZE - parsed.total_committed[me];
         let to_call = (parsed.street_last_bet_to - parsed.street_committed[me]).min(stack);
         if to_call == 0 {
+            self.forced = None;
+            self.last_trace = Some(DecisionTrace {
+                street: parsed.street,
+                path: DecisionPath::Desynced,
+                moves: vec![(RealMove::Check, 1.0)],
+            });
             return RealMove::Check;
         }
 
@@ -84,11 +97,12 @@ impl Bot {
 
         // Price of the call: chips in versus the pot we would be contesting.
         let odds = to_call as f64 / (parsed.pot() + to_call) as f64;
-        if equity >= odds {
-            RealMove::Call
-        } else {
-            RealMove::Fold
-        }
+        let mv = if equity >= odds { RealMove::Call } else { RealMove::Fold };
+        // Deterministic, and nothing downstream depends on which move was
+        // played, so a forced move is recorded but not needed.
+        self.forced = None;
+        self.last_trace = Some(DecisionTrace { street: parsed.street, path: DecisionPath::Desynced, moves: vec![(mv, 1.0)] });
+        mv
     }
 
     /// Postflop decision by full-range vectorized re-solve of the real state —
@@ -131,17 +145,19 @@ impl Bot {
         };
 
         let played = self.play_distribution(&probs);
+        let facing = parsed.last_bet_size > 0;
+        let moves: Vec<RealMove> = acts.iter().map(|&a| root_move(&root, hs.my_seat, a, facing)).collect();
         // AIVAT: value each root action for our hand BEFORE the draw, so the
         // term below is a pure function of the pre-draw state and the draw.
         let values = solver.root_action_values(combo_index(hs.my_hole[0], hs.my_hole[1]));
-        let idx = self.draw(&played);
+        let idx = self.choose(DecisionPath::Resolve, parsed.street, &played, &moves);
         if let Some(v) = values {
             let expected: f64 = played.iter().zip(&v).map(|(p, x)| p * x).sum();
             hs.action_luck_bb += v[idx] - expected;
         }
 
         self.condition_on_resolve(hs, &mut solver, &resolved, &board5, idx);
-        let mv = root_move(&root, hs.my_seat, acts[idx], parsed.last_bet_size > 0);
+        let mv = moves[idx];
         self.mirror_own_move(hs, parsed, mv);
         mv
     }
@@ -282,13 +298,38 @@ impl Bot {
         gs
     }
 
-    /// Purify + sample an action index from a distribution.
-    fn sample(&mut self, probs: &[f64]) -> usize {
-        let played = self.play_distribution(probs);
-        self.draw(&played)
+    /// Pick the root action to play from the purified distribution `played`
+    /// (one entry per action, `moves[i]` its real move): the forced move when
+    /// [`Bot::act_forced`] set one, otherwise a draw.  Records the trace either
+    /// way.
+    fn choose(&mut self, path: DecisionPath, street: u8, played: &[f64], moves: &[RealMove]) -> usize {
+        self.last_trace = Some(DecisionTrace {
+            street,
+            path,
+            moves: moves.iter().copied().zip(played.iter().copied()).collect(),
+        });
+        let Some(forced) = self.forced.take() else {
+            return self.draw(played);
+        };
+        let gap = |m: RealMove| match (m, forced) {
+            (RealMove::BetTo(a), RealMove::BetTo(b)) => Some(a.abs_diff(b)),
+            _ if m == forced => Some(0),
+            _ => None,
+        };
+        // Nearest matching move; among equals, the one we were likelier to play.
+        let best = (0..moves.len())
+            .filter_map(|i| gap(moves[i]).map(|g| (g, i)))
+            .min_by(|a, b| a.0.cmp(&b.0).then(played[b.1].partial_cmp(&played[a.1]).unwrap()));
+        match best {
+            Some((_, i)) => i,
+            None => {
+                self.forced_mismatches += 1;
+                (0..played.len()).max_by(|&a, &b| played[a].partial_cmp(&played[b]).unwrap()).unwrap_or(0)
+            }
+        }
     }
 
-    /// The distribution [`sample`](Self::sample) actually draws from:
+    /// The distribution a decision actually draws from:
     /// actions below `purify` dropped and the rest renormalized, or the
     /// argmax alone when purification drops everything.  Exposed separately
     /// because range updates must use what was played, not what was solved.
@@ -328,7 +369,7 @@ impl Bot {
     }
 
     /// Each of our hands' probability of playing root action `idx` under a
-    /// resolve's strategy, purified as [`sample`](Self::sample) would play it —
+    /// resolve's strategy, purified as it would be played —
     /// the Bayes likelihood for our own range after a re-solved decision.
     /// Hands the resolve never reached get 0: they carry no range mass.
     fn resolve_likelihood(

@@ -4,11 +4,13 @@
 //! Subcommands: `slumbot` (play a match), `chart` (print a strategy chart),
 //! `expl` (abstract-game exploitability of the **blueprint**), `lbr`
 //! (exploitability lower bound of the **live agent** by local best response —
-//! the only measurement here that exercises re-solving).
+//! the only measurement here that exercises re-solving), `replay` (what the
+//! agent would do in logged spots — see `replay.rs`).
 //!
 //! ```text
 //! play slumbot [hands] [flags]
 //! play lbr     [hands] [--lbr-seed=S] [bot flags]
+//! play replay  --spots=SPOTS.jsonl --out=TRACE.jsonl [bot flags]
 //!
 //!   hands              number of hands to play (default 1000)
 //!   --data=DIR         artifact directory (default `data`): needs
@@ -39,6 +41,9 @@
 //!   --continuations=L  comma-separated turn/flop leaf pot scales, first 0.0
 //!                      (default 0.0,0.75,1.5,3.0; a single 0.0 = check-down)
 //!   --purify=X         drop action probabilities below X (default 0.1)
+//!   --opp-range-floor=X  floor on the likelihood of the opponent's postflop
+//!                      actions in its range update (default 0 = plain
+//!                      Bayes; 1 = postflop actions do not narrow its range)
 //!   --seed=N           sampling seed (default 1)
 //!   --log-hands=PATH   write full per-hand histories (final action string,
 //!                      both hands, position, board, winnings) as JSONL,
@@ -56,6 +61,7 @@
 mod chart;
 mod expl;
 mod lbr;
+mod replay;
 mod slumbot;
 
 use std::path::{Path, PathBuf};
@@ -73,7 +79,7 @@ const ABSTRACT_SB: u32 = 1;
 const BOT_FLAGS: &[&str] = &[
     "data", "policy", "stack-bb", "cap", "no-resolve", "no-resolve-turn", "no-resolve-flop",
     "turn-full-river", "runout-sample", "no-continual", "iters", "turn-iters", "river-cap",
-    "continuations", "purify", "seed",
+    "continuations", "purify", "opp-range-floor", "seed",
 ];
 
 /// `--cap=N` or `--cap=P,F,T,R` (default 3).  Unlike [`flag`], a value that
@@ -124,9 +130,10 @@ fn main() {
         Some("chart") => chart::run(&args),
         Some("expl") => expl::run(&args),
         Some("lbr") => lbr::run(&args),
+        Some("replay") => replay::run(&args),
         _ => {
             eprintln!(
-                "usage: play slumbot [hands] | chart | expl | lbr [hands]  [flags]\n\
+                "usage: play slumbot [hands] | chart | expl | lbr [hands] | replay --spots=PATH --out=PATH  [flags]\n\
                  see the header of src/bin/play/main.rs"
             );
             std::process::exit(2);
@@ -185,6 +192,7 @@ fn build_bot(args: &[String], dir: &Path) -> Bot {
         continual: !args.iter().any(|a| a == "--no-continual"),
         resolve_desynced: !no_resolve,
         purify: flag(args, "purify").unwrap_or(0.1),
+        opp_range_floor: strict_flag(args, "opp-range-floor").unwrap_or(0.0),
         seed: flag(args, "seed").unwrap_or(1),
     };
 

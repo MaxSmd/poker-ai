@@ -26,5 +26,5 @@ pub mod protocol;
 pub mod slumbot;
 pub mod tracker;
 
-pub use bot::{Bot, BotConfig, HandState};
+pub use bot::{Bot, BotConfig, DecisionPath, DecisionTrace, HandState};
 pub use policy::CompactPolicy;

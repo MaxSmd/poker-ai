@@ -308,6 +308,16 @@ impl RealMove {
             RealMove::BetTo(n) => format!("b{n}"),
         }
     }
+
+    /// Parse one wire increment (`"f" | "k" | "c" | "b<N>"`).
+    pub fn from_incr(s: &str) -> Option<RealMove> {
+        match s {
+            "f" => Some(RealMove::Fold),
+            "k" => Some(RealMove::Check),
+            "c" => Some(RealMove::Call),
+            _ => s.strip_prefix('b')?.parse().ok().map(RealMove::BetTo),
+        }
+    }
 }
 
 #[cfg(test)]

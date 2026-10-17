@@ -270,6 +270,7 @@ fn resolve_bot(turn: bool, flop: bool, continuations: Vec<f64>) -> Bot {
             continual: true,
             resolve_desynced: true,
             purify: 0.0,
+            opp_range_floor: 0.0,
             seed: 42,
         },
     )
@@ -430,4 +431,83 @@ fn the_carry_is_dropped_at_a_street_change() {
 
     b.act(&mut hs, &river, &river_board).expect("river decision");
     assert!(hs.carried_cfvs.is_some(), "the river's bootstrap resolve leaves a new carry");
+}
+
+/// Forced mode plays the move given — even one the agent would rarely draw —
+/// records the distribution it would have drawn from, matches a bet to the
+/// nearest root action, and counts a move no root action matches.
+#[test]
+fn act_forced_plays_the_logged_move_and_records_the_distribution() {
+    let mut b = bot(false);
+    let hole = [parse_card("Ac").unwrap(), parse_card("Kd").unwrap()];
+
+    let mut hs = b.start_hand(1, hole); // SB, first in preflop
+    assert_eq!(b.act_forced(&mut hs, "", &[], "f").unwrap(), "f");
+    let t = b.last_trace().expect("trace recorded");
+    assert_eq!(t.path, DecisionPath::Blueprint);
+    assert!((t.prob(|_| true) - 1.0).abs() < 1e-9, "trace is a distribution");
+    assert!(t.prob(|m| m == RealMove::Fold) > 0.0);
+
+    let mut hs = b.start_hand(1, hole);
+    let incr = b.act_forced(&mut hs, "", &[], "b210").unwrap();
+    assert!(incr.starts_with('b'), "a bet maps to the nearest raise, got {incr:?}");
+    assert_eq!(b.forced_mismatches(), 0);
+
+    // Facing the blind there is no check: counted, and the likeliest move plays.
+    let mut hs = b.start_hand(1, hole);
+    b.act_forced(&mut hs, "", &[], "k").unwrap();
+    assert_eq!(b.forced_mismatches(), 1);
+}
+
+/// The floor bounds how far one postflop opponent action can narrow its
+/// range.  Hands holding the 2♣ never bet this flop in the policy; after a
+/// bet, a plain Bayes update (floor 0) kills them, floor 1 leaves the range
+/// exactly as it was, and anything between keeps them alive.
+#[test]
+fn opp_range_floor_limits_how_far_a_postflop_action_narrows_the_range() {
+    let board = cards(&["Qs", "4s", "3h"]);
+    let hole = [parse_card("Ac").unwrap(), parse_card("Kd").unwrap()];
+    let deuce = parse_card("2c").unwrap();
+    let game = || BlueprintHoldem::new(400, 2, 1, 0).with_raise_cap(3);
+    let cfg = |floor| BotConfig { opp_range_floor: floor, resolve_flop: false, ..Default::default() };
+
+    // Keys at the big blind's flop decision, for every live hand with the 2♣.
+    let mut probe = Bot::new(game(), CompactPolicy::from_entries(vec![]), cfg(0.0));
+    let mut hs = probe.start_hand(1, hole);
+    probe.sync(&mut hs, &parse_action("b200c/").unwrap(), &board);
+    let n = hs.hand.actions(&probe.game).len();
+    let blocked = |c: u8| board.contains(&c) || hole.contains(&c);
+    let deuces: Vec<usize> = (0..NUM_COMBOS)
+        .filter(|&i| {
+            let [a, c] = combo_cards(i);
+            (a == deuce || c == deuce) && !blocked(a) && !blocked(c)
+        })
+        .collect();
+    let mut entries = std::collections::BTreeMap::new();
+    for &i in &deuces {
+        let mut p = vec![0.0f32; n];
+        p[0] = 1.0; // always check
+        entries.insert(hs.hand.key_with_hole(&probe.game, combo_cards(i)), p);
+    }
+    let entries: Vec<(u64, Vec<f32>)> = entries.into_iter().collect();
+
+    let run = |floor: f64| {
+        let mut b = Bot::new(game(), CompactPolicy::from_entries(entries.clone()), cfg(floor));
+        let mut hs = b.start_hand(1, hole);
+        b.sync(&mut hs, &parse_action("b200c/").unwrap(), &board);
+        let before = hs.ranges[1 - hs.my_seat].probs.clone();
+        b.sync(&mut hs, &parse_action("b200c/b100").unwrap(), &board);
+        (before, hs.ranges[1 - hs.my_seat].probs.clone())
+    };
+
+    let (before, after) = run(0.0);
+    for &i in &deuces {
+        assert!(before[i] > 0.0 && after[i] == 0.0, "plain Bayes: a never-bet hand dies");
+    }
+    let (before, after) = run(1.0);
+    for (x, y) in before.iter().zip(&after) {
+        assert!((x - y).abs() < 1e-12, "floor 1: the bet must not move the range");
+    }
+    let (_, after) = run(0.3);
+    assert!(deuces.iter().all(|&i| after[i] > 0.0), "floor 0.3 keeps them alive");
 }

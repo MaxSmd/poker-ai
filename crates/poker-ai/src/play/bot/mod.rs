@@ -35,7 +35,7 @@ mod tests;
 use crate::games::blueprint::BlueprintHoldem;
 use crate::play::policy::CompactPolicy;
 use crate::play::protocol::{parse_action, Event, Parsed};
-use crate::play::tracker::{AbstractHand, MapOutcome};
+use crate::play::tracker::{AbstractHand, MapOutcome, RealMove};
 use crate::resolving::belief_state::{combo_cards, BeliefState, NUM_COMBOS};
 use crate::util::rng::xorshift_next_unit;
 
@@ -145,6 +145,15 @@ pub struct BotConfig {
     /// Purification: drop actions below this probability, renormalize, then
     /// sample (`0.0` = sample the raw mixed strategy).
     pub purify: f64,
+    /// Floor on the likelihood of the opponent's **postflop** actions in its
+    /// range update: each hand's blueprint probability `L` of the observed
+    /// action becomes `floor + (1 − floor)·L`.  `0.0` is the plain Bayes
+    /// update; `1.0` ignores postflop actions entirely.  A floor keeps an
+    /// action the blueprint rarely takes (say, a turn lead) from narrowing the
+    /// opponent's range to the few hands that take it — the right inference
+    /// against the blueprint itself, the wrong one against an opponent whose
+    /// frequencies differ.  Preflop updates and our own range are unaffected.
+    pub opp_range_floor: f64,
     /// Seed for the agent's action sampling and bet-mapping randomization.
     pub seed: u64,
 }
@@ -164,6 +173,7 @@ impl Default for BotConfig {
             continual: true,
             resolve_desynced: true,
             purify: 0.1,
+            opp_range_floor: 0.0,
             seed: 1,
         }
     }
@@ -204,6 +214,33 @@ pub struct HandState {
     action_luck_bb: f64,
 }
 
+/// Which regime decided a move (see `decide`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecisionPath {
+    Blueprint,
+    Resolve,
+    Desynced,
+}
+
+/// The distribution one decision was drawn from, in real moves: one entry
+/// per root action, so a move can appear more than once (an abstract fold
+/// with nothing to call is a check).  Recorded for every decision; read by
+/// `play replay` to measure what the agent *would* do in logged spots.
+#[derive(Clone, Debug)]
+pub struct DecisionTrace {
+    pub street: u8,
+    pub path: DecisionPath,
+    pub moves: Vec<(RealMove, f64)>,
+}
+
+impl DecisionTrace {
+    /// Total probability of moves matching `pred`.
+    pub fn prob(&self, pred: impl Fn(RealMove) -> bool) -> f64 {
+        // `+ 0.0`: an empty sum is −0.0, which would print as "-0".
+        self.moves.iter().filter(|(m, _)| pred(*m)).map(|(_, p)| p).sum::<f64>() + 0.0
+    }
+}
+
 impl HandState {
     /// The AIVAT action-luck term for this hand in Slumbot chips (see
     /// `action_luck_bb`).  Adjusted winnings = raw − card luck − this.
@@ -220,6 +257,11 @@ pub struct Bot {
     cfg: BotConfig,
     rng: u64,
     tracking: TrackingCounts,
+    /// Set by [`Bot::act_forced`]: play this move instead of sampling.
+    forced: Option<RealMove>,
+    /// Forced moves that matched none of the decision's root actions.
+    forced_mismatches: u64,
+    last_trace: Option<DecisionTrace>,
 }
 
 /// How often the agent's abstract mirror of the real hand broke down.
@@ -288,7 +330,47 @@ impl std::fmt::Display for TrackingCounts {
 impl Bot {
     pub fn new(game: BlueprintHoldem, policy: CompactPolicy, cfg: BotConfig) -> Self {
         let rng = cfg.seed | 1;
-        Self { game, policy, cfg, rng, tracking: TrackingCounts::default() }
+        Self {
+            game,
+            policy,
+            cfg,
+            rng,
+            tracking: TrackingCounts::default(),
+            forced: None,
+            forced_mismatches: 0,
+            last_trace: None,
+        }
+    }
+
+    /// The distribution behind the most recent decision (see [`DecisionTrace`]).
+    pub fn last_trace(&self) -> Option<&DecisionTrace> {
+        self.last_trace.as_ref()
+    }
+
+    /// Forced moves so far that no root action matched (see [`Self::act_forced`]).
+    pub fn forced_mismatches(&self) -> u64 {
+        self.forced_mismatches
+    }
+
+    /// [`act`](Self::act), but play `forced` (a wire increment) instead of
+    /// sampling — everything else, including our range and the carried
+    /// values, is updated exactly as if we had drawn it.  The replay of a
+    /// logged hand: it follows the hand's real history while still recording
+    /// what the agent would have done ([`Self::last_trace`]).  A bet is matched
+    /// to the root action with the nearest amount; a move no root action
+    /// matches plays the most likely action and is counted.
+    pub fn act_forced(
+        &mut self,
+        hs: &mut HandState,
+        action_str: &str,
+        board: &[u8],
+        forced: &str,
+    ) -> Result<String, String> {
+        let mv = RealMove::from_incr(forced).ok_or_else(|| format!("bad forced move {forced:?}"))?;
+        self.forced = Some(mv);
+        let out = self.act(hs, action_str, board);
+        self.forced = None;
+        out
     }
 
     /// How the blueprint lookups behind this bot's decisions have resolved.
@@ -346,6 +428,7 @@ impl Bot {
             ));
         }
 
+        self.last_trace = None;
         // Counted here rather than in the decision functions: `decide_resolve`
         // can fall through to `decide_blueprint`, and this is the one entry
         // point every decision passes through exactly once.
@@ -465,6 +548,7 @@ impl Bot {
         for &c in &gs.board[..gs.board_cards_count()] {
             board_mask |= 1 << c;
         }
+        let floor = if seat != hs.my_seat && gs.street >= 1 { self.cfg.opp_range_floor } else { 0.0 };
         let mut likelihood = vec![1.0; NUM_COMBOS];
         for (i, l) in likelihood.iter_mut().enumerate() {
             if hs.ranges[seat].probs[i] <= 0.0 {
@@ -476,7 +560,7 @@ impl Bot {
                 continue;
             }
             let key = hs.hand.key_with_hole(&self.game, [a, b]);
-            *l = self.policy.probs_or_uniform(key, n)[action_index as usize];
+            *l = floor + (1.0 - floor) * self.policy.probs_or_uniform(key, n)[action_index as usize];
         }
         hs.ranges[seat].update(&likelihood);
     }
