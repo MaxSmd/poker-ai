@@ -199,15 +199,17 @@ Architecture (`crates/poker-ai/src/play/`):
   (turn) or 1176 (flop) board completions *per iteration* — the flop cost 24.6 s
   a decision before `--runout-sample` let it estimate that sweep from a rotating
   sample instead of enumerating it. `--no-resolve` plays the blueprint
-  throughout; `--no-resolve-turn` / `--no-resolve-flop` fall back street by
-  street.
+  throughout; `--no-resolve-flop` falls back on the flop. The turn plays the
+  blueprint by default: replaying 792 logged turn spots showed its re-solve
+  folding 81% to Slumbot's leads against Slumbot's own 43% (`--resolve-turn`
+  turns it back on; see `BotConfig::resolve_turn`).
 - The runner prints a running **bb/100 ± 95% CI**, emits `@wandb` metric lines
   (wrap with `scripts/train_wandb.py` to chart a long match), persists the
   session token, and logs every hand to `data/slumbot_results.csv`.
 
 Flags: `--iters=N` (resolve iterations), `--river-cap=N`, `--purify=X`
 (drop sub-X action probabilities), `--seed=N`, `--no-resolve`,
-`--no-resolve-turn`, `--no-resolve-flop`, `--runout-sample=N` (completions per
+`--resolve-turn`, `--no-resolve-flop`, `--runout-sample=N` (completions per
 iteration at a depth-cut leaf; `0` = exact),
 `--token=`/`--username=`/`--password=` — see the header of `src/bin/play/main.rs`.
 
@@ -217,8 +219,7 @@ continual re-solving, blueprint warm-starting, multi-valued leaf continuations,
 full-river turn resolves — is implemented and tested. Full-river turn resolving
 (`--turn-full-river`) stays an offline reference: it solves the real river
 betting rather than cutting at the reveal, which is exact and costs 798 s per
-decision. A Slumbot A/B of postflop re-solving against blueprint-only play
-(`--no-resolve-turn --no-resolve-flop`) is the next measurement.
+decision.
 
 ## Evaluation toolkit
 

@@ -67,7 +67,8 @@ run() {
 #    arm is compared against.
 run lbr_blueprint_only lbr "$HANDS" --cap=2 --no-resolve --lbr-seed="$SEED"
 
-# 2. The headline: the shipped agent, re-solving all three postflop streets.
+# 2. The headline: the shipped agent (river and flop re-solved, turn from the
+#    blueprint since 2026-10).
 #    (1) vs (2) is the ablation that justifies the resolver.
 run lbr_resolve_all   lbr "$HANDS" --cap=2 --lbr-seed="$SEED"
 

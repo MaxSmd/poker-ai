@@ -131,7 +131,7 @@ resets the magnitude.
 | Option | Use when | Benefits | Drawbacks |
 |---|---|---|---|
 | River re-solve (**default**) | Every river decision | Full-range vectorized CFR⁺ from the *real* public state — real pot/stacks, so bet-translation error vanishes on the deepest street; ~1–2 s/decision | — |
-| `--resolve-turn` (full-river mode default) | Turn decisions | Deals the river as an explicit chance node and solves the **real river betting** below — exact to showdown, no leaf model (true-game gate: 0.0014 bb vs 1.44 bb for the leaf cut) | ~48× a river resolve's tree per iteration; tune `--turn-iters` |
+| `--resolve-turn` (**off by default**) | Turn decisions | Re-solves the turn with the K-continuation leaf. Off because it over-folds: on 792 replayed Slumbot turn leads it folds 81% (Slumbot 43%, blueprint 40%) — the leaf lets the opponent choose the river pot size per hand | `--turn-full-river` solves the real river betting instead (exact; 798 s/decision, offline only) |
 | `--turn-checkdown` | Speed A/Bs | Turn resolves fall back to the K-continuation check-down cut | Reintroduces the leaf model the full-river mode removes |
 | `--resolve-flop` | Flop decisions (experimental) | K-continuation cut at the undealt turn | Slowest; leaf model on the turn boundary |
 | Continual re-solving (**default**) | Multiple resolves per hand | Carries the opponent's CFVs **at the child our action reached** and gadget-constrains the next resolve **within the street** (opponent actions leave the carry as a safe upper bound); dropped at each board reveal, where it would average over the new card; our own range is updated with the resolve's played (purified) strategy, never the blueprint's. Before 2026-09 the bot carried root CFVs across streets and used blueprint likelihoods | `--no-continual` for independent per-decision resolves |
@@ -174,7 +174,7 @@ memory_estimate [flop turn river]          exact footprint matrix (2p + 6-max)
       POKER_AI_ESTIMATE_STATES=N           betting-tree memo cap
       POKER_AI_ESTIMATE_CAPS="2;3;3,2,2,1" cap rows (per-street specs allowed)
 play slumbot [hands]                       live match vs slumbot.com (raw + luck-adjusted bb/100 ± CI)
-      --cap=N|P,F,T,R --no-resolve --no-resolve-turn --no-resolve-flop
+      --cap=N|P,F,T,R --no-resolve --resolve-turn --no-resolve-flop
       --turn-full-river --runout-sample=N --no-continual
       --iters=N --turn-iters=N --river-cap=N --continuations=L --purify=X --seed=N
       --log-hands=PATH --token=T | --username=U --password=P

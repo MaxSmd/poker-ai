@@ -10,7 +10,8 @@
 # time: each loads the ~16 GB blueprint.  About 3.5 hours.
 #
 # Arms, cheapest-to-interpret first:
-#   default         must reproduce the logged 82%, or the replay is unfaithful
+#   default         the configuration the log was played with (turn re-solve
+#                   on); must reproduce the logged 82%, or the replay is unfaithful
 #   leaf_checkdown  a plain check-down leaf instead of K continuations
 #   floor_1         Slumbot's postflop actions do not narrow its range at all
 #   floor_0.3       the same, partially — the shippable form of floor_1
@@ -37,10 +38,10 @@ run() {
     grep -E "^Done:" "$OUT/$name.log" | sed 's/^/      /'
 }
 
-run default
-run leaf_checkdown --continuations=0.0
-run floor_1 --opp-range-floor=1.0
-run floor_0.3 --opp-range-floor=0.3
+run default --resolve-turn
+run leaf_checkdown --resolve-turn --continuations=0.0
+run floor_1 --resolve-turn --opp-range-floor=1.0
+run floor_0.3 --resolve-turn --opp-range-floor=0.3
 run blueprint_turn --no-resolve-turn
 
 # shellcheck disable=SC2086  # ARMS is a word list by construction

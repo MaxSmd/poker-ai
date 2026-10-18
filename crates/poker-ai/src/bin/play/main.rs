@@ -24,7 +24,9 @@
 //!                      --cap=P,F,T,R for a per-street-capped blueprint
 //!   --no-resolve       blueprint-only (skip the vectorized re-solve entirely,
 //!                      including for spots the abstraction lost track of)
-//!   --no-resolve-turn  blueprint on the turn (re-solving is ON by default)
+//!   --resolve-turn     re-solve the turn (OFF by default: its leaf model
+//!                      over-folds — see BotConfig::resolve_turn)
+//!   --no-resolve-turn  blueprint on the turn (the default; still accepted)
 //!   --no-resolve-flop  blueprint on the flop (re-solving is ON by default)
 //!   --runout-sample=N  board completions evaluated per iteration at a
 //!                      depth-cut leaf, 0 = exact (default 64).  What makes
@@ -77,7 +79,7 @@ const ABSTRACT_SB: u32 = 1;
 /// The flags that configure the playing agent ([`build_bot`]) — shared by
 /// `slumbot` and `lbr`, which each add their own.
 const BOT_FLAGS: &[&str] = &[
-    "data", "policy", "stack-bb", "cap", "no-resolve", "no-resolve-turn", "no-resolve-flop",
+    "data", "policy", "stack-bb", "cap", "no-resolve", "resolve-turn", "no-resolve-turn", "no-resolve-flop",
     "turn-full-river", "runout-sample", "no-continual", "iters", "turn-iters", "river-cap",
     "continuations", "purify", "opp-range-floor", "seed",
 ];
@@ -181,7 +183,9 @@ fn build_bot(args: &[String], dir: &Path) -> Bot {
     let no_resolve = args.iter().any(|a| a == "--no-resolve");
     let cfg = BotConfig {
         resolve_river: !no_resolve,
-        resolve_turn: !no_resolve && !args.iter().any(|a| a == "--no-resolve-turn"),
+        resolve_turn: !no_resolve
+            && args.iter().any(|a| a == "--resolve-turn")
+            && !args.iter().any(|a| a == "--no-resolve-turn"),
         resolve_flop: !no_resolve && !args.iter().any(|a| a == "--no-resolve-flop"),
         river_iters: flag(args, "iters").unwrap_or(1_500),
         turn_iters: flag(args, "turn-iters").unwrap_or(500),

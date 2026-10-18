@@ -16,7 +16,9 @@
 //!   **turn** resolve cuts at the river reveal and a **flop** resolve at the
 //!   turn reveal, with the opponent choosing among K continuations at the leaf,
 //!   so the resolve is robust to post-leaf betting a plain check-down ignores.
-//!   All three streets re-solve by default, each inside ~2 s per decision;
+//!   The river and flop re-solve by default, each inside ~2 s per decision;
+//!   the turn plays the blueprint (see `BotConfig::resolve_turn` for the
+//!   measurement behind that);
 //!   `runout_sample` is what makes the turn and flop affordable, and
 //!   `turn_full_river` is an offline reference mode at 798 s/decision.
 //! * **Continual re-solving** (DeepStack-style, on by default) — every resolve
@@ -48,7 +50,19 @@ pub struct BotConfig {
     /// A complete board has no runout, so [`Self::runout_sample`] does not
     /// apply here — the river is always exact to showdown.
     pub resolve_river: bool,
-    /// Re-solve turn decisions.  On by default.
+    /// Re-solve turn decisions.  **Off by default** — the blueprint plays the
+    /// turn.
+    ///
+    /// Measured by replaying the 792 logged spots where Slumbot leads the turn
+    /// into our small blind (`scripts/replay_turn_folds.sh`, 2026-10): with
+    /// the K-continuation leaf the resolve folds 81% there (top pair or better
+    /// 13%), against Slumbot's 43% in the same spot; the blueprint folds 40%
+    /// (top pair or better 2%).  The leaf lets the opponent pick the river pot
+    /// size per hand — large when ahead, small when behind — which prices
+    /// every marginal call as a loser.  A plain check-down leaf errs the other
+    /// way (20%, calling with nothing 61%), and flooring the opponent's range
+    /// updates only reached 64%.  Turn on with `--resolve-turn` once the leaf
+    /// model is fixed.
     ///
     /// 1.9 s per decision. A turn board has only 48 completions, so at the
     /// default [`Self::runout_sample`] of 64 the turn sweep clamps to exact —
@@ -162,7 +176,7 @@ impl Default for BotConfig {
     fn default() -> Self {
         Self {
             resolve_river: true,
-            resolve_turn: true,
+            resolve_turn: false,
             resolve_flop: true,
             river_iters: 1_500,
             turn_iters: 500,
