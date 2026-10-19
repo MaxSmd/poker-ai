@@ -2,25 +2,31 @@
 """Select logged spots for `play replay`, and compare the traces it writes.
 
     python scripts/replay_spots.py select LOG.jsonl --out=SPOTS.jsonl \\
-        [--street=turn --seat=SB --spot="vs bet" --size=40-80%]
+        [--street=turn --seat=SB --spot="vs bet" --size=40-80% --max=N]
     python scripts/replay_spots.py summarize SPOTS.jsonl NAME=TRACE.jsonl ...
 
 `select` finds every decision of ours in the log matching the spot (keys as
-in spot_report.py; the defaults are the turn spot where we fold 81% against
-Slumbot's 43%) and writes one line per spot: the logged hand plus `target`,
-the offset of that decision in its action string.
+in spot_report.py; `--spot=unopened` ignores --size), keeps a reproducible
+random `--max` of them, and writes one line per spot: the logged hand plus
+`target`, the offset of that decision in its action string.  A sidecar
+`SPOTS.jsonl.meta` records what the spot is judged by — betting frequency
+when unopened, folding frequency when facing a bet — and Slumbot's rate in
+the same spot of the same log.
 
-`summarize` prints, for each named trace, the agent's average probability of
-folding there — overall, and by the made-hand class of our cards — next to
-the fold rate actually logged on the same spots, then applies the decision
-rule fixed before the run:
+`summarize` prints, for each named trace, the agent's average rate there —
+overall, and by the made-hand class of our cards — next to the rate actually
+logged on the same spots, then applies the decision rule fixed before the
+run:
 
-  * the `default` trace must reproduce the logged fold rate within 5 points,
-    or the replay is not faithful and no other row means anything;
-  * a setting FIXES the leak if we fold top pair or better at most 10% of the
-    time AND fold at most 60% overall (Slumbot: 43%; MDF: about 33%).
+  * the `default` trace must reproduce the logged rate within 5 points, or
+    the replay is not faithful and no other row means anything;
+  * a setting FIXES the leak if its rate is within 10 points of Slumbot's in
+    the same spot — on either side, so trading over-folding for
+    over-calling does not count — and, for a fold spot, we fold top pair or
+    better at most 10% of the time.
 """
 import json
+import random
 import sys
 from collections import Counter, defaultdict
 
@@ -75,40 +81,76 @@ def arg(name, default):
     return next((a.split("=", 1)[1] for a in sys.argv if a.startswith(f"--{name}=")), default)
 
 
+def stat_of(want):
+    """What a spot is judged by: betting frequency when nothing is bet yet,
+    folding frequency when facing a bet."""
+    return "bet" if want[2] == "unopened" else "fold"
+
+
+def took(stat, token):
+    return token == ("b" if stat == "bet" else "f")
+
+
 def select(log, out):
     want = (STREETS.index(arg("street", "turn")), arg("seat", "SB"), arg("spot", "vs bet"), arg("size", "40-80%"))
-    n_hands = n_spots = 0
-    with open(log) as f, open(out, "w") as w:
-        for ln in f:
-            if not ln.strip():
+    if want[2] == "unopened":
+        want = want[:3] + ("",)
+    stat = stat_of(want)
+    max_n = int(arg("max", "0"))
+    spots, slumbot = [], []
+    n_hands = 0
+    for ln in open(log):
+        if not ln.strip():
+            continue
+        r = json.loads(ln)
+        n_hands += 1
+        for d in decisions(r.get("action", "")):
+            if spot_key(d) != want:
                 continue
-            r = json.loads(ln)
-            n_hands += 1
-            if len(r.get("hole") or []) != 2:
+            if d["pos"] != r["pos"]:
+                slumbot.append(took(stat, d["action"]))
                 continue
-            for d in decisions(r.get("action", "")):
-                if d["pos"] != r["pos"] or spot_key(d) != want:
-                    continue
-                if len(r.get("board") or []) < [0, 3, 4, 5][want[0]]:
-                    continue
-                spot = {k: r[k] for k in ("i", "pos", "hole", "board", "action")}
-                spot["target"] = d["offset"]
-                w.write(json.dumps(spot) + "\n")
-                n_spots += 1
-    print(f"{n_spots} spots {want} from {n_hands} hands -> {out}")
+            if len(r.get("hole") or []) != 2 or len(r.get("board") or []) < [0, 3, 4, 5][want[0]]:
+                continue
+            spot = {k: r[k] for k in ("i", "pos", "hole", "board", "action")}
+            spot["target"] = d["offset"]
+            spots.append(spot)
+    found = len(spots)
+    if max_n and found > max_n:
+        spots = random.Random(1).sample(spots, max_n)  # fixed seed: reproducible
+    with open(out, "w") as w:
+        for spot in spots:
+            w.write(json.dumps(spot) + "\n")
+    meta = {
+        "key": list(want),
+        "stat": stat,
+        "slumbot_rate": sum(slumbot) / len(slumbot) if slumbot else None,
+        "slumbot_n": len(slumbot),
+        "log": log,
+    }
+    with open(out + ".meta", "w") as w:
+        json.dump(meta, w)
+    sl = f"{meta['slumbot_rate']:.2f}" if slumbot else "n/a"
+    print(f"{len(spots)} of {found} spots {want} from {n_hands} hands -> {out}   "
+          f"(judged by {stat}; Slumbot {stat}s {sl} here, n={len(slumbot)})")
 
 
 def summarize(spots_path, named):
-    spots = {}
-    for ln in open(spots_path):
-        if ln.strip():
-            s = json.loads(ln)
-            spots[s["i"]] = s
-    logged = [s["action"][s["target"]] for s in spots.values()]
-    logged_fold = sum(t == "f" for t in logged) / len(logged)
+    spots = [json.loads(ln) for ln in open(spots_path) if ln.strip()]
+    try:
+        meta = json.load(open(spots_path + ".meta"))
+    except FileNotFoundError:
+        sys.exit(f"{spots_path}.meta missing — re-run `select` (it writes the spot's stat and Slumbot's rate)")
+    stat, ref = meta["stat"], meta["slumbot_rate"]
+    field = "raise" if stat == "bet" else "fold"  # an unopened BetTo is a bet
+    logged = sum(took(stat, s["action"][s["target"]]) for s in spots) / len(spots)
+    key = " ".join(x for x in [STREETS[meta["key"][0]], *meta["key"][1:]] if x)
 
-    print(f"\n{len(spots)} spots.  Logged fold rate on them: {logged_fold:.2f}\n")
-    hdr = f"{'setting':<22} {'n':>4}  {'fold':>5}  {'fold, top pair+':>15}  " + "  ".join(f"{c:>11}" for c in CLASSES) + "   paths"
+    print(f"\n=== {key}: {len(spots)} spots, judged by {stat} frequency ===")
+    print(f"Logged {stat} rate on them: {logged:.2f}.   Slumbot in the same spot: "
+          f"{ref:.2f} (n={meta['slumbot_n']})\n")
+    strong_col = f"{stat}, top pair+"
+    hdr = f"{'setting':<22} {'n':>4}  {stat:>5}  {strong_col:>15}  " + "  ".join(f"{c:>11}" for c in CLASSES) + "   paths"
     print(hdr)
     print("-" * len(hdr))
     verdicts = {}
@@ -123,33 +165,36 @@ def summarize(spots_path, named):
             continue
         by = defaultdict(list)
         for r in rows:
-            by[hand_class(r["hole"], r["board"])].append(r["fold"])
-        fold = sum(r["fold"] for r in rows) / len(rows)
+            by[hand_class(r["hole"], r["board"])].append(r[field])
+        rate = sum(r[field] for r in rows) / len(rows)
         strong = [f for c in STRONG for f in by[c]]
-        strong_fold = sum(strong) / len(strong) if strong else float("nan")
+        strong_rate = sum(strong) / len(strong) if strong else float("nan")
         paths = Counter(r["path"] for r in rows)
         cells = "  ".join(f"{sum(by[c]) / len(by[c]):>5.2f} n={len(by[c]):<4}" if by[c] else f"{'—':>11}" for c in CLASSES)
-        print(f"{name:<22} {len(rows):>4}  {fold:>5.2f}  {strong_fold:>15.2f}  {cells}   "
+        print(f"{name:<22} {len(rows):>4}  {rate:>5.2f}  {strong_rate:>15.2f}  {cells}   "
               + ", ".join(f"{k} {v}" for k, v in sorted(paths.items())))
-        verdicts[name] = (fold, strong_fold, len(rows))
+        verdicts[name] = (rate, strong_rate, len(rows))
 
     print("\nDecision rule (fixed before the run):")
     if "default" not in verdicts:
         print("  no `default` trace — cannot check that the replay is faithful.")
         return
-    d_fold, _, d_n = verdicts["default"]
-    if abs(d_fold - logged_fold) > 0.05:
-        print(f"  REPLAY NOT FAITHFUL: default folds {d_fold:.2f}, the log shows {logged_fold:.2f}. "
+    d_rate, _, d_n = verdicts["default"]
+    if abs(d_rate - logged) > 0.05:
+        print(f"  REPLAY NOT FAITHFUL: default {stat}s {d_rate:.2f}, the log shows {logged:.2f}. "
               "Fix the replay before reading any other row.")
         return
     if d_n < 0.9 * len(spots):
         print(f"  REPLAY INCOMPLETE: default traced {d_n} of {len(spots)} spots — check the errors in its log.")
         return
-    print(f"  replay faithful: default {d_fold:.2f} vs logged {logged_fold:.2f}.")
-    for name, (fold, strong_fold, _) in verdicts.items():
-        ok = strong_fold <= 0.10 and fold <= 0.60
-        print(f"  {name:<22} {'FIXES the leak' if ok else 'does not fix it'}"
-              f"   (top pair+ folds {strong_fold:.2f}, overall {fold:.2f})")
+    print(f"  replay faithful: default {d_rate:.2f} vs logged {logged:.2f}.")
+    for name, (rate, strong_rate, _) in verdicts.items():
+        near = abs(rate - ref) <= 0.10
+        ok = near and (stat == "bet" or strong_rate <= 0.10)
+        why = f"{stat} {rate:.2f} vs Slumbot {ref:.2f}"
+        if stat == "fold":
+            why += f", top pair+ folds {strong_rate:.2f}"
+        print(f"  {name:<22} {'FIXES the leak' if ok else 'does not fix it'}   ({why})")
 
 
 def self_check():
