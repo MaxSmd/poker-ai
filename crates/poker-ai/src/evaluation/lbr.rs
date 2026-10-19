@@ -428,6 +428,7 @@ mod tests {
             resolve_turn: false,
             resolve_flop: false,
             resolve_desynced: false,
+            search: false,
             seed: 7,
             ..Default::default()
         };

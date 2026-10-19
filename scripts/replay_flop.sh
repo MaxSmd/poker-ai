@@ -47,17 +47,17 @@ python3 scripts/replay_spots.py select "$LOG" --street=flop --seat=BB --spot="vs
 NAMES="default blueprint_flop leaf_checkdown leaf_mild"
 flags() {
     case $1 in
-        default) ;;
-        blueprint_flop) echo --no-resolve-flop ;;
-        leaf_checkdown) echo --continuations=0.0 ;;
-        leaf_mild) echo --continuations=0.0,0.75 ;;
+        default) echo --no-search ;;
+        blueprint_flop) echo --no-search --no-resolve-flop ;;
+        leaf_checkdown) echo --no-search --continuations=0.0 ;;
+        leaf_mild) echo --no-search --continuations=0.0,0.75 ;;
     esac
 }
 
 for name in $NAMES; do
     for spot in cbet defend; do
         printf '=== %s  START  %-15s %-7s %s\n' "$(date +%H:%M:%S)" "$name" "$spot" "$(flags "$name")"
-        # shellcheck disable=SC2046  # flags expands to zero or one word
+        # shellcheck disable=SC2046  # flags expands to a word list
         nice -n 19 "$BIN" replay --spots="$OUT/$spot.jsonl" --out="$OUT/${spot}_$name.jsonl" --cap=2 \
             $(flags "$name") > "$OUT/${spot}_$name.log" 2>&1
         printf '=== %s  DONE   %-15s %-7s exit %d\n' "$(date +%H:%M:%S)" "$name" "$spot" "$?"

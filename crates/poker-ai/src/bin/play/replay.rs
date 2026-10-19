@@ -193,6 +193,7 @@ mod tests {
             resolve_river: false,
             resolve_turn: true,
             resolve_flop: false,
+            search: false,
             turn_iters: 20,
             river_cap: 1,
             continuations: vec![0.0],

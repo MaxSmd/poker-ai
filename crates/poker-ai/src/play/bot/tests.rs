@@ -20,6 +20,7 @@ fn bot(resolve: bool) -> Bot {
             river_cap: 2,
             purify: 0.0,
             seed: 42,
+            search: false,
             ..Default::default()
         },
     )
@@ -117,6 +118,7 @@ fn bucketed_flop_updates_never_index_out_of_bounds() {
             river_cap: 2,
             purify: 0.0,
             seed: 7,
+            search: false,
             ..Default::default()
         },
     );
@@ -471,7 +473,7 @@ fn opp_range_floor_limits_how_far_a_postflop_action_narrows_the_range() {
     let hole = [parse_card("Ac").unwrap(), parse_card("Kd").unwrap()];
     let deuce = parse_card("2c").unwrap();
     let game = || BlueprintHoldem::new(400, 2, 1, 0).with_raise_cap(3);
-    let cfg = |floor| BotConfig { opp_range_floor: floor, resolve_flop: false, ..Default::default() };
+    let cfg = |floor| BotConfig { opp_range_floor: floor, resolve_flop: false, search: false, ..Default::default() };
 
     // Keys at the big blind's flop decision, for every live hand with the 2♣.
     let mut probe = Bot::new(game(), CompactPolicy::from_entries(vec![]), cfg(0.0));

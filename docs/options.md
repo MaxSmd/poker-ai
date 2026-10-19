@@ -132,7 +132,7 @@ resets the magnitude.
 |---|---|---|---|
 | River re-solve (**default**) | Every river decision | Full-range vectorized CFR⁺ from the *real* public state — real pot/stacks, so bet-translation error vanishes on the deepest street; ~1–2 s/decision | — |
 | `--resolve-turn` (**off by default**) | Turn decisions | Re-solves the turn with the K-continuation leaf. Off because it over-folds: on 792 replayed Slumbot turn leads it folds 81% (Slumbot 43%, blueprint 40%) — the leaf lets the opponent choose the river pot size per hand | `--turn-full-river` solves the real river betting instead (exact; 798 s/decision, offline only) |
-| `--search` (off by default, pending `scripts/replay_search.sh`) | Flop and turn decisions where the abstraction is in sync | Depth-limited MCCFR in the blueprint's own game; at each leaf both players pick one of four blueprint continuations (unbiased / fold- / call- / raise-biased) and the hand is rolled out (Modicum, Pluribus) — no pot-scale stand-in leaf. Gated by the explicit oracle (0.010 bb with a check-down continuation) | Quality bounded by the blueprint it rolls out with; `--search-iters` trades time for convergence |
+| Depth-limited search (**default**; `--no-search` to disable) | Flop and turn decisions where the abstraction is in sync | Depth-limited MCCFR in the blueprint's own game; at each leaf both players pick one of four blueprint continuations (unbiased / fold- / call- / raise-biased) and the hand is rolled out (Modicum, Pluribus) — no pot-scale stand-in leaf. Gated by the explicit oracle (0.010 bb with a check-down continuation); on 600 replayed spots each it moved flop c-bet 0.28→0.54, flop fold 0.56→0.45, turn lead 0.19→0.42, turn fold 0.39→0.43 (Slumbot 0.58 / 0.49 / 0.33 / 0.35), 0.12 s/decision | Quality bounded by the blueprint it rolls out with; `--search-iters` trades time for convergence |
 | `--turn-checkdown` | Speed A/Bs | Turn resolves fall back to the K-continuation check-down cut | Reintroduces the leaf model the full-river mode removes |
 | `--resolve-flop` | Flop decisions (experimental) | K-continuation cut at the undealt turn | Slowest; leaf model on the turn boundary |
 | Continual re-solving (**default**) | Multiple resolves per hand | Carries the opponent's CFVs **at the child our action reached** and gadget-constrains the next resolve **within the street** (opponent actions leave the carry as a safe upper bound); dropped at each board reveal, where it would average over the new card; our own range is updated with the resolve's played (purified) strategy, never the blueprint's. Before 2026-09 the bot carried root CFVs across streets and used blueprint likelihoods | `--no-continual` for independent per-decision resolves |
@@ -175,7 +175,7 @@ memory_estimate [flop turn river]          exact footprint matrix (2p + 6-max)
       POKER_AI_ESTIMATE_STATES=N           betting-tree memo cap
       POKER_AI_ESTIMATE_CAPS="2;3;3,2,2,1" cap rows (per-street specs allowed)
 play slumbot [hands]                       live match vs slumbot.com (raw + luck-adjusted bb/100 ± CI)
-      --cap=N|P,F,T,R --no-resolve --resolve-turn --no-resolve-flop --search --search-iters=N
+      --cap=N|P,F,T,R --no-resolve --resolve-turn --no-resolve-flop --no-search --search-iters=N
       --turn-full-river --runout-sample=N --no-continual
       --iters=N --turn-iters=N --river-cap=N --continuations=L --purify=X --seed=N
       --log-hands=PATH --token=T | --username=U --password=P

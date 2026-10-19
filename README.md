@@ -202,7 +202,10 @@ Architecture (`crates/poker-ai/src/play/`):
   throughout; `--no-resolve-flop` falls back on the flop. The turn plays the
   blueprint by default: replaying 792 logged turn spots showed its re-solve
   folding 81% to Slumbot's leads against Slumbot's own 43% (`--resolve-turn`
-  turns it back on; see `BotConfig::resolve_turn`).
+  turns it back on; see `BotConfig::resolve_turn`). Where the abstraction is in
+  sync, flop and turn decisions are played by depth-limited search with
+  blueprint continuation strategies at the leaves (Pluribus-style; `--no-search`
+  disables it — see `BotConfig::search` for the replay measurement behind it).
 - The runner prints a running **bb/100 ± 95% CI**, emits `@wandb` metric lines
   (wrap with `scripts/train_wandb.py` to chart a long match), persists the
   session token, and logs every hand to `data/slumbot_results.csv`.

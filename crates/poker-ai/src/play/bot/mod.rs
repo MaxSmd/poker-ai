@@ -173,7 +173,21 @@ pub struct BotConfig {
     /// ([`crate::resolving::depth_limited`]) instead of the vectorized
     /// resolve or the blueprint.  Only where the abstract mirror is in sync —
     /// the search runs in the blueprint's own game; anything else falls back
-    /// to the usual path.  Off by default until measured.
+    /// to the usual path.  **On by default** (`--no-search` turns it off).
+    ///
+    /// Measured by replaying 600 logged spots each from a 10k-hand Slumbot
+    /// log (`scripts/replay_search.sh`, 2026-10), against Slumbot's own
+    /// frequencies in the same spots:
+    ///
+    /// ```text
+    ///                               before   search   Slumbot
+    ///   flop c-bet (we bet)          0.28     0.54     0.58
+    ///   flop vs a bet (we fold)      0.56     0.45     0.49
+    ///   turn lead (we bet)           0.19     0.42     0.33
+    ///   turn vs a lead (we fold)     0.39     0.43     0.35
+    /// ```
+    ///
+    /// at 0.12 s per decision with the 16 GB blueprint at 2000 iterations.
     pub search: bool,
     /// MCCFR iterations per search.
     pub search_iters: u64,
@@ -197,7 +211,7 @@ impl Default for BotConfig {
             resolve_desynced: true,
             purify: 0.1,
             opp_range_floor: 0.0,
-            search: false,
+            search: true,
             search_iters: 2_000,
             seed: 1,
         }
