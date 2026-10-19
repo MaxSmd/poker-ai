@@ -168,6 +168,15 @@ pub struct BotConfig {
     /// against the blueprint itself, the wrong one against an opponent whose
     /// frequencies differ.  Preflop updates and our own range are unaffected.
     pub opp_range_floor: f64,
+    /// Play flop and turn decisions by depth-limited search with blueprint
+    /// continuation strategies at the leaves
+    /// ([`crate::resolving::depth_limited`]) instead of the vectorized
+    /// resolve or the blueprint.  Only where the abstract mirror is in sync —
+    /// the search runs in the blueprint's own game; anything else falls back
+    /// to the usual path.  Off by default until measured.
+    pub search: bool,
+    /// MCCFR iterations per search.
+    pub search_iters: u64,
     /// Seed for the agent's action sampling and bet-mapping randomization.
     pub seed: u64,
 }
@@ -188,6 +197,8 @@ impl Default for BotConfig {
             resolve_desynced: true,
             purify: 0.1,
             opp_range_floor: 0.0,
+            search: false,
+            search_iters: 2_000,
             seed: 1,
         }
     }
@@ -233,6 +244,7 @@ pub struct HandState {
 pub enum DecisionPath {
     Blueprint,
     Resolve,
+    Search,
     Desynced,
 }
 
@@ -453,7 +465,10 @@ impl Bot {
         }
         let resolve_desynced =
             desynced && self.cfg.resolve_desynced && parsed.street > 0 && board_matches(parsed.street, board);
-        let mv = if self.should_resolve(parsed.street, board) || resolve_desynced {
+        let search = self.cfg.search && !desynced && matches!(parsed.street, 1 | 2) && board_matches(parsed.street, board);
+        let mv = if search {
+            self.decide_search(hs, &parsed, board)
+        } else if self.should_resolve(parsed.street, board) || resolve_desynced {
             self.decide_resolve(hs, &parsed, board)
         } else {
             self.decide_blueprint(hs, &parsed, board)

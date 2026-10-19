@@ -142,6 +142,19 @@ pub struct BlueprintState {
     street_raises: u8,
 }
 
+impl BlueprintState {
+    /// The abstract action indices from the start of the hand — the history
+    /// half of every blueprint key below this node.
+    pub fn history(&self) -> &[u8] {
+        &self.history
+    }
+
+    /// Raises made so far on the current street (the raise-cap counter).
+    pub fn street_raises(&self) -> u8 {
+        self.street_raises
+    }
+}
+
 /// A zero-allocation traversal cursor for [`BlueprintHoldem`]: one `GameState`
 /// walked in place via `apply_action`/`undo_action`, plus an inline
 /// perfect-recall history (no per-node `Vec`).

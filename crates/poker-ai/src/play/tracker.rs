@@ -105,6 +105,11 @@ impl AbstractHand {
         game.actions(&self.state)
     }
 
+    /// The abstract node the mirror is at.
+    pub fn state(&self) -> &BlueprintState {
+        &self.state
+    }
+
     /// The wrapped abstract engine state.
     pub fn gs<'g>(&'g self, game: &'g BlueprintHoldem) -> &'g GameState {
         game.game_state(&self.state)

@@ -43,6 +43,11 @@
 //!   --continuations=L  comma-separated turn/flop leaf pot scales, first 0.0
 //!                      (default 0.0,0.75,1.5,3.0; a single 0.0 = check-down)
 //!   --purify=X         drop action probabilities below X (default 0.1)
+//!   --search           flop and turn by depth-limited search with blueprint
+//!                      continuation strategies at the leaves (Pluribus-style;
+//!                      see resolving::depth_limited), where the abstraction
+//!                      is in sync
+//!   --search-iters=N   MCCFR iterations per search (default 2000)
 //!   --opp-range-floor=X  floor on the likelihood of the opponent's postflop
 //!                      actions in its range update (default 0 = plain
 //!                      Bayes; 1 = postflop actions do not narrow its range)
@@ -81,7 +86,7 @@ const ABSTRACT_SB: u32 = 1;
 const BOT_FLAGS: &[&str] = &[
     "data", "policy", "stack-bb", "cap", "no-resolve", "resolve-turn", "no-resolve-turn", "no-resolve-flop",
     "turn-full-river", "runout-sample", "no-continual", "iters", "turn-iters", "river-cap",
-    "continuations", "purify", "opp-range-floor", "seed",
+    "continuations", "purify", "opp-range-floor", "search", "search-iters", "seed",
 ];
 
 /// `--cap=N` or `--cap=P,F,T,R` (default 3).  Unlike [`flag`], a value that
@@ -197,6 +202,8 @@ fn build_bot(args: &[String], dir: &Path) -> Bot {
         resolve_desynced: !no_resolve,
         purify: flag(args, "purify").unwrap_or(0.1),
         opp_range_floor: strict_flag(args, "opp-range-floor").unwrap_or(0.0),
+        search: !no_resolve && args.iter().any(|a| a == "--search"),
+        search_iters: strict_flag(args, "search-iters").unwrap_or(2_000),
         seed: flag(args, "seed").unwrap_or(1),
     };
 
@@ -217,6 +224,9 @@ fn build_bot(args: &[String], dir: &Path) -> Bot {
         resolve_state(cfg.resolve_turn, cfg.turn_iters),
         resolve_state(cfg.resolve_flop, cfg.turn_iters),
     );
+    if cfg.search {
+        println!("  flop/turn: depth-limited search, {} iterations", cfg.search_iters);
+    }
     if cfg.resolve_turn || cfg.resolve_flop {
         println!("  continuations (K={}): {:?}", cfg.continuations.len(), cfg.continuations);
     }

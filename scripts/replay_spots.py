@@ -170,9 +170,12 @@ def summarize(spots_path, named):
         strong = [f for c in STRONG for f in by[c]]
         strong_rate = sum(strong) / len(strong) if strong else float("nan")
         paths = Counter(r["path"] for r in rows)
+        secs = [r["secs"] for r in rows if "secs" in r]
+        if secs:
+            paths[f"{sum(secs) / len(secs):.2f}s/decision"] = 0
         cells = "  ".join(f"{sum(by[c]) / len(by[c]):>5.2f} n={len(by[c]):<4}" if by[c] else f"{'—':>11}" for c in CLASSES)
         print(f"{name:<22} {len(rows):>4}  {rate:>5.2f}  {strong_rate:>15.2f}  {cells}   "
-              + ", ".join(f"{k} {v}" for k, v in sorted(paths.items())))
+              + ", ".join(f"{k} {v}" if v else k for k, v in sorted(paths.items())))
         verdicts[name] = (rate, strong_rate, len(rows))
 
     print("\nDecision rule (fixed before the run):")

@@ -19,8 +19,8 @@
 //! per line plus `target`, the offset in its action string of the decision to
 //! measure.  Each output line repeats the spot's `i`, `hole`, `board` and the
 //! logged move, and adds the agent's probability of folding, calling,
-//! checking and raising there, and which path decided (resolve / blueprint /
-//! desynced).  `scripts/replay_spots.py summarize` turns traces into the
+//! checking and raising there, which path decided (resolve / search /
+//! blueprint / desynced), and how long that decision took (`secs`).  `scripts/replay_spots.py summarize` turns traces into the
 //! comparison table.
 
 use std::io::{BufRead, BufReader, Write};
@@ -138,12 +138,15 @@ fn replay_one(bot: &mut Bot, spot: &Spot) -> Result<String, String> {
         }
         let logged = token_at(&spot.action, at);
         let seen = visible(&board, parsed.street)?;
+        let t0 = std::time::Instant::now();
         bot.act_forced(&mut hs, prefix, &seen, logged)?;
+        let secs = t0.elapsed().as_secs_f64();
         if at == spot.target {
             let t = bot.last_trace().ok_or("decision left no trace")?;
             let path = match t.path {
                 DecisionPath::Blueprint => "blueprint",
                 DecisionPath::Resolve => "resolve",
+                DecisionPath::Search => "search",
                 DecisionPath::Desynced => "desynced",
             };
             return Ok(serde_json::json!({
@@ -156,6 +159,7 @@ fn replay_one(bot: &mut Bot, spot: &Spot) -> Result<String, String> {
                 "call": t.prob(|m| m == RealMove::Call),
                 "check": t.prob(|m| m == RealMove::Check),
                 "raise": t.prob(|m| matches!(m, RealMove::BetTo(_))),
+                "secs": secs,
             })
             .to_string());
         }

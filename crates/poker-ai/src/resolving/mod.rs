@@ -6,4 +6,5 @@
 //! oracle, and lives in [`crate::validation::resolving`].
 
 pub mod belief_state;
+pub mod depth_limited;
 pub mod vector_cfr;

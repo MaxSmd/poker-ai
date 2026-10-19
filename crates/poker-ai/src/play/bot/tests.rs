@@ -271,6 +271,8 @@ fn resolve_bot(turn: bool, flop: bool, continuations: Vec<f64>) -> Bot {
             resolve_desynced: true,
             purify: 0.0,
             opp_range_floor: 0.0,
+            search: false,
+            search_iters: 0,
             seed: 42,
         },
     )
@@ -510,4 +512,51 @@ fn opp_range_floor_limits_how_far_a_postflop_action_narrows_the_range() {
     }
     let (_, after) = run(0.3);
     assert!(deuces.iter().all(|&i| after[i] > 0.0), "floor 0.3 keeps them alive");
+}
+
+/// Search end to end: a flop decision goes through the depth-limited
+/// search, plays a legal move, conditions our range on what the search
+/// played, and advances the mirror like any other decision.
+#[test]
+fn a_searched_flop_decision_is_legal_and_updates_our_range() {
+    let game = BlueprintHoldem::new(400, 2, 1, 0).with_raise_cap(2);
+    let cfg = BotConfig { search: true, search_iters: 200, resolve_river: false, purify: 0.0, seed: 3, ..Default::default() };
+    let mut b = Bot::new(game, CompactPolicy::from_entries(vec![]), cfg);
+    let hole = [parse_card("Ac").unwrap(), parse_card("Kd").unwrap()];
+    let mut hs = b.start_hand(0, hole); // BB, first to act postflop
+    let action = "b200c/";
+    let board = cards(&["Qs", "4s", "3h"]);
+    b.sync(&mut hs, &parse_action(action).unwrap(), &board);
+    let before = hs.ranges[hs.my_seat].probs.clone();
+
+    let incr = b.act(&mut hs, action, &board).expect("flop decision");
+    assert!(incr == "k" || incr.starts_with('b'), "unopened flop: check or bet, got {incr:?}");
+    assert!(parse_action(&format!("{action}{incr}")).is_ok());
+    let t = b.last_trace().unwrap();
+    assert_eq!(t.path, DecisionPath::Search);
+    assert!((t.prob(|_| true) - 1.0).abs() < 1e-9);
+
+    let after = &hs.ranges[hs.my_seat].probs;
+    assert!((after.iter().sum::<f64>() - 1.0).abs() < 1e-9);
+    assert!(
+        before.iter().zip(after).filter(|(&p, _)| p > 0.0).any(|(&p, &q)| (q / p - 1.0).abs() > 1e-3),
+        "the search's strategy must reshape our range"
+    );
+    assert_eq!(hs.pending_self.map(|p| p.is_some()), Some(true), "mirror advanced");
+}
+
+/// A spot the mirror has lost has no blueprint node to search from: it
+/// takes the usual desynced path instead.
+#[test]
+fn a_desynced_spot_is_not_searched() {
+    let action = "b250b750b1657b6750c/b13250";
+    let board = cards(&["2c", "7h", "9s"]);
+    let mut b = resolve_bot(false, false, vec![0.0]);
+    b.cfg.search = true;
+    b.cfg.search_iters = 50;
+    b.cfg.runout_sample = 8;
+    let h = [parse_card("Ac").unwrap(), parse_card("Ad").unwrap()];
+    let mut hs = b.start_hand(1, h);
+    b.act(&mut hs, action, &board).expect("bot acts");
+    assert_ne!(b.last_trace().unwrap().path, DecisionPath::Search);
 }

@@ -17,6 +17,7 @@ use crate::play::protocol::{EventKind, Parsed, BIG_BLIND, SMALL_BLIND, STACK_SIZ
 use crate::play::tracker::{MapOutcome, RealMove};
 use super::hole_mask;
 use crate::resolving::belief_state::{combo_cards, combo_index, BeliefState, NUM_COMBOS};
+use crate::resolving::depth_limited::{search, SearchConfig, SearchRoot};
 use crate::resolving::vector_cfr::{
     capped_root_actions, subgame_info_key, ResolveConfig, VectorCfr, VectorResolved,
 };
@@ -38,10 +39,22 @@ impl Bot {
         let key = hs.hand.info_key(&self.game);
         let probs = self.policy.probs_or_uniform(key, acts.len());
 
+        let moves = self.abstract_moves(hs, parsed, &acts, facing);
+        let played = self.play_distribution(&probs);
+        let idx = self.choose(DecisionPath::Blueprint, parsed.street, &played, &moves);
+        let mv = moves[idx];
+
+        self.update_range(hs, hs.my_seat, idx as u8);
+        hs.hand.apply(&self.game, idx as u8);
+        hs.pending_self = Some(Some(idx as u8));
+        mv
+    }
+
+    /// Each abstract action at the mirror's node as a real move.
+    fn abstract_moves(&self, hs: &HandState, parsed: &Parsed, acts: &[Action], facing: bool) -> Vec<RealMove> {
         let real_min = parsed.last_bet_size.max(BIG_BLIND);
         let remaining = STACK_SIZE - parsed.total_last_bet_to;
-        let moves: Vec<RealMove> = acts
-            .iter()
+        acts.iter()
             .map(|&a| {
                 hs.hand.abstract_to_real(
                     &self.game,
@@ -53,15 +66,66 @@ impl Bot {
                     remaining,
                 )
             })
-            .collect();
-        let played = self.play_distribution(&probs);
-        let idx = self.choose(DecisionPath::Blueprint, parsed.street, &played, &moves);
-        let mv = moves[idx];
+            .collect()
+    }
 
-        self.update_range(hs, hs.my_seat, idx as u8);
+    /// Flop/turn decision by depth-limited search in the blueprint's own game
+    /// (see [`crate::resolving::depth_limited`]).  Called only when the mirror
+    /// is in sync, so the root is an exact blueprint node.
+    pub(super) fn decide_search(&mut self, hs: &mut HandState, parsed: &Parsed, board: &[u8]) -> RealMove {
+        let acts: Vec<Action> = hs.hand.actions(&self.game).iter().copied().collect();
+        let seed = (self.unit() * u64::MAX as f64) as u64;
+        let state = hs.hand.state();
+        let input = SearchRoot {
+            game: &self.game,
+            root: self.game.game_state(state).clone(),
+            street_raises: state.street_raises(),
+            history: state.history().to_vec(),
+            ranges: resolve_beliefs(hs, board),
+            hero_hole: hs.my_hole,
+        };
+        let cfg = SearchConfig { iterations: self.cfg.search_iters, seed, ..Default::default() };
+        let result = search(&input, &self.policy, &cfg);
+
+        let moves = self.abstract_moves(hs, parsed, &acts, parsed.last_bet_size > 0);
+        let played = self.play_distribution(&result.hero);
+        let idx = self.choose(DecisionPath::Search, parsed.street, &played, &moves);
+
+        // Our range follows the strategy the search played for each hand;
+        // a hand it never sampled keeps the blueprint's likelihood.
+        let gs = hs.hand.gs(&self.game);
+        let mut board_mask = 0u64;
+        for &c in &gs.board[..gs.board_cards_count()] {
+            board_mask |= 1 << c;
+        }
+        let mut likelihood = vec![0.0; NUM_COMBOS];
+        for (h, l) in likelihood.iter_mut().enumerate() {
+            if hs.ranges[hs.my_seat].probs[h] <= 0.0 {
+                continue;
+            }
+            let [a, b] = combo_cards(h);
+            if board_mask & (1 << a) != 0 || board_mask & (1 << b) != 0 {
+                continue;
+            }
+            *l = match &result.root_strategies[h] {
+                Some(s) => self.play_distribution(s)[idx],
+                None => {
+                    let key = hs.hand.key_with_hole(&self.game, [a, b]);
+                    self.play_distribution(&self.policy.probs_or_uniform(key, acts.len()))[idx]
+                }
+            };
+        }
+        let mut updated = hs.ranges[hs.my_seat].clone();
+        updated.update(&likelihood);
+        if updated.probs.iter().any(|&p| p > 0.0) {
+            hs.ranges[hs.my_seat] = updated;
+        }
+
+        // A search carries no CFVs: the next re-solve this hand bootstraps.
+        hs.carried_cfvs = None;
         hs.hand.apply(&self.game, idx as u8);
         hs.pending_self = Some(Some(idx as u8));
-        mv
+        moves[idx]
     }
 
     /// Decision when the abstract game has no node for this spot.
