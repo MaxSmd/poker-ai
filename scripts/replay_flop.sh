@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 #
-# One round: does any setting fix our flop play?
+# One round: does any setting fix our flop play — and if one does, does it
+# change the result against Slumbot?
 #
 #   tmux new-session -d -s replay '~/poker-ai/scripts/replay_flop.sh; exec bash'
+#
+# 1. Replays (~3 h): the arms below on two flop spots.
+# 2. Picks the first arm that passes BOTH spots by the fixed rule, if any.
+# 3. Plays a logged 10k-hand Slumbot match with it (~17 h) and adds the match
+#    result and the spot report of its log to summary.txt.  With no winner,
+#    the match is skipped and summary.txt says so.
 #
 # The flop is still re-solved with the K-continuation leaf that made the turn
 # over-fold (scripts/replay_turn_folds.sh).  Two flop spots from the log,
@@ -22,7 +29,7 @@
 # Slumbot on either side, and, when facing a bet, top pair or better folded
 # at most 10%.  A setting ships only if it passes BOTH spots — fixing the
 # c-bet by breaking the defence is not a fix.  One process at a time
-# (~16 GB each).  About 3 hours.
+# (~16 GB each).  About 20 hours with the match, 3 without.
 set -u
 
 cd "$(dirname "$0")/.." || exit 1
@@ -64,5 +71,40 @@ for spot in cbet defend; do
         args="$args $name=$OUT/${spot}_$name.jsonl"
     done
     # shellcheck disable=SC2086  # a word list by construction
-    python3 scripts/replay_spots.py summarize "$OUT/$spot.jsonl" $args
-done | tee "$OUT/summary.txt"
+    python3 scripts/replay_spots.py summarize "$OUT/$spot.jsonl" $args > "$OUT/summary_$spot.txt"
+done
+cat "$OUT/summary_cbet.txt" "$OUT/summary_defend.txt" > "$OUT/summary.txt"
+
+# The winner: the first non-default arm passing both spots.  Both summaries
+# must also have found the replay faithful, or no verdict counts.
+passes() { grep -qE "^  $1 +FIXES the leak" "$OUT/summary_$2.txt"; }
+WINNER=""
+if grep -q "replay faithful" "$OUT/summary_cbet.txt" && grep -q "replay faithful" "$OUT/summary_defend.txt"; then
+    for name in $NAMES; do
+        [ "$name" = default ] && continue
+        if passes "$name" cbet && passes "$name" defend; then WINNER=$name; break; fi
+    done
+fi
+
+{
+    echo
+    echo "================================ RESULT ================================"
+    if [ -z "$WINNER" ]; then
+        echo "No arm passed both spots (or the replay was not faithful) — no match played."
+    else
+        echo "Winner: $WINNER  ($(flags "$WINNER"))"
+    fi
+} | tee -a "$OUT/summary.txt"
+[ -n "$WINNER" ] || exit 0
+
+printf '=== %s  START  slumbot 10000 with %s\n' "$(date +%H:%M:%S)" "$WINNER"
+# shellcheck disable=SC2046
+nice -n 19 "$BIN" slumbot 10000 --cap=2 $(flags "$WINNER") \
+    --log-hands="$OUT/hands_10k_$WINNER.jsonl" > "$OUT/slumbot_10k_$WINNER.log" 2>&1
+printf '=== %s  DONE   slumbot  exit %d\n' "$(date +%H:%M:%S)" "$?"
+{
+    echo
+    echo "Slumbot, 10k hands with $WINNER (baseline: luck-adjusted -19.6 ± 19.9 bb/100):"
+    grep -E "^Done:|^Abstraction tracking" "$OUT/slumbot_10k_$WINNER.log"
+    python3 scripts/spot_report.py "$OUT/hands_10k_$WINNER.jsonl"
+} | tee -a "$OUT/summary.txt"
