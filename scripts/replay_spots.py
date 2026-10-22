@@ -97,7 +97,7 @@ def select(log, out):
         want = want[:3] + ("",)
     stat = stat_of(want)
     max_n = int(arg("max", "0"))
-    spots, slumbot = [], []
+    spots, slumbot, slumbot_raise = [], [], []
     n_hands = 0
     for ln in open(log):
         if not ln.strip():
@@ -109,6 +109,7 @@ def select(log, out):
                 continue
             if d["pos"] != r["pos"]:
                 slumbot.append(took(stat, d["action"]))
+                slumbot_raise.append(d["action"] == "b")
                 continue
             if len(r.get("hole") or []) != 2 or len(r.get("board") or []) < [0, 3, 4, 5][want[0]]:
                 continue
@@ -126,6 +127,9 @@ def select(log, out):
         "stat": stat,
         "slumbot_rate": sum(slumbot) / len(slumbot) if slumbot else None,
         "slumbot_n": len(slumbot),
+        # Facing a bet, raising too often is a leak of its own (the search
+        # once check-raised the flop 51% against Slumbot's 7%).
+        "slumbot_raise": sum(slumbot_raise) / len(slumbot_raise) if stat == "fold" and slumbot_raise else None,
         "log": log,
     }
     with open(out + ".meta", "w") as w:
@@ -177,27 +181,93 @@ def summarize(spots_path, named):
         print(f"{name:<22} {len(rows):>4}  {rate:>5.2f}  {strong_rate:>15.2f}  {cells}   "
               + ", ".join(f"{k} {v}" if v else k for k, v in sorted(paths.items())))
         verdicts[name] = (rate, strong_rate, len(rows))
+        if stat == "fold":
+            print(f"{'':<22} {'':>4}  raise {sum(r['raise'] for r in rows) / len(rows):.2f}"
+                  + (f" (Slumbot {meta['slumbot_raise']:.2f})" if meta.get("slumbot_raise") is not None else ""))
 
     print("\nDecision rule (fixed before the run):")
     if "default" not in verdicts:
         print("  no `default` trace — cannot check that the replay is faithful.")
         return
-    d_rate, _, d_n = verdicts["default"]
+    problem = faithfulness(spots, logged, stat, *verdicts["default"][:3:2])
+    if problem:
+        print(f"  {problem}")
+        return
+    print(f"  replay faithful: default {verdicts['default'][0]:.2f} vs logged {logged:.2f}.")
+    for name, path in named:
+        if name in verdicts:
+            ok, why, _ = judge(meta, path)
+            print(f"  {name:<22} {'FIXES the leak' if ok else 'does not fix it'}   ({why})")
+
+
+def faithfulness(spots, logged, stat, d_rate, d_n):
+    """Why the `default` trace cannot be trusted, or None if it can."""
     if abs(d_rate - logged) > 0.05:
-        print(f"  REPLAY NOT FAITHFUL: default {stat}s {d_rate:.2f}, the log shows {logged:.2f}. "
-              "Fix the replay before reading any other row.")
-        return
+        return (f"REPLAY NOT FAITHFUL: default {stat}s {d_rate:.2f}, the log shows {logged:.2f}. "
+                "Fix the replay before reading any other row.")
     if d_n < 0.9 * len(spots):
-        print(f"  REPLAY INCOMPLETE: default traced {d_n} of {len(spots)} spots — check the errors in its log.")
-        return
-    print(f"  replay faithful: default {d_rate:.2f} vs logged {logged:.2f}.")
-    for name, (rate, strong_rate, _) in verdicts.items():
-        near = abs(rate - ref) <= 0.10
-        ok = near and (stat == "bet" or strong_rate <= 0.10)
-        why = f"{stat} {rate:.2f} vs Slumbot {ref:.2f}"
-        if stat == "fold":
-            why += f", top pair+ folds {strong_rate:.2f}"
-        print(f"  {name:<22} {'FIXES the leak' if ok else 'does not fix it'}   ({why})")
+        return f"REPLAY INCOMPLETE: default traced {d_n} of {len(spots)} spots — check the errors in its log."
+    return None
+
+
+def judge(meta, trace_path):
+    """The rule fixed before each run, for one trace on one spot:
+    `(passes, explanation, total |gap| to Slumbot)`.
+
+    Within 10 points of Slumbot's rate on either side; facing a bet, also
+    within 10 points of Slumbot's raise rate (when the spot records it) and
+    top pair or better folded at most 10% of the time."""
+    rows = [json.loads(ln) for ln in open(trace_path) if ln.strip()]
+    stat, ref = meta["stat"], meta["slumbot_rate"]
+    field = "raise" if stat == "bet" else "fold"
+    rate = sum(r[field] for r in rows) / len(rows)
+    gap = abs(rate - ref)
+    ok = gap <= 0.10
+    why = f"{stat} {rate:.2f} vs Slumbot {ref:.2f}"
+    if stat == "fold":
+        strong = [r["fold"] for r in rows if hand_class(r["hole"], r["board"]) in STRONG]
+        strong_rate = sum(strong) / len(strong) if strong else 0.0
+        ok = ok and strong_rate <= 0.10
+        why += f", top pair+ folds {strong_rate:.2f}"
+        ref_raise = meta.get("slumbot_raise")
+        if ref_raise is not None:
+            raise_rate = sum(r["raise"] for r in rows) / len(rows)
+            gap += abs(raise_rate - ref_raise)
+            ok = ok and abs(raise_rate - ref_raise) <= 0.10
+            why += f", raise {raise_rate:.2f} vs {ref_raise:.2f}"
+    return ok, why, gap
+
+
+def best(out_dir, spot_names, arms):
+    """The arm that passes every spot (each with a faithful `default`),
+    with the smallest total gap to Slumbot; fewer iterations (earlier in
+    `arms`) on a tie.  Prints its name, or nothing."""
+    winner = None
+    for arm in arms:
+        if arm == "default":
+            continue
+        total, passed = 0.0, True
+        for spot in spot_names:
+            sp = f"{out_dir}/{spot}.jsonl"
+            meta = json.load(open(sp + ".meta"))
+            spots = [json.loads(ln) for ln in open(sp) if ln.strip()]
+            stat = meta["stat"]
+            logged = sum(took(stat, x["action"][x["target"]]) for x in spots) / len(spots)
+            try:
+                d_rows = [json.loads(ln) for ln in open(f"{out_dir}/{spot}_default.jsonl") if ln.strip()]
+                field = "raise" if stat == "bet" else "fold"
+                d_rate = sum(r[field] for r in d_rows) / len(d_rows)
+                if faithfulness(spots, logged, stat, d_rate, len(d_rows)):
+                    return None
+                ok, _, gap = judge(meta, f"{out_dir}/{spot}_{arm}.jsonl")
+            except (FileNotFoundError, ZeroDivisionError):
+                ok, gap = False, 0.0
+            passed = passed and ok
+            total += gap
+        if passed and (winner is None or total < winner[1] - 1e-12):
+            winner = (arm, total)
+    if winner:
+        print(winner[0])
 
 
 def self_check():
@@ -220,6 +290,8 @@ if __name__ == "__main__":
     pos = [a for a in sys.argv[1:] if not a.startswith("--")]
     if len(pos) >= 2 and pos[0] == "select":
         select(pos[1], arg("out", "spots.jsonl"))
+    elif len(pos) >= 2 and pos[0] == "best":
+        best(pos[1], arg("spots", "").split(","), arg("arms", "").split(","))
     elif len(pos) >= 3 and pos[0] == "summarize":
         summarize(pos[1], [tuple(p.split("=", 1)) if "=" in p else (p, p) for p in pos[2:]])
     else:
