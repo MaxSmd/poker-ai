@@ -38,11 +38,11 @@ run() {
     grep -E "^Done:" "$OUT/$name.log" | sed 's/^/      /'
 }
 
-run default --no-search --resolve-turn
-run leaf_checkdown --no-search --resolve-turn --continuations=0.0
-run floor_1 --no-search --resolve-turn --opp-range-floor=1.0
-run floor_0.3 --no-search --resolve-turn --opp-range-floor=0.3
-run blueprint_turn --no-search --no-resolve-turn
+run default --no-search --resolve-flop --resolve-turn
+run leaf_checkdown --no-search --resolve-flop --resolve-turn --continuations=0.0
+run floor_1 --no-search --resolve-flop --resolve-turn --opp-range-floor=1.0
+run floor_0.3 --no-search --resolve-flop --resolve-turn --opp-range-floor=0.3
+run blueprint_turn --no-search --resolve-flop --no-resolve-turn
 
 # shellcheck disable=SC2086  # ARMS is a word list by construction
 python3 scripts/replay_spots.py summarize "$OUT/spots.jsonl" $ARMS | tee "$OUT/summary.txt"

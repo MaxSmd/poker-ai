@@ -70,7 +70,7 @@ run lbr_blueprint_only lbr "$HANDS" --cap=2 --no-resolve --lbr-seed="$SEED"
 # 2. The headline: the shipped agent (river and flop re-solved, turn from the
 #    blueprint since 2026-10).
 #    (1) vs (2) is the ablation that justifies the resolver.
-run lbr_resolve_all   lbr "$HANDS" --cap=2 --lbr-seed="$SEED"
+run lbr_resolve_all   lbr "$HANDS" --cap=2 --resolve-flop --resolve-turn --lbr-seed="$SEED"
 
 # 3. A tighter blueprint exploitability figure than the 16-flop estimate:
 #    4x the flops, and board-samples=3 to match the historical runs.
@@ -79,11 +79,11 @@ run expl_flops64      expl --cap=2 --flops=64 --board-samples=3 --seed="$SEED"
 # 4. Purification was tuned when only the river was re-solved.  With three
 #    streets re-solved, small probabilities are more likely to be real mixing
 #    than abstraction noise, so 0.1 may now be discarding strategy.
-run lbr_purify0       lbr "$HANDS" --cap=2 --purify=0.0 --lbr-seed="$SEED"
+run lbr_purify0       lbr "$HANDS" --cap=2 --resolve-flop --resolve-turn --purify=0.0 --lbr-seed="$SEED"
 
 # 5. Isolate the streets: river+turn only.  Against (2) this prices the flop
 #    resolve specifically — the most expensive one at 2.1 s/decision.
-run lbr_no_flop       lbr "$HANDS" --cap=2 --no-resolve-flop --lbr-seed="$SEED"
+run lbr_no_flop       lbr "$HANDS" --cap=2 --resolve-turn --lbr-seed="$SEED"
 
 # 6-8. Why does re-solving lose ground to LBR?  Each of (1)->(5) re-solved
 #    another street and the agent won less; these isolate the suspects.
@@ -92,12 +92,12 @@ run lbr_river_only    lbr "$HANDS" --cap=2 --no-resolve-turn --no-resolve-flop -
 
 #    Continual off: every resolve starts unconstrained.  If the gadget or the
 #    values it carries are at fault, this closes the gap to (1).
-run lbr_no_continual  lbr "$HANDS" --cap=2 --no-continual --lbr-seed="$SEED"
+run lbr_no_continual  lbr "$HANDS" --cap=2 --resolve-flop --resolve-turn --no-continual --lbr-seed="$SEED"
 
 #    Resolve cap 2: the resolves default to 3 raises a street against a cap-2
 #    blueprint, so they solve a different betting game than the one the
 #    ranges entering them came from.
-run lbr_river_cap2    lbr "$HANDS" --cap=2 --river-cap=2 --lbr-seed="$SEED"
+run lbr_river_cap2    lbr "$HANDS" --cap=2 --resolve-flop --resolve-turn --river-cap=2 --lbr-seed="$SEED"
 
 echo "================================ SUMMARY ================================"
 for f in "$OUT"/*.log; do

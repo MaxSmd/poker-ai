@@ -199,20 +199,20 @@ Architecture (`crates/poker-ai/src/play/`):
   (turn) or 1176 (flop) board completions *per iteration* — the flop cost 24.6 s
   a decision before `--runout-sample` let it estimate that sweep from a rotating
   sample instead of enumerating it. `--no-resolve` plays the blueprint
-  throughout; `--no-resolve-flop` falls back on the flop. The turn plays the
-  blueprint by default: replaying 792 logged turn spots showed its re-solve
-  folding 81% to Slumbot's leads against Slumbot's own 43% (`--resolve-turn`
-  turns it back on; see `BotConfig::resolve_turn`). Where the abstraction is in
-  sync, flop and turn decisions are played by depth-limited search with
-  blueprint continuation strategies at the leaves (Pluribus-style; `--no-search`
-  disables it — see `BotConfig::search` for the replay measurement behind it).
+  throughout. By default only the river re-solves; the flop and turn play the
+  blueprint, because their leaf-cut re-solves over-fold — 66% of small-blind
+  flop decisions facing a bet were folds (Slumbot: 33-37%), and 81% on turn
+  leads (`--resolve-flop` / `--resolve-turn` turn them back on; see
+  `BotConfig::resolve_flop`). `--search` plays flop and turn by depth-limited
+  search with blueprint continuations instead (off: over-aggressive in play,
+  see `BotConfig::search`).
 - The runner prints a running **bb/100 ± 95% CI**, emits `@wandb` metric lines
   (wrap with `scripts/train_wandb.py` to chart a long match), persists the
   session token, and logs every hand to `data/slumbot_results.csv`.
 
 Flags: `--iters=N` (resolve iterations), `--river-cap=N`, `--purify=X`
 (drop sub-X action probabilities), `--seed=N`, `--no-resolve`,
-`--resolve-turn`, `--no-resolve-flop`, `--runout-sample=N` (completions per
+`--resolve-turn`, `--resolve-flop`, `--search`, `--runout-sample=N` (completions per
 iteration at a depth-cut leaf; `0` = exact),
 `--token=`/`--username=`/`--password=` — see the header of `src/bin/play/main.rs`.
 

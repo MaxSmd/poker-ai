@@ -47,10 +47,10 @@ python3 scripts/replay_spots.py select "$LOG" --street=flop --seat=BB --spot="vs
 NAMES="default blueprint_flop leaf_checkdown leaf_mild"
 flags() {
     case $1 in
-        default) echo --no-search ;;
+        default) echo --no-search --resolve-flop ;;
         blueprint_flop) echo --no-search --no-resolve-flop ;;
-        leaf_checkdown) echo --no-search --continuations=0.0 ;;
-        leaf_mild) echo --no-search --continuations=0.0,0.75 ;;
+        leaf_checkdown) echo --no-search --resolve-flop --continuations=0.0 ;;
+        leaf_mild) echo --no-search --resolve-flop --continuations=0.0,0.75 ;;
     esac
 }
 

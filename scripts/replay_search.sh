@@ -55,7 +55,7 @@ sel turn_defend --street=turn --seat=SB --spot="vs bet" --size=40-80%
 SPOTS="flop_cbet flop_defend turn_lead turn_defend"
 
 for name in default search; do
-    flags="--no-search"
+    flags="--no-search --resolve-flop"
     [ "$name" = search ] && flags="--search --search-iters=$ITERS"
     for spot in $SPOTS; do
         printf '=== %s  START  %-8s %-12s %s\n' "$(date +%H:%M:%S)" "$name" "$spot" "$flags"

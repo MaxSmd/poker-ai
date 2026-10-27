@@ -16,9 +16,9 @@
 //!   **turn** resolve cuts at the river reveal and a **flop** resolve at the
 //!   turn reveal, with the opponent choosing among K continuations at the leaf,
 //!   so the resolve is robust to post-leaf betting a plain check-down ignores.
-//!   The river and flop re-solve by default, each inside ~2 s per decision;
-//!   the turn plays the blueprint (see `BotConfig::resolve_turn` for the
-//!   measurement behind that);
+//!   By default only the **river** re-solves (exact to showdown, no leaf
+//!   model); the flop and turn play the blueprint — their leaf-cut re-solves
+//!   over-fold, measured in `BotConfig::resolve_turn` and `resolve_flop`;
 //!   `runout_sample` is what makes the turn and flop affordable, and
 //!   `turn_full_river` is an offline reference mode at 798 s/decision.
 //! * **Continual re-solving** (DeepStack-style, on by default) — every resolve
@@ -71,7 +71,17 @@ pub struct BotConfig {
     /// **[`Self::turn_full_river`] must stay off.** It replaces the depth cut
     /// with the real river betting and costs 798 s per decision.
     pub resolve_turn: bool,
-    /// Re-solve flop decisions.  On by default.
+    /// Re-solve flop decisions.  **Off by default** — the blueprint plays the
+    /// flop, as it does the turn.
+    ///
+    /// Two 10k-hand Slumbot logs with this on show where the money went:
+    /// facing a flop bet the small blind folded 66% (Slumbot 33-37% in the
+    /// same seat) and the big blind 56-57% (Slumbot 46-49%), together about
+    /// -20 bb/100 — the whole loss.  It is the same continuation leaf that
+    /// made the turn re-solve fold 81% to leads (see `resolve_turn`), and the
+    /// match history agrees: blueprint flop with river re-solving scored
+    /// +7.9 ± 26 (July) and -5.9 ± 33 (August); re-solving the flop, -23.7
+    /// and -19.6.  `--resolve-flop` turns it back on.
     ///
     /// 2.1 s per decision — down from **24.6 s** before [`Self::runout_sample`]
     /// existed. Each depth-cut leaf enumerates C(49,2)=1176 turn+river
@@ -173,7 +183,10 @@ pub struct BotConfig {
     /// ([`crate::resolving::depth_limited`]) instead of the vectorized
     /// resolve or the blueprint.  Only where the abstract mirror is in sync —
     /// the search runs in the blueprint's own game; anything else falls back
-    /// to the usual path.  **On by default** (`--no-search` turns it off).
+    /// to the usual path.  **Off by default** (`--search` turns it on): it
+    /// fixed the four spots it was replayed on but turned the big blind
+    /// hyper-aggressive in play (flop lead 53%, check-raise 51%; Slumbot 16%
+    /// and 7%), and more iterations did not cure that.
     ///
     /// Measured by replaying 600 logged spots each from a 10k-hand Slumbot
     /// log (`scripts/replay_search.sh`, 2026-10), against Slumbot's own
@@ -206,7 +219,7 @@ impl Default for BotConfig {
         Self {
             resolve_river: true,
             resolve_turn: false,
-            resolve_flop: true,
+            resolve_flop: false,
             river_iters: 1_500,
             turn_iters: 500,
             river_cap: 3,
@@ -217,7 +230,7 @@ impl Default for BotConfig {
             resolve_desynced: true,
             purify: 0.1,
             opp_range_floor: 0.0,
-            search: true,
+            search: false,
             search_iters: 2_000,
             search_continuations: crate::resolving::depth_limited::CONTINUATIONS,
             search_bias: 5.0,

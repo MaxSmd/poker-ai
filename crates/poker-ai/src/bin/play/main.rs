@@ -27,7 +27,9 @@
 //!   --resolve-turn     re-solve the turn (OFF by default: its leaf model
 //!                      over-folds — see BotConfig::resolve_turn)
 //!   --no-resolve-turn  blueprint on the turn (the default; still accepted)
-//!   --no-resolve-flop  blueprint on the flop (re-solving is ON by default)
+//!   --resolve-flop     re-solve the flop (OFF by default: its leaf model
+//!                      over-folds — see BotConfig::resolve_flop)
+//!   --no-resolve-flop  blueprint on the flop (the default; still accepted)
 //!   --runout-sample=N  board completions evaluated per iteration at a
 //!                      depth-cut leaf, 0 = exact (default 64).  What makes
 //!                      turn/flop re-solving affordable: a flop leaf has 1176
@@ -43,10 +45,10 @@
 //!   --continuations=L  comma-separated turn/flop leaf pot scales, first 0.0
 //!                      (default 0.0,0.75,1.5,3.0; a single 0.0 = check-down)
 //!   --purify=X         drop action probabilities below X (default 0.1)
-//!   --no-search        turn off the flop/turn depth-limited search (ON by
-//!                      default: blueprint continuation strategies at the
-//!                      leaves, Pluribus-style — see resolving::depth_limited
-//!                      and BotConfig::search); --search is still accepted
+//!   --search           flop and turn by depth-limited search with blueprint
+//!                      continuation strategies at the leaves (OFF by default:
+//!                      over-aggressive in play — see BotConfig::search);
+//!                      --no-search is still accepted
 //!   --search-iters=N   MCCFR iterations per search (default 2000)
 //!   --search-k=K       continuation strategies per player at a leaf, 1-4
 //!                      (default 4: blueprint, fold-, call-, raise-biased)
@@ -89,7 +91,7 @@ const ABSTRACT_SB: u32 = 1;
 /// The flags that configure the playing agent ([`build_bot`]) — shared by
 /// `slumbot` and `lbr`, which each add their own.
 const BOT_FLAGS: &[&str] = &[
-    "data", "policy", "stack-bb", "cap", "no-resolve", "resolve-turn", "no-resolve-turn", "no-resolve-flop",
+    "data", "policy", "stack-bb", "cap", "no-resolve", "resolve-turn", "no-resolve-turn", "resolve-flop", "no-resolve-flop",
     "turn-full-river", "runout-sample", "no-continual", "iters", "turn-iters", "river-cap",
     "continuations", "purify", "opp-range-floor", "search", "no-search", "search-iters", "search-k", "search-bias",
     "search-opp-only", "seed",
@@ -197,7 +199,9 @@ fn build_bot(args: &[String], dir: &Path) -> Bot {
         resolve_turn: !no_resolve
             && args.iter().any(|a| a == "--resolve-turn")
             && !args.iter().any(|a| a == "--no-resolve-turn"),
-        resolve_flop: !no_resolve && !args.iter().any(|a| a == "--no-resolve-flop"),
+        resolve_flop: !no_resolve
+            && args.iter().any(|a| a == "--resolve-flop")
+            && !args.iter().any(|a| a == "--no-resolve-flop"),
         river_iters: flag(args, "iters").unwrap_or(1_500),
         turn_iters: flag(args, "turn-iters").unwrap_or(500),
         river_cap: flag(args, "river-cap").unwrap_or(3),
@@ -208,7 +212,9 @@ fn build_bot(args: &[String], dir: &Path) -> Bot {
         resolve_desynced: !no_resolve,
         purify: flag(args, "purify").unwrap_or(0.1),
         opp_range_floor: strict_flag(args, "opp-range-floor").unwrap_or(0.0),
-        search: !no_resolve && !args.iter().any(|a| a == "--no-search"),
+        search: !no_resolve
+            && args.iter().any(|a| a == "--search")
+            && !args.iter().any(|a| a == "--no-search"),
         search_iters: strict_flag(args, "search-iters").unwrap_or(2_000),
         search_continuations: strict_flag(args, "search-k").unwrap_or(4usize).clamp(1, 4),
         search_bias: strict_flag(args, "search-bias").unwrap_or(5.0),
