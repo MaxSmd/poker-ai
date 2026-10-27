@@ -84,7 +84,14 @@ impl Bot {
             ranges: resolve_beliefs(hs, board),
             hero_hole: hs.my_hole,
         };
-        let cfg = SearchConfig { iterations: self.cfg.search_iters, seed, ..Default::default() };
+        let cfg = SearchConfig {
+            iterations: self.cfg.search_iters,
+            continuations: self.cfg.search_continuations,
+            bias: self.cfg.search_bias,
+            searcher_chooses: self.cfg.search_searcher_chooses,
+            seed,
+            ..Default::default()
+        };
         let result = search(&input, &self.policy, &cfg);
 
         let moves = self.abstract_moves(hs, parsed, &acts, parsed.last_bet_size > 0);

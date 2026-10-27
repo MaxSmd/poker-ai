@@ -191,6 +191,12 @@ pub struct BotConfig {
     pub search: bool,
     /// MCCFR iterations per search.
     pub search_iters: u64,
+    /// Continuation strategies per player at a search leaf (4, or 1 for the
+    /// blueprint alone), how strongly the biased ones lean, and whether we
+    /// choose ours too — see `resolving::depth_limited::SearchConfig`.
+    pub search_continuations: usize,
+    pub search_bias: f64,
+    pub search_searcher_chooses: bool,
     /// Seed for the agent's action sampling and bet-mapping randomization.
     pub seed: u64,
 }
@@ -213,6 +219,9 @@ impl Default for BotConfig {
             opp_range_floor: 0.0,
             search: true,
             search_iters: 2_000,
+            search_continuations: crate::resolving::depth_limited::CONTINUATIONS,
+            search_bias: 5.0,
+            search_searcher_chooses: true,
             seed: 1,
         }
     }

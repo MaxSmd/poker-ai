@@ -275,6 +275,9 @@ fn resolve_bot(turn: bool, flop: bool, continuations: Vec<f64>) -> Bot {
             opp_range_floor: 0.0,
             search: false,
             search_iters: 0,
+            search_continuations: 4,
+            search_bias: 5.0,
+            search_searcher_chooses: true,
             seed: 42,
         },
     )

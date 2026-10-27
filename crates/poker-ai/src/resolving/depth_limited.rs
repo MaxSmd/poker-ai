@@ -96,12 +96,25 @@ pub struct SearchConfig {
     /// at the blueprint), so that much evidence must accumulate before the
     /// search departs from the blueprint.  `0` starts uniform.
     pub warm: f64,
+    /// Whether the searcher also chooses its continuation at a leaf
+    /// (Pluribus) or plays the plain blueprint there while only the opponent
+    /// chooses (Modicum's original formulation).  Letting the searcher choose
+    /// lets it "plan" to keep raising, which makes aggression now look better.
+    pub searcher_chooses: bool,
     pub seed: u64,
 }
 
 impl Default for SearchConfig {
     fn default() -> Self {
-        Self { iterations: 2_000, continuations: CONTINUATIONS, bias: 5.0, own_share: 0.5, warm: 1.0, seed: 1 }
+        Self {
+            iterations: 2_000,
+            continuations: CONTINUATIONS,
+            bias: 5.0,
+            own_share: 0.5,
+            warm: 1.0,
+            searcher_chooses: true,
+            seed: 1,
+        }
     }
 }
 
@@ -158,6 +171,8 @@ struct Search<'a, P: ContinuationPolicy> {
     board5: [u8; 5],
     big_blind: f64,
     rng: u64,
+    /// The searching player's seat.
+    hero: usize,
 }
 
 /// Run the search and return the searcher's root strategy.
@@ -173,6 +188,7 @@ pub fn search<P: ContinuationPolicy>(root: &SearchRoot<'_>, policy: &P, cfg: &Se
         board5: root.root.board,
         big_blind: root.game.big_blind_chips() as f64,
         rng: cfg.seed | 1,
+        hero,
     };
     let street = root.root.street;
     s.build(root.root.clone(), root.street_raises, root.history.clone(), Vec::new(), street);
@@ -344,16 +360,24 @@ impl<P: ContinuationPolicy> Search<'_, P> {
         let cards = [combo_cards(hands[0]), combo_cards(hands[1])];
         let board = self.runout(cards);
         let k = self.cfg.continuations;
-        if k == 1 {
-            return self.rollout(id, cards, board, [0, 0], p);
-        }
+        let (hero, searcher_chooses) = (self.hero, self.cfg.searcher_chooses);
+        let chooses = |pl: usize| k > 1 && (pl != hero || searcher_chooses);
         let o = 1 - p;
-        let at_o = offset[o] + hands[o] * k;
-        let sigma_o = self.current(at_o, k);
-        for (s, x) in self.strat[at_o..at_o + k].iter_mut().zip(&sigma_o) {
-            *s += w * x;
+        let c_o = if chooses(o) {
+            let at_o = offset[o] + hands[o] * k;
+            let sigma_o = self.current(at_o, k);
+            for (s, x) in self.strat[at_o..at_o + k].iter_mut().zip(&sigma_o) {
+                *s += w * x;
+            }
+            self.draw(&sigma_o) as u8
+        } else {
+            0
+        };
+        if !chooses(p) {
+            let mut conts = [0u8; 2];
+            conts[o] = c_o;
+            return self.rollout(id, cards, board, conts, p);
         }
-        let c_o = self.draw(&sigma_o) as u8;
         let at_p = offset[p] + hands[p] * k;
         let sigma_p = self.current(at_p, k);
         let mut values = [0.0; CONTINUATIONS];
@@ -723,6 +747,58 @@ mod tests {
         let expl = exploitability(&Subgame::new(root, &beliefs, &leaf), &res.strategy);
         println!("warm-started search: {expl:.4} bb exploitable in the oracle");
         assert!(expl < 0.05, "a blueprint start must still converge, got {expl}");
+    }
+
+    /// With only the opponent choosing, the searcher's continuation is the
+    /// blueprint: its choice regrets stay untouched and the search still
+    /// emits valid strategies.
+    #[test]
+    fn opponent_only_continuations_leave_the_searcher_on_the_blueprint() {
+        let board = [make_card(12, 0), make_card(11, 1), make_card(7, 2), NO_CARD, NO_CARD];
+        let root = public_root(board, 400, 1);
+        let hero = root.current_player();
+        let game = BlueprintHoldem::new(400, 2, 1, 0).with_raise_cap(2);
+        let mut ranges = [BeliefState::uniform(), BeliefState::uniform()];
+        for r in &mut ranges {
+            r.remove_board(&board[..3]);
+        }
+        let hero_hole = [make_card(10, 3), make_card(10, 2)];
+        let input = SearchRoot { game: &game, root, street_raises: 0, history: Vec::new(), ranges, hero_hole };
+        let cfg = SearchConfig { iterations: 200, searcher_chooses: false, ..Default::default() };
+        let mut s = Search {
+            game: &game,
+            policy: &Uniform,
+            cfg: cfg.clone(),
+            nodes: Vec::new(),
+            regrets: Vec::new(),
+            strat: Vec::new(),
+            board5: input.root.board,
+            big_blind: 2.0,
+            rng: 1,
+            hero,
+        };
+        s.build(input.root.clone(), 0, Vec::new(), Vec::new(), 1);
+        s.regrets = vec![0.0; s.size()];
+        s.strat = vec![0.0; s.size()];
+        let sampler = Sampler::new(&input.ranges, hero, hero_hole, 0.5);
+        for t in 1..=200u64 {
+            for p in 0..2 {
+                let (hands, w) = sampler.sample(&mut s.rng).unwrap();
+                s.walk(0, p, hands, w * t as f64);
+            }
+        }
+        let k = CONTINUATIONS;
+        let mut opp_trained = false;
+        for node in &s.nodes {
+            if let Kind::Leaf { offset, .. } = node.kind {
+                let mine = &s.regrets[offset[hero]..offset[hero] + NUM_COMBOS * k];
+                assert!(mine.iter().all(|&r| r == 0.0), "searcher's leaf choices must stay untouched");
+                opp_trained |= s.regrets[offset[1 - hero]..offset[1 - hero] + NUM_COMBOS * k].iter().any(|&r| r != 0.0);
+            }
+        }
+        assert!(opp_trained, "the opponent still chooses");
+        let res = search(&input, &Uniform, &cfg);
+        assert!((res.hero.iter().sum::<f64>() - 1.0).abs() < 1e-9);
     }
 
     /// The importance weights are p/q for the dealing scheme: weighting each

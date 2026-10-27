@@ -48,6 +48,11 @@
 //!                      leaves, Pluribus-style — see resolving::depth_limited
 //!                      and BotConfig::search); --search is still accepted
 //!   --search-iters=N   MCCFR iterations per search (default 2000)
+//!   --search-k=K       continuation strategies per player at a leaf, 1-4
+//!                      (default 4: blueprint, fold-, call-, raise-biased)
+//!   --search-bias=X    how strongly the biased continuations lean (default 5)
+//!   --search-opp-only  only the opponent chooses a continuation; we continue
+//!                      with the blueprint (Modicum's original formulation)
 //!   --opp-range-floor=X  floor on the likelihood of the opponent's postflop
 //!                      actions in its range update (default 0 = plain
 //!                      Bayes; 1 = postflop actions do not narrow its range)
@@ -86,7 +91,8 @@ const ABSTRACT_SB: u32 = 1;
 const BOT_FLAGS: &[&str] = &[
     "data", "policy", "stack-bb", "cap", "no-resolve", "resolve-turn", "no-resolve-turn", "no-resolve-flop",
     "turn-full-river", "runout-sample", "no-continual", "iters", "turn-iters", "river-cap",
-    "continuations", "purify", "opp-range-floor", "search", "no-search", "search-iters", "seed",
+    "continuations", "purify", "opp-range-floor", "search", "no-search", "search-iters", "search-k", "search-bias",
+    "search-opp-only", "seed",
 ];
 
 /// `--cap=N` or `--cap=P,F,T,R` (default 3).  Unlike [`flag`], a value that
@@ -204,6 +210,9 @@ fn build_bot(args: &[String], dir: &Path) -> Bot {
         opp_range_floor: strict_flag(args, "opp-range-floor").unwrap_or(0.0),
         search: !no_resolve && !args.iter().any(|a| a == "--no-search"),
         search_iters: strict_flag(args, "search-iters").unwrap_or(2_000),
+        search_continuations: strict_flag(args, "search-k").unwrap_or(4usize).clamp(1, 4),
+        search_bias: strict_flag(args, "search-bias").unwrap_or(5.0),
+        search_searcher_chooses: !args.iter().any(|a| a == "--search-opp-only"),
         seed: flag(args, "seed").unwrap_or(1),
     };
 
@@ -225,7 +234,13 @@ fn build_bot(args: &[String], dir: &Path) -> Bot {
         resolve_state(cfg.resolve_flop, cfg.turn_iters),
     );
     if cfg.search {
-        println!("  flop/turn: depth-limited search, {} iterations", cfg.search_iters);
+        println!(
+            "  flop/turn: depth-limited search, {} iterations, K={} (bias {}){}",
+            cfg.search_iters,
+            cfg.search_continuations,
+            cfg.search_bias,
+            if cfg.search_searcher_chooses { "" } else { ", opponent-only choice" }
+        );
     }
     if cfg.resolve_turn || cfg.resolve_flop {
         println!("  continuations (K={}): {:?}", cfg.continuations.len(), cfg.continuations);
