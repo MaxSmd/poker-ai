@@ -306,12 +306,26 @@ fn indexed_preflop_only_partition_and_key_round_trip() {
 #[test]
 #[ignore]
 fn indexed_blueprint_postflop_and_soa() {
+    indexed_postflop_and_soa(RaiseCaps::uniform(1));
+}
+
+/// The same gate under per-street caps — the shape a production retrain
+/// uses (more raises preflop and on the flop, one on the river).  Deeper
+/// stacks so the extra preflop and flop raises are reachable.
+#[test]
+#[ignore]
+fn indexed_blueprint_postflop_and_soa_per_street_caps() {
+    indexed_postflop_and_soa(RaiseCaps([3, 3, 2, 1]));
+}
+
+fn indexed_postflop_and_soa(caps: RaiseCaps) {
     use crate::games::{CursorGame, IndexedGame};
     use crate::solver::mccfr::SoaMccfr;
 
+    let stack = if caps == RaiseCaps::uniform(1) { 12 } else { 40 };
     let mk = || {
-        BlueprintHoldem::new(12, 2, 1, 0) // 6bb: check lines reach every street under cap 1
-            .with_raise_cap(1)
+        BlueprintHoldem::new(stack, 2, 1, 0) // 6bb under cap 1: check lines reach every street
+            .with_raise_caps(caps)
             .with_street_bucket(0, BucketMap::full_coverage_mod(&[2, 3], 40))
             .with_street_bucket(1, BucketMap::full_coverage_mod(&[2, 4], 40))
             .with_street_bucket(2, BucketMap::full_coverage_mod(&[2, 5], 40))
