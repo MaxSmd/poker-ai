@@ -46,6 +46,10 @@ them by hand on an idle box:
 
 ```bash
 cargo run --release --example bench_train_paths     # MCCFR path throughput, parallel scaling
+                                                    #   (`-- big` for the out-of-cache tree the
+                                                    #    blueprint actually trains in)
+cargo run --release --example bench_discount        # discount schedules and the baseline, by
+                                                    #   exact exploitability under sampling
 cargo run --release --example bench_rbp             # RBP theta/K sensitivity
 cargo run --release --example bench_resolve_cost    # per-decision resolve cost by mode
                                                     #   (add `-- all` for the multi-GB
@@ -101,17 +105,19 @@ box the whole build is ~30 min (river OCHS k-means dominates).
 ### 2. Check the memory footprint (`memory_estimate`)
 
 Enumerates the **exact** abstract betting tree (2-player and 6-max) and prints
-info sets, action slots, and regret-table RAM for a stack × raise-cap matrix:
+info sets, action slots, regret-table RAM and the size of the trained
+strategy for a stack × raise-cap matrix:
 
 ```bash
 cargo run --release --bin memory_estimate            # current bucket counts
 cargo run --release --bin memory_estimate -- 200 200 200   # what-if buckets
 ```
 
-Reference points: heads-up 200 bb cap-3 ≈ 299M info sets ≈ 11 GB;
-6-max 20 bb cap-2 ≈ 6.8B info sets ≈ 161 GB — see the tool's output for the
-full matrix before launching anything big (it is the authority; these are the
-same reference points restated at the current 12 B/slot).
+Reference points at 500/500/800 buckets: heads-up 200 bb cap-3 = 392M info
+sets, 12.9 GB of table (8.6 GB with `--no-baseline`) and a 2.2 GB strategy
+file; 6-max 20 bb cap-2 = 9.5B info sets, 237 GB — see the tool's output for
+the full matrix before launching anything big (it is the authority). The table
+costs 12 bytes per (info set, action) slot and nothing per info set.
 
 ### 3. Train the blueprint (`train blueprint`)
 
@@ -132,10 +138,10 @@ cite them from here; two copies drift.
   the same `--cap` to every `play` command.
 - `--soa` — flat structure-of-arrays regret store (12 B per (info set, action)
   slot — 24 B/info set at 2 actions — vs ~350 B/info set on the HashMap path;
-  all three accumulators `f32`, the strategy sum accumulated with stochastic
+  regret, strategy sum and baseline all `f32`, the strategy sum accumulated with stochastic
   rounding so long-run averaging cannot freeze, see
   [docs/memory-budget.md](docs/memory-budget.md)). Needs the full-coverage
-  abstraction from step 1.
+  abstraction from step 1. Writes the strategy in the dense format (below).
 - `--atomic[=THREADS]` — lock-free atomic training (Pluribus-style in-place
   CAS updates; defaults to all cores). Near-linear scaling — measured 4.5×
   over the batched path on 4 performance cores — at the cost of
@@ -143,8 +149,16 @@ cite them from here; two copies drift.
   gated against the serial path by exploitability.
 - `--parallel[=BATCH]` — deterministic mini-batch parallel MCCFR
   (bit-reproducible per seed+batch, but merge-bound: ~7 effective cores)
+- `--no-baseline` — train without the VR-MCCFR control variate: 8 instead of
+  12 bytes per slot (the `no-bl` column of `memory_estimate`) and ~20% more
+  nodes per second, for a variance reduction that measured as −6%…+11%
+  exploitability at equal iterations on the small exact games
+  (`examples/bench_discount.rs`). Unmeasured at 200 bb — A/B it with
+  `play expl` before spending the freed memory on a finer abstraction.
 - `--resume` — continue from `data/blueprint_holdem_soa.ckpt` (checkpoints are
-  atomic and written every `--chunk`; an interruption costs at most one chunk)
+  atomic and written every `--chunk`; an interruption costs at most one chunk).
+  Checkpoints written by earlier builds load and are converted; one trained
+  with a different `--cap`, stack depth or bucket counts is refused
 - `--chunk=N` — progress/checkpoint cadence (default: line every 1%)
 - `--data=DIR` — artifact directory (default `data/`)
 
@@ -154,8 +168,20 @@ this size (it read *negative*) and cost ~25 min per report. Measure the trained
 artifact with `play expl` (the vectorized abstract-game best response) as a
 milestone metric instead.
 
-Outputs `data/blueprint_holdem.bin` — the average strategy, keyed identically
-to the HashMap path, which is what the resolver loads.
+Outputs `data/blueprint_holdem.bin` — the average strategy, which is what
+`play` loads. With `--soa` it is the **dense** format: one `u16` probability
+per (info set, action) in the order of the game's dense index, 2 bytes per
+slot and nothing per info set (3.2 GB for 595M info sets). Without `--soa` it
+is a hashed-key map (`HashMap<u64, Vec<f32>>`), as every blueprint before the
+dense format is — about five times larger (16 GB for the same 595M), on disk
+and in `play`'s memory. `play` reads both; to shrink an existing one:
+
+```bash
+# Same --cap / --stack-bb / --data as for playing it. Writes
+# data/blueprint_holdem_dense.bin, reads it back and compares every info set
+# with the original before reporting success; the original is left alone.
+cargo run --release --bin play -- compact --cap=2
+```
 
 ### Experiment tracking (Weights & Biases)
 
@@ -177,7 +203,9 @@ line up. Without the wrapper the trainer's output is unchanged.
 standard public benchmark bot):
 
 ```bash
-# Needs data/blueprint_holdem.bin + the bucket maps from the SAME training run.
+# Needs data/blueprint_holdem.bin + the bucket maps from the SAME training run,
+# and the --cap it was trained with. A dense strategy file is checked against
+# the game those build and refused if they do not match.
 cargo run --release --bin play -- slumbot 10000
 ```
 

@@ -9,7 +9,7 @@ use std::path::Path;
 
 use poker_ai::abstraction::bucket_map::BucketMap;
 use poker_ai::games::blueprint::{BlueprintHoldem, RaiseCaps};
-use poker_ai::play::policy::write_policy;
+use poker_ai::play::policy::{write_dense_policy, write_policy};
 use poker_ai::solver::variant::Variant;
 use poker_ai::solver::dcfr::Discount;
 use poker_ai::solver::mccfr::Mccfr;
@@ -23,6 +23,28 @@ use crate::{data_dir, emit_metric, parse_cadence, BIG_BLIND, SMALL_BLIND};
 /// value that does not parse exits rather than silently training cap-1.
 fn parse_caps(args: &[String]) -> RaiseCaps {
     strict_flag(args, "cap").unwrap_or(RaiseCaps::uniform(1))
+}
+
+/// The solver stack's name in the run header and W&B config.
+fn base_label(baseline: bool) -> &'static str {
+    if baseline {
+        "DCFR+baseline"
+    } else {
+        "DCFR"
+    }
+}
+
+/// A resumed run keeps the checkpoint's solver configuration, whatever the
+/// command line says — the table either has a baseline array or it does not.
+/// Say so, rather than let `--no-baseline` look like it took effect.
+fn warn_if_baseline_differs(requested: bool, checkpoint: bool) {
+    if requested != checkpoint {
+        eprintln!(
+            "note: the checkpoint was trained {} the baseline and the run continues that way; \
+             the flag only applies to a fresh run",
+            if checkpoint { "with" } else { "without" }
+        );
+    }
 }
 
 /// The `raise_cap` W&B config value: a number for a uniform cap, as every
@@ -77,6 +99,11 @@ pub fn load_blueprint_game(dir: &Path, stack: u32, cap: RaiseCaps, verbose: bool
 ///                      maps + finite cap)
 ///   --optimistic       predictive regret updates (serial path only; not --soa)
 ///   --parallel[=BATCH] mini-batch parallel MCCFR (keeps the baseline)
+///   --no-baseline      train without the VR-MCCFR control variate: a third
+///                      less table memory under --soa (8 instead of 12 bytes
+///                      per slot) and fewer memory touches per node, for a
+///                      variance reduction `examples/bench_discount.rs` could
+///                      not tell from zero at equal iterations
 ///   --resume           continue from blueprint_holdem[_soa].ckpt
 ///   --chunk=N          iterations per progress line + checkpoint (default ~1%)
 ///   --data=DIR         artifact directory (default `data/`)
@@ -105,8 +132,9 @@ pub fn run_blueprint(args: &[String]) {
     });
     let optimistic = flag("--optimistic");
     let resume = flag("--resume");
+    let baseline = !flag("--no-baseline");
 
-    let mut features = vec![format!("cap={cap}")];
+    let mut features = vec![base_label(baseline).to_string(), format!("cap={cap}")];
     if optimistic {
         features.push("optimistic".into());
     }
@@ -120,16 +148,20 @@ pub fn run_blueprint(args: &[String]) {
     let ckpt_path = dir.join("blueprint_holdem.ckpt");
 
     println!(
-        "Training heads-up NLHE blueprint: {iters} iters, {stack_bb}bb stacks, seed {seed} [DCFR+baseline+{feat}]"
+        "Training heads-up NLHE blueprint: {iters} iters, {stack_bb}bb stacks, seed {seed} [{feat}]"
     );
     let solver = if resume && ckpt_path.exists() {
         let game = load_blueprint_game(&dir, stack, cap, true);
         let s = Mccfr::load_checkpoint(&ckpt_path, game).expect("load checkpoint");
         println!("Resuming from {} at iteration {}", ckpt_path.display(), s.iterations());
+        warn_if_baseline_differs(baseline, s.uses_baseline());
         s
     } else {
         let game = load_blueprint_game(&dir, stack, cap, true);
-        let mut s = Mccfr::with_seed(game, Variant::Dcfr(Discount::RECOMMENDED), seed).with_baseline();
+        let mut s = Mccfr::with_seed(game, Variant::Dcfr(Discount::RECOMMENDED), seed);
+        if baseline {
+            s = s.with_baseline();
+        }
         // Optimistic is serial-only: it composes poorly with batch staleness.
         if parallel_batch.is_none() && optimistic {
             s = s.with_optimistic();
@@ -198,25 +230,37 @@ pub fn run_blueprint_soa(args: &[String]) {
         })
     });
     let resume = args.iter().any(|a| a == "--resume");
+    let baseline = !args.iter().any(|a| a == "--no-baseline");
 
     let mode = SoaMode::from_flags(atomic_threads, parallel_batch);
-    let feat = format!("cap={cap}+soa+{}", mode.label());
+    let feat = format!("{}+cap={cap}+soa+{}", base_label(baseline), mode.label());
 
     let dir = data_dir(args);
     std::fs::create_dir_all(&dir).expect("create data directory");
     let ckpt_path = dir.join("blueprint_holdem_soa.ckpt");
 
     println!(
-        "Training heads-up NLHE blueprint (SoA store): {iters} iters, {stack_bb}bb stacks, seed {seed} [DCFR+baseline+{feat}]"
+        "Training heads-up NLHE blueprint (SoA store): {iters} iters, {stack_bb}bb stacks, seed {seed} [{feat}]"
     );
     let solver = if resume && ckpt_path.exists() {
         let game = load_blueprint_game(&dir, stack, cap, true).with_indexing();
-        let s = SoaMccfr::load_checkpoint(&ckpt_path, game).expect("load SoA checkpoint");
+        let s = SoaMccfr::load_checkpoint(&ckpt_path, game).unwrap_or_else(|e| {
+            // Not a panic: the likeliest cause is a flag that differs from
+            // the interrupted run's, and the message says which kind.
+            eprintln!("cannot resume: {e}");
+            std::process::exit(1);
+        });
         println!("Resuming from {} at iteration {}", ckpt_path.display(), s.iterations());
+        warn_if_baseline_differs(baseline, s.uses_baseline());
         s
     } else {
         let game = load_blueprint_game(&dir, stack, cap, true).with_indexing();
-        SoaMccfr::with_seed(game, Variant::Dcfr(Discount::RECOMMENDED), seed).with_baseline()
+        let s = SoaMccfr::with_seed(game, Variant::Dcfr(Discount::RECOMMENDED), seed);
+        if baseline {
+            s.with_baseline()
+        } else {
+            s
+        }
     };
     println!(
         "Flat table: {} info sets, {} bytes/info set (vs ~350 for the HashMap Node)",
@@ -242,21 +286,18 @@ pub fn run_blueprint_soa(args: &[String]) {
     run_chunked(&mut trainer, iters, &parse_cadence(args, iters), &ckpt_path);
     let solver = trainer.solver;
 
-    // Export the deployable average strategy in the SAME HashMap<u64, Vec<f32>>
-    // format the HashMap path writes (keys reconstructed via info_key_at), so the
-    // artifact is interchangeable; only visited info sets are emitted.
+    // Export the deployable average strategy in the dense policy format: one
+    // u16 probability per table slot, in the table's own order, so the file
+    // needs no key per info set (`play::policy`) — about a fifth of the
+    // hashed-key artifact the HashMap path writes, on disk and in `play`'s
+    // memory.  `play` pairs it with a game laid out like this one, i.e. the
+    // same --cap, stack depth and bucket maps.
     //
-    // Streamed, never materialized: this table has hundreds of millions of
-    // visited info sets and is still resident here, so building the `HashMap`
-    // and then a whole-file `Vec<u8>` was tens of GB of peak at the one moment
-    // in the run where dying costs the most (`play::policy::write_policy`).
-    let game = load_blueprint_game(&dir, stack, cap, false).with_indexing();
+    // Streamed, never materialized: the table is still resident here, and
+    // this is the one moment in the run where dying costs the most.
     let path = dir.join("blueprint_holdem.bin");
-    let visited = (0..solver.capacity()).filter(|&i| solver.is_visited(i)).map(|i| {
-        let probs = solver.average_strategy_at(i).into_iter().map(|x| x as f32).collect();
-        (game.info_key_at(i), probs)
-    });
-    let n = write_policy(&path, visited).expect("write strategy");
-    println!("Saved {n} info sets -> {}", path.display());
+    let n = write_dense_policy(&path, solver.layout(), |at, out| solver.average_strategy_into(at, out))
+        .expect("write strategy");
+    println!("Saved {n} info sets -> {} (dense policy, {} slots)", path.display(), solver.layout().total_slots());
 }
 

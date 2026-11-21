@@ -19,6 +19,7 @@
 # pass/fail and flakes on a throttled machine; run them by hand on an idle box:
 #   cargo run --release --example bench_train_paths     # MCCFR path throughput
 #   cargo run --release --example bench_rbp             # RBP theta/K sweep
+#   cargo run --release --example bench_discount        # discount schedules, baseline
 #   cargo run --release --example bench_resolve_cost    # per-decision resolve cost
 #   cargo run --release --example bench_ochs            # OCHS vs scalar river
 

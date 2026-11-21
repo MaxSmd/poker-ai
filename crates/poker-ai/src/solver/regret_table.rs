@@ -8,10 +8,13 @@
 //! addressed by that index: no hashing, no per-node allocation, and a checkpoint
 //! that is a handful of contiguous arrays rather than a serde-heavy map.
 //!
-//! Arithmetic is done in `f64`; all three accumulators are stored `f32`, at
-//! 12 bytes per (info set, action).  The optimistic (`prev_inst`) and pruning
-//! (`consec_below`) accumulators are **optional** arrays — empty unless those
-//! features are enabled — so you only pay their memory when you use them.
+//! Arithmetic is done in `f64`; the accumulators are stored `f32`: regret and
+//! strategy sum always (8 bytes per (info set, action)), plus the VR-MCCFR
+//! baseline when control variates are on (12).  The baseline is an
+//! **optional** array — empty unless enabled — so a run without control
+//! variates does not pay a third of the table for it.  Nothing is stored per
+//! info set: where each one's slots are is a run-length
+//! [`Layout`], a few megabytes at any scale.
 //!
 //! ## Why the strategy sum can be `f32` (and why it could not before)
 //!
@@ -51,13 +54,12 @@
 //! implementation-progress note.
 
 use std::io;
-use std::ops::Range;
-use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use super::variant::Variant;
 use super::MAX_ACTIONS;
+use crate::games::{Layout, Span};
 use crate::util::rng::xorshift_next_unit;
 
 /// EMA learning rate for the VR-MCCFR baseline (mirrors `mccfr::BASELINE_RATE`).
@@ -117,45 +119,57 @@ pub(crate) fn strategy_discount(t: u64, variant: Variant) -> f64 {
 /// [`LeanTable`](crate::solver::lean_table::LeanTable) rounds, saturates, and
 /// rescales).  The parallel and atomic training paths are f32-only and keep
 /// using [`RegretTable`]'s concrete accessors.
+///
+/// Every per-info-set method takes the info set's [`Span`] rather than its
+/// index.  The traversal gets the span from the game where the game can say
+/// ([`IndexedGame::slot_span`](crate::games::IndexedGame::slot_span)) and from
+/// [`span`](RegretStore::span) otherwise — once per node, however many arrays
+/// it then touches.
 pub trait RegretStore: Serialize + Sized {
-    /// Lay out the arrays for `capacity` info sets with `actions(i)` slots each.
-    fn build(capacity: usize, actions: &dyn Fn(usize) -> usize) -> Self;
-    fn capacity(&self) -> usize;
-    fn num_actions(&self, info_set: usize) -> usize;
+    /// Allocate zeroed accumulators for `layout`.
+    fn build(layout: Layout) -> Self;
+    /// Where each info set's slots are.
+    fn layout(&self) -> &Layout;
+    fn capacity(&self) -> usize {
+        self.layout().capacity()
+    }
+    /// The slots of info set `info_set`, looked up in the layout.
+    fn span(&self, info_set: usize) -> Span {
+        self.layout().span(info_set)
+    }
     /// Ever updated (any strategy mass) — gates export of unreached slots.
-    fn is_visited(&self, info_set: usize) -> bool;
-    /// Allocate the VR-MCCFR baseline accumulator, if this store keeps it
-    /// optional.  Called by
+    fn is_visited(&self, at: Span) -> bool;
+    /// Allocate the VR-MCCFR baseline accumulator.  Called by
     /// [`SoaMccfr::with_baseline`](crate::solver::mccfr::SoaMccfr::with_baseline)
     /// — the flag is a builder step, so the table cannot know at `build` time
-    /// whether control variates will be used.  Stores whose baseline is always
-    /// resident do nothing.
-    fn enable_baseline(&mut self) {}
+    /// whether control variates will be used, and a run without them should
+    /// not carry the array.
+    fn enable_baseline(&mut self);
     fn bytes_per_info_set(&self) -> usize;
     /// Regret-matching current strategy, written into the first `n` slots of
     /// `out` and `n` returned.  The buffer is a fixed
     /// `[f64; MAX_ACTIONS]` rather than a `Vec` so the traversals can keep it on
     /// the stack: this is the per-decision-node call, and a `Vec` here is one
     /// heap allocation per visited node (~10¹² of them over a blueprint run).
-    fn strategy_into(&self, info_set: usize, out: &mut [f64; MAX_ACTIONS]) -> usize;
+    fn strategy_into(&self, at: Span, out: &mut [f64; MAX_ACTIONS]) -> usize;
     /// Average (deployable) strategy, written into `out`.
-    fn average_into(&self, info_set: usize, out: &mut Vec<f64>);
+    fn average_into(&self, at: Span, out: &mut Vec<f64>);
     /// The traverser's regret update at iteration `t`: per-action lazy discount
     /// (per `variant`) then add of the instantaneous regret `util[a] − node_value`.
-    fn add_regret(&mut self, info_set: usize, util: &[f64], node_value: f64, t: u64, variant: Variant);
+    fn add_regret(&mut self, at: Span, util: &[f64], node_value: f64, t: u64, variant: Variant);
     /// The opponent's average-strategy accumulation at iteration `t`.  `rng`
     /// drives the stochastic rounding both stores use for this array — draw it
     /// from a stream separate from action sampling, so changing the storage
     /// precision cannot perturb which trajectories a seed explores.
-    fn add_strategy(&mut self, info_set: usize, strategy: &[f64], t: u64, variant: Variant, rng: &mut u64);
+    fn add_strategy(&mut self, at: Span, strategy: &[f64], t: u64, variant: Variant, rng: &mut u64);
     /// `(Σ_a σ(a)·b(a), b(chosen))` — the opponent-node control-variate reads.
-    fn baseline_pair(&self, info_set: usize, strategy: &[f64], chosen: usize) -> (f64, f64);
+    fn baseline_pair(&self, at: Span, strategy: &[f64], chosen: usize) -> (f64, f64);
     /// One EMA step of baseline slot `a` toward `target` (player-0 perspective).
-    fn baseline_ema(&mut self, info_set: usize, a: usize, target: f64);
+    fn baseline_ema(&mut self, at: Span, a: usize, target: f64);
 }
 
-/// Flat `f32` regret / strategy-sum / baseline arrays indexed by a dense info-set
-/// id, with per-info-set offsets and action counts.
+/// Flat `f32` regret / strategy-sum / baseline arrays, one slot per
+/// (info set, action), placed by a [`Layout`].
 #[derive(Serialize, Deserialize)]
 pub struct RegretTable {
     /// Cumulative counterfactual regret per (info set, action).
@@ -165,86 +179,78 @@ pub struct RegretTable {
     /// array after ~1.7e7 visits, which is why it used to be `f64` at double
     /// the bytes.  See the module header for the full argument.
     strategy_sum: Vec<f32>,
-    /// VR-MCCFR baseline value per (info set, action), player-0 perspective.
+    /// VR-MCCFR baseline value per (info set, action), player-0 perspective —
+    /// **empty unless [`enable_baseline`](RegretStore::enable_baseline) was
+    /// called**, so a run without control variates does not carry a third
+    /// array the size of the regrets.
     baseline: Vec<f32>,
-    /// Previous instantaneous regret (optimistic updates) — empty unless enabled.
-    prev_inst: Vec<f32>,
-    /// Consecutive-below-θ streak (RBP pruning) — empty unless enabled.
-    consec_below: Vec<u32>,
-    /// Actions per info set.
-    num_actions: Vec<u8>,
-    /// Start offset of each info set in the flat arrays.
-    offsets: Vec<u32>,
+    /// Where each info set's slots are.  Run-length encoded — a few megabytes
+    /// where the per-info-set offset and action-count arrays it replaced were
+    /// 5 bytes per info set (see [`Layout`]).
+    layout: Layout,
 }
 
 impl RegretTable {
-    /// Build the table for `capacity` info sets, `actions(i)` actions each.
-    /// `optimistic` / `pruning` allocate their feature arrays only when set.
-    pub fn with_layout(
-        capacity: usize,
-        actions: impl Fn(usize) -> usize,
-        optimistic: bool,
-        pruning: bool,
-    ) -> Self {
-        let mut num_actions = Vec::with_capacity(capacity);
-        let mut offsets = Vec::with_capacity(capacity);
-        let mut total = 0u32;
-        for i in 0..capacity {
-            let a = actions(i);
-            debug_assert!(a <= u8::MAX as usize, "action count fits u8");
-            offsets.push(total);
-            num_actions.push(a as u8);
-            total += a as u32;
-        }
-        let total = total as usize;
-        Self {
-            regret: vec![0.0; total],
-            strategy_sum: vec![0.0f32; total],
-            baseline: vec![0.0; total],
-            prev_inst: if optimistic { vec![0.0; total] } else { Vec::new() },
-            consec_below: if pruning { vec![0; total] } else { Vec::new() },
-            num_actions,
-            offsets,
-        }
+    /// A zeroed table for `layout`, without the baseline array (see
+    /// [`enable_baseline`](RegretStore::enable_baseline)).
+    pub fn new(layout: Layout) -> Self {
+        let total = layout.total_slots();
+        Self { regret: vec![0.0; total], strategy_sum: vec![0.0; total], baseline: Vec::new(), layout }
     }
 
-    /// Reassemble a table from already-laid-out arrays — the checkpoint
-    /// migration path (`mccfr::soa::legacy`), which rebuilds the strategy sums
-    /// at a different width and cannot go through [`Self::with_layout`].
-    #[allow(clippy::too_many_arguments)]
+    /// A zeroed table for `capacity` info sets, `actions(i)` actions each.
+    pub fn with_layout(capacity: usize, actions: impl Fn(usize) -> usize) -> Self {
+        Self::new(Layout::build(capacity, actions))
+    }
+
+    /// Reassemble a table from arrays read from a file — the checkpoint
+    /// loaders, current and legacy.  Rejects arrays that do not fit the
+    /// layout: every later access trusts the layout for its bounds.
     pub(crate) fn from_parts(
         regret: Vec<f32>,
         strategy_sum: Vec<f32>,
         baseline: Vec<f32>,
-        prev_inst: Vec<f32>,
-        consec_below: Vec<u32>,
-        num_actions: Vec<u8>,
-        offsets: Vec<u32>,
-    ) -> Self {
-        Self { regret, strategy_sum, baseline, prev_inst, consec_below, num_actions, offsets }
+        layout: Layout,
+    ) -> io::Result<Self> {
+        let table = Self { regret, strategy_sum, baseline, layout };
+        table.validate().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        Ok(table)
     }
 
-    /// The raw arrays, for the checkpoint-migration test that has to write a
-    /// file in the pre-`f32` layout.
+    /// The layout is sound and every array is exactly as long as it says.
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        self.layout.validate()?;
+        let total = self.layout.total_slots();
+        if self.regret.len() != total || self.strategy_sum.len() != total {
+            return Err(format!(
+                "table arrays hold {} / {} slots but the layout has {total}",
+                self.regret.len(),
+                self.strategy_sum.len()
+            ));
+        }
+        if !self.baseline.is_empty() && self.baseline.len() != total {
+            return Err(format!("baseline holds {} slots but the layout has {total}", self.baseline.len()));
+        }
+        if self.layout.max_width() > MAX_ACTIONS {
+            return Err(format!("an info set is wider than {MAX_ACTIONS} actions"));
+        }
+        Ok(())
+    }
+
+    /// The raw arrays, for the checkpoint-migration tests that have to write
+    /// files in the older layouts.
     #[cfg(test)]
-    #[allow(clippy::type_complexity)]
-    pub(crate) fn parts_for_test(
-        &self,
-    ) -> (&[f32], &[f32], &[f32], &[f32], &[u32], &[u8], &[u32]) {
-        (
-            &self.regret,
-            &self.strategy_sum,
-            &self.baseline,
-            &self.prev_inst,
-            &self.consec_below,
-            &self.num_actions,
-            &self.offsets,
-        )
+    pub(crate) fn parts_for_test(&self) -> (&[f32], &[f32], &[f32], &Layout) {
+        (&self.regret, &self.strategy_sum, &self.baseline, &self.layout)
+    }
+
+    pub fn layout(&self) -> &Layout {
+        &self.layout
     }
 
     /// Number of info sets.
     pub fn capacity(&self) -> usize {
-        self.num_actions.len()
+        self.layout.capacity()
     }
 
     /// Total (info set × action) slots — the flat array length.
@@ -254,87 +260,63 @@ impl RegretTable {
 
     /// Per-info-set memory footprint in bytes (the accumulators actually held).
     pub fn bytes_per_info_set(&self) -> usize {
-        // regret + strategy-sum + baseline, all f32, plus the optional arrays.
-        let per_slot = 4 + 4 + 4
-            + if self.prev_inst.is_empty() { 0 } else { 4 }
-            + if self.consec_below.is_empty() { 0 } else { 4 };
+        // regret + strategy-sum, both f32, plus the baseline when resident.
+        let per_slot = 4 + 4 + if self.baseline.is_empty() { 0 } else { 4 };
         let avg_actions = if self.capacity() == 0 { 0 } else { self.total_slots() / self.capacity() };
         per_slot * avg_actions
     }
 
-    fn span(&self, info_set: usize) -> Range<usize> {
-        let start = self.offsets[info_set] as usize;
-        start..start + self.num_actions[info_set] as usize
+    /// The slots of info set `info_set`, looked up in the layout.
+    pub fn span(&self, info_set: usize) -> Span {
+        self.layout.span(info_set)
     }
 
-    pub fn num_actions(&self, info_set: usize) -> usize {
-        self.num_actions[info_set] as usize
+    /// Whether the info set at `at` was ever updated (any non-zero
+    /// strategy-sum mass) — used to skip never-reached slots when exporting a
+    /// deployable strategy.
+    pub fn is_visited(&self, at: Span) -> bool {
+        self.strategy_sum[at.range()].iter().any(|&x| x != 0.0)
     }
 
-    /// Whether `info_set` was ever updated (any non-zero strategy-sum mass) — used
-    /// to skip never-reached slots when exporting a deployable strategy, so the
-    /// SoA artifact carries only visited info sets, like the `HashMap` path.
-    pub fn is_visited(&self, info_set: usize) -> bool {
-        self.strategy_sum[self.span(info_set)].iter().any(|&x| x != 0.0)
+    pub fn regret_mut(&mut self, at: Span) -> &mut [f32] {
+        &mut self.regret[at.range()]
     }
 
-    pub fn regret_mut(&mut self, info_set: usize) -> &mut [f32] {
-        let span = self.span(info_set);
-        &mut self.regret[span]
+    pub fn strategy_sum_mut(&mut self, at: Span) -> &mut [f32] {
+        &mut self.strategy_sum[at.range()]
     }
 
-    pub fn strategy_sum_mut(&mut self, info_set: usize) -> &mut [f32] {
-        let span = self.span(info_set);
-        &mut self.strategy_sum[span]
+    /// Whether the baseline array is resident (control variates enabled).
+    pub fn has_baseline(&self) -> bool {
+        !self.baseline.is_empty()
     }
 
-    pub fn baseline(&self, info_set: usize) -> &[f32] {
-        &self.baseline[self.span(info_set)]
+    pub fn baseline(&self, at: Span) -> &[f32] {
+        debug_assert!(self.has_baseline(), "baseline read before `enable_baseline`");
+        &self.baseline[at.range()]
     }
 
-    pub fn baseline_mut(&mut self, info_set: usize) -> &mut [f32] {
-        let span = self.span(info_set);
-        &mut self.baseline[span]
+    pub fn baseline_mut(&mut self, at: Span) -> &mut [f32] {
+        &mut self.baseline[at.range()]
     }
 
-    /// Raw pointers to the three accumulator arrays plus the (immutable) layout,
-    /// for the lock-free atomic trainer (`SoaMccfr::train_atomic`), which must
-    /// update the table concurrently through shared references.  Soundness
+    /// Raw pointers to the three accumulator arrays plus their length, for the
+    /// lock-free atomic trainer (`SoaMccfr::train_atomic`), which must update
+    /// the table concurrently through shared references.  The baseline
+    /// pointer is dangling when [`has_baseline`](Self::has_baseline) is false
+    /// and must not be dereferenced then.  Soundness
     /// contract: the caller keeps the exclusive borrow of `self` alive for the
-    /// whole training run and performs **every** access to these arrays through
-    /// atomics, so no non-atomic aliases exist while threads race.
-    pub(crate) fn atomic_parts(&mut self) -> (*mut f32, *mut f32, *mut f32, &[u32], &[u8]) {
-        (
-            self.regret.as_mut_ptr(),
-            self.strategy_sum.as_mut_ptr(),
-            self.baseline.as_mut_ptr(),
-            &self.offsets,
-            &self.num_actions,
-        )
+    /// whole training run, performs **every** access to these arrays through
+    /// atomics, so no non-atomic aliases exist while threads race, and stays
+    /// below the returned slot count.
+    pub(crate) fn atomic_parts(&mut self) -> (*mut f32, *mut f32, *mut f32, usize) {
+        (self.regret.as_mut_ptr(), self.strategy_sum.as_mut_ptr(), self.baseline.as_mut_ptr(), self.regret.len())
     }
 
-    /// Optimistic momentum accumulator (only present when enabled).
-    pub fn prev_inst_mut(&mut self, info_set: usize) -> Option<&mut [f32]> {
-        if self.prev_inst.is_empty() {
-            return None;
-        }
-        let span = self.span(info_set);
-        Some(&mut self.prev_inst[span])
-    }
-
-    /// RBP below-θ streak accumulator (only present when enabled).
-    pub fn consec_below_mut(&mut self, info_set: usize) -> Option<&mut [u32]> {
-        if self.consec_below.is_empty() {
-            return None;
-        }
-        let span = self.span(info_set);
-        Some(&mut self.consec_below[span])
-    }
-
-    /// Regret-matched current strategy for `info_set`, written into `out[..n]`
-    /// and `n` returned (`f64` arithmetic over the `f32` regrets).
-    pub fn strategy_into(&self, info_set: usize, out: &mut [f64; MAX_ACTIONS]) -> usize {
-        let regret = &self.regret[self.span(info_set)];
+    /// Regret-matched current strategy for the info set at `at`, written into
+    /// `out[..n]` and `n` returned (`f64` arithmetic over the `f32` regrets).
+    pub fn strategy_into(&self, at: Span, out: &mut [f64; MAX_ACTIONS]) -> usize {
+        let regret = &self.regret[at.range()];
         let n = regret.len();
         assert!(n <= MAX_ACTIONS, "info set wider than the stack buffer");
         let total: f64 = regret.iter().map(|&r| (r as f64).max(0.0)).sum();
@@ -348,9 +330,9 @@ impl RegretTable {
         n
     }
 
-    /// Average (deployable) strategy for `info_set`, written into `out`.
-    pub fn average_into(&self, info_set: usize, out: &mut Vec<f64>) {
-        let s = &self.strategy_sum[self.span(info_set)];
+    /// Average (deployable) strategy for the info set at `at`, written into `out`.
+    pub fn average_into(&self, at: Span, out: &mut Vec<f64>) {
+        let s = &self.strategy_sum[at.range()];
         let n = s.len();
         out.clear();
         let total: f64 = s.iter().map(|&x| x as f64).sum();
@@ -360,62 +342,49 @@ impl RegretTable {
             out.extend(std::iter::repeat_n(1.0 / n as f64, n));
         }
     }
-
-    /// Serialize to a bincode file (flat arrays — compact, fast to load).
-    pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
-        let bytes = bincode::serialize(self).map_err(io::Error::other)?;
-        let path = path.as_ref();
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, bytes)?;
-        std::fs::rename(&tmp, path)
-    }
-
-    /// Load from a bincode file.
-    pub fn load(path: impl AsRef<Path>) -> io::Result<Self> {
-        let bytes = std::fs::read(path)?;
-        bincode::deserialize(&bytes).map_err(io::Error::other)
-    }
 }
 
 // The f32 store's update arithmetic: f64 math, f32 store — moved here verbatim
 // from the solver's former inline updates (the bit-identical solver gates cover
 // the move).
 impl RegretStore for RegretTable {
-    fn build(capacity: usize, actions: &dyn Fn(usize) -> usize) -> Self {
-        Self::with_layout(capacity, actions, false, false)
+    fn build(layout: Layout) -> Self {
+        Self::new(layout)
     }
 
-    fn capacity(&self) -> usize {
-        RegretTable::capacity(self)
+    fn layout(&self) -> &Layout {
+        &self.layout
     }
 
-    fn num_actions(&self, info_set: usize) -> usize {
-        RegretTable::num_actions(self, info_set)
+    fn is_visited(&self, at: Span) -> bool {
+        RegretTable::is_visited(self, at)
     }
 
-    fn is_visited(&self, info_set: usize) -> bool {
-        RegretTable::is_visited(self, info_set)
+    fn enable_baseline(&mut self) {
+        if self.baseline.is_empty() {
+            self.baseline = vec![0.0; self.regret.len()];
+        }
     }
 
     fn bytes_per_info_set(&self) -> usize {
         RegretTable::bytes_per_info_set(self)
     }
 
-    fn strategy_into(&self, info_set: usize, out: &mut [f64; MAX_ACTIONS]) -> usize {
-        RegretTable::strategy_into(self, info_set, out)
+    fn strategy_into(&self, at: Span, out: &mut [f64; MAX_ACTIONS]) -> usize {
+        RegretTable::strategy_into(self, at, out)
     }
 
-    fn average_into(&self, info_set: usize, out: &mut Vec<f64>) {
-        RegretTable::average_into(self, info_set, out)
+    fn average_into(&self, at: Span, out: &mut Vec<f64>) {
+        RegretTable::average_into(self, at, out)
     }
 
-    fn add_regret(&mut self, info_set: usize, util: &[f64], node_value: f64, t: u64, variant: Variant) {
+    fn add_regret(&mut self, at: Span, util: &[f64], node_value: f64, t: u64, variant: Variant) {
         let (pos, neg) = match variant {
             Variant::Vanilla => (1.0, 1.0),
             Variant::Dcfr(d) => (d.positive_factor(t), d.negative_factor(t)),
         };
         let discount = matches!(variant, Variant::Dcfr(_));
-        let regret = self.regret_mut(info_set);
+        let regret = self.regret_mut(at);
         for (r32, &u) in regret.iter_mut().zip(util) {
             let mut r = *r32 as f64;
             if discount {
@@ -426,25 +395,25 @@ impl RegretStore for RegretTable {
         }
     }
 
-    fn add_strategy(&mut self, info_set: usize, strategy: &[f64], t: u64, variant: Variant, rng: &mut u64) {
+    fn add_strategy(&mut self, at: Span, strategy: &[f64], t: u64, variant: Variant, rng: &mut u64) {
         let weight = match variant {
             Variant::Vanilla => 1.0,
             Variant::Dcfr(d) => d.strategy_weight(t),
         };
-        let s = self.strategy_sum_mut(info_set);
+        let s = self.strategy_sum_mut(at);
         for (sum, &p) in s.iter_mut().zip(strategy) {
             sr_add(sum, weight * p, rng);
         }
     }
 
-    fn baseline_pair(&self, info_set: usize, strategy: &[f64], chosen: usize) -> (f64, f64) {
-        let b = self.baseline(info_set);
+    fn baseline_pair(&self, at: Span, strategy: &[f64], chosen: usize) -> (f64, f64) {
+        let b = self.baseline(at);
         let exp = strategy.iter().zip(b).map(|(&p, &v)| p * v as f64).sum();
         (exp, b[chosen] as f64)
     }
 
-    fn baseline_ema(&mut self, info_set: usize, a: usize, target: f64) {
-        let b = self.baseline_mut(info_set);
+    fn baseline_ema(&mut self, at: Span, a: usize, target: f64) {
+        let b = self.baseline_mut(at);
         b[a] = (b[a] as f64 + BASELINE_RATE * (target - b[a] as f64)) as f32;
     }
 }
@@ -487,12 +456,12 @@ mod tests {
         // round-to-nearest stops dead — the deployed average freezes while
         // still looking like a converged artifact.
         const N: u64 = 30_000_000; // ~1.8× the 2^24 wall
-        let mut t = RegretTable::with_layout(1, |_| 1, false, false);
+        let mut t = RegretTable::with_layout(1, |_| 1);
         let mut rng = 99u64;
         for step in 1..=N {
-            t.add_strategy(0, &[1.0], step, Variant::Vanilla, &mut rng);
+            t.add_strategy(t.span(0), &[1.0], step, Variant::Vanilla, &mut rng);
         }
-        let got = t.strategy_sum_mut(0)[0] as f64;
+        let got = t.strategy_sum_mut(t.span(0))[0] as f64;
         let err = (got - N as f64).abs() / N as f64;
         assert!(err < 0.01, "SR sum {got} should track {N} (off by {:.2}%)", err * 100.0);
 
@@ -510,16 +479,16 @@ mod tests {
         // the 2^24 wall: the average must end up near 50/50.  Under RTN both
         // slots pin and the answer is whatever it was at 2^24.
         const HALF: u64 = 20_000_000;
-        let mut t = RegretTable::with_layout(1, |_| 2, false, false);
+        let mut t = RegretTable::with_layout(1, |_| 2);
         let mut rng = 7u64;
         for step in 1..=HALF {
-            t.add_strategy(0, &[1.0, 0.0], step, Variant::Vanilla, &mut rng);
+            t.add_strategy(t.span(0), &[1.0, 0.0], step, Variant::Vanilla, &mut rng);
         }
         for step in HALF + 1..=2 * HALF {
-            t.add_strategy(0, &[0.0, 1.0], step, Variant::Vanilla, &mut rng);
+            t.add_strategy(t.span(0), &[0.0, 1.0], step, Variant::Vanilla, &mut rng);
         }
         let mut avg = Vec::new();
-        t.average_into(0, &mut avg);
+        t.average_into(t.span(0), &mut avg);
         assert!(
             (avg[1] - 0.5).abs() < 0.02,
             "the second half must register: got {avg:?}, RTN would give ~{:.2}",
@@ -529,55 +498,67 @@ mod tests {
     }
 
     #[test]
-    fn layout_offsets_and_widths() {
-        let t = RegretTable::with_layout(4, |_| 2, false, false);
+    fn layout_places_each_info_set() {
+        let t = RegretTable::with_layout(4, |i| 2 + i % 2);
         assert_eq!(t.capacity(), 4);
-        assert_eq!(t.total_slots(), 8);
-        assert_eq!(t.num_actions(2), 2);
-        assert!(t.prev_inst.is_empty() && t.consec_below.is_empty());
+        assert_eq!(t.total_slots(), 10);
+        assert_eq!(t.span(2), Span { base: 5, n: 2 });
+        assert_eq!(t.span(3), Span { base: 7, n: 3 });
+        t.validate().unwrap();
+    }
+
+    #[test]
+    fn arrays_that_do_not_fit_the_layout_are_rejected() {
+        // A table read from a file is trusted for its bounds afterwards, so a
+        // truncated array or a foreign layout has to fail at the door.
+        let layout = Layout::build(3, |_| 2);
+        assert!(RegretTable::from_parts(vec![0.0; 6], vec![0.0; 6], Vec::new(), layout.clone()).is_ok());
+        assert!(RegretTable::from_parts(vec![0.0; 6], vec![0.0; 6], vec![0.0; 6], layout.clone()).is_ok());
+        assert!(RegretTable::from_parts(vec![0.0; 5], vec![0.0; 6], Vec::new(), layout.clone()).is_err());
+        assert!(RegretTable::from_parts(vec![0.0; 6], vec![0.0; 6], vec![0.0; 4], layout).is_err());
     }
 
     #[test]
     fn uniform_strategy_when_no_regret() {
-        let t = RegretTable::with_layout(1, |_| 4, false, false);
+        let t = RegretTable::with_layout(1, |_| 4);
         let mut s = [0.0; MAX_ACTIONS];
-        let n = t.strategy_into(0, &mut s);
+        let n = t.strategy_into(t.span(0), &mut s);
         assert_eq!(&s[..n], &[0.25; 4]);
     }
 
     #[test]
     fn regret_matching_normalizes_positive_regret() {
-        let mut t = RegretTable::with_layout(1, |_| 3, false, false);
-        t.regret_mut(0).copy_from_slice(&[3.0, 0.0, -2.0]);
+        let mut t = RegretTable::with_layout(1, |_| 3);
+        t.regret_mut(t.span(0)).copy_from_slice(&[3.0, 0.0, -2.0]);
         let mut s = [0.0; MAX_ACTIONS];
-        assert_eq!(t.strategy_into(0, &mut s), 3);
+        assert_eq!(t.strategy_into(t.span(0), &mut s), 3);
         assert!((s[0] - 1.0).abs() < 1e-9 && s[1] == 0.0 && s[2] == 0.0);
     }
 
     #[test]
-    fn optional_arrays_allocate_only_when_enabled() {
-        let plain = RegretTable::with_layout(10, |_| 2, false, false);
-        let full = RegretTable::with_layout(10, |_| 2, true, true);
-        assert!(plain.prev_inst.is_empty());
-        assert!(!full.prev_inst.is_empty() && !full.consec_below.is_empty());
-        // (f32 regret + f32 strategy-sum + f32 baseline) × 2 actions = 24
-        // bytes/info set, vs the HashMap Node's five heap vecs (~350 B).
-        assert_eq!(plain.bytes_per_info_set(), 24);
+    fn the_baseline_allocates_only_when_enabled() {
+        let plain = RegretTable::with_layout(10, |_| 2);
+        assert!(!plain.has_baseline());
+        // (f32 regret + f32 strategy-sum) × 2 actions = 16 bytes/info set, vs
+        // the HashMap Node's five heap vecs (~350 B)…
+        assert_eq!(plain.bytes_per_info_set(), 16);
+        // …and 24 once control variates add the baseline: a third of the table.
+        let mut with_baseline = RegretTable::with_layout(10, |_| 2);
+        with_baseline.enable_baseline();
+        assert!(with_baseline.has_baseline());
+        assert_eq!(with_baseline.bytes_per_info_set(), 24);
+        let at = with_baseline.span(3);
+        with_baseline.baseline_ema(at, 1, 10.0);
+        assert_eq!(with_baseline.baseline(at), &[0.0, 1.0], "one EMA step of 0.1 toward 10");
     }
 
     #[test]
-    fn save_load_round_trips() {
-        let mut t = RegretTable::with_layout(2, |_| 2, false, false);
-        t.regret_mut(1).copy_from_slice(&[1.5, -0.5]);
-        t.strategy_sum_mut(1).copy_from_slice(&[2.0, 1.0]);
-        let path = std::env::temp_dir().join(format!("regret_table_test_{}.bin", std::process::id()));
-        t.save(&path).unwrap();
-        let loaded = RegretTable::load(&path).unwrap();
-        std::fs::remove_file(&path).ok();
-        let mut a = Vec::new();
-        let mut b = Vec::new();
-        t.average_into(1, &mut a);
-        loaded.average_into(1, &mut b);
-        assert_eq!(a, b);
+    fn nothing_is_stored_per_info_set() {
+        // The point of the run-length layout: a table's index costs the same
+        // whether a block holds ten info sets or ten million.
+        let small = RegretTable::with_layout(10, |_| 2);
+        let large = RegretTable::with_layout(100_000, |_| 2);
+        assert_eq!(small.layout().runs(), 1);
+        assert_eq!(large.layout().runs(), 1);
     }
 }

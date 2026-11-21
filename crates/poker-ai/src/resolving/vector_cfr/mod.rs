@@ -39,7 +39,6 @@ mod tests;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use poker_core::legal_actions;
 use poker_core::state::{GameState, NO_CARD};
 
 use crate::abstraction::features::{combo_cards, PreparedRunout, PreparedShowdown};
@@ -71,8 +70,9 @@ pub struct VectorResolved {
 pub struct ResolveConfig {
     /// Maximum raises in the subgame (`u32::MAX` = the engine's unbounded
     /// re-raising).  Past the cap voluntary aggression (raise / voluntary
-    /// all-in) is pruned, exactly mirroring the blueprint's betting abstraction
-    /// (`BlueprintHoldem::capped_legal`) — a forced all-in call always stays.
+    /// all-in) is pruned — a forced all-in call always stays.  (The blueprint's
+    /// own cap keeps the all-in; see `build::capped_legal` for why this one
+    /// need not.)
     /// Deep-stacked resolving needs a finite cap: the unbounded re-raise chain
     /// makes the public tree explode.
     pub raise_cap: u32,
@@ -306,14 +306,5 @@ pub fn solve_vectorized(
 /// samples an index from the resolved distribution and looks the concrete
 /// action up here.
 pub fn capped_root_actions(root: &GameState, raise_cap: u32) -> Vec<poker_core::action::Action> {
-    use poker_core::action::Action;
-    let full = legal_actions(root);
-    if raise_cap > 0 {
-        return full.to_vec();
-    }
-    let has_passive = full.iter().any(|a| matches!(a, Action::Check | Action::Call));
-    full.iter()
-        .copied()
-        .filter(|a| !(matches!(a, Action::Raise(_)) || (matches!(a, Action::AllIn) && has_passive)))
-        .collect()
+    build::capped_legal(root, 0, raise_cap)
 }

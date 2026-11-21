@@ -23,7 +23,23 @@
 //! index no holes, which is all a throughput measurement needs.  Turn/river
 //! coverage maps are ~280 MB, so this wants release and some RAM headroom.
 //!
-//!   cargo run --release --example bench_train_paths
+//! The SoA arm comes in two sizes, because they measure different machines:
+//!
+//! * `all` — a 20 bb tree whose whole regret table fits in cache.  This is the
+//!   traversal's *arithmetic*: engine, action menus, sampling.
+//! * `big` — a 100 bb tree with a 340 MB table (9.5 M info sets), far out of
+//!   cache.  This is the regime the real blueprint trains in, where the cost
+//!   of a node is mostly the memory it touches — and an optimization that
+//!   looks free on the small tree (or pointless on it) can be worth 30% here.
+//!   Judge anything aimed at blueprint training speed on this one.
+//!
+//!   cargo run --release --example bench_train_paths            # cursor arm only
+//!   cargo run --release --example bench_train_paths -- all     # + SoA, in-cache tree
+//!   cargo run --release --example bench_train_paths -- big     # + SoA, out-of-cache tree
+//!
+//! Add `no-baseline` to either SoA arm to train without the VR-MCCFR control
+//! variate (`train blueprint --no-baseline`): a third less table, and one
+//! array fewer to touch per node.
 
 use std::time::Instant;
 
@@ -80,23 +96,29 @@ fn cursor_vs_clone() {
     println!("          => {:.2}x\n", clone_s / fast_s);
 }
 
-/// Serial vs batched-parallel vs lock-free atomic, on an indexed cap-2 tree.
-fn soa_scaling() {
+/// Serial vs batched-parallel vs lock-free atomic, on an indexed cap-2 tree of
+/// `stack_bb` big blinds with `buckets` card buckets per street.
+fn soa_scaling(stack_bb: u32, buckets: u16) {
     let iters = iters();
-    println!("== SoA solver: parallel scaling on an indexed 20bb cap-2 tree ({iters} iters) ==");
+    println!("== SoA solver: parallel scaling on an indexed {stack_bb}bb cap-2 tree ({iters} iters) ==");
     println!("   (building ~280 MB of full-coverage maps per config — this is the slow part)");
 
     let mk = || {
-        BlueprintHoldem::new(40, 2, 1, 0)
+        BlueprintHoldem::new(stack_bb * 2, 2, 1, 0)
             .with_raise_cap(2)
-            .with_street_bucket(0, BucketMap::full_coverage_mod(&[2, 3], 40))
-            .with_street_bucket(1, BucketMap::full_coverage_mod(&[2, 4], 40))
-            .with_street_bucket(2, BucketMap::full_coverage_mod(&[2, 5], 40))
+            .with_street_bucket(0, BucketMap::full_coverage_mod(&[2, 3], buckets))
+            .with_street_bucket(1, BucketMap::full_coverage_mod(&[2, 4], buckets))
+            .with_street_bucket(2, BucketMap::full_coverage_mod(&[2, 5], buckets))
             .with_indexing()
     };
     let bench = |name: &str, f: &mut dyn FnMut(&mut SoaMccfr<BlueprintHoldem>)| -> f64 {
-        let mut s =
-            SoaMccfr::with_seed(mk(), Variant::Dcfr(Discount::RECOMMENDED), 1).with_baseline();
+        let mut s = SoaMccfr::with_seed(mk(), Variant::Dcfr(Discount::RECOMMENDED), 1);
+        if !std::env::args().any(|a| a == "no-baseline") {
+            s = s.with_baseline();
+        }
+        if name == "serial" {
+            println!("   {} info sets, {} B each", s.capacity(), s.bytes_per_info_set());
+        }
         let t0 = Instant::now();
         f(&mut s);
         let secs = t0.elapsed().as_secs_f64();
@@ -128,12 +150,18 @@ fn soa_scaling() {
 
 fn main() {
     cursor_vs_clone();
-    // The SoA arm builds ~280 MB of coverage maps per configuration, six
+    // The SoA arms build ~280 MB of coverage maps per configuration, six
     // configurations deep — worth having, but not something to run by accident
-    // on a small machine, so it is opt-in like `bench_resolve_cost`'s heavy modes.
-    if std::env::args().any(|a| a == "all") {
-        soa_scaling();
-    } else {
-        println!("Cursor arm only; pass `all` for the SoA scaling arm (~280 MB of maps per config).");
+    // on a small machine, so they are opt-in like `bench_resolve_cost`'s heavy
+    // modes.
+    let arg = |name: &str| std::env::args().any(|a| a == name);
+    if arg("all") {
+        soa_scaling(20, 40);
+    }
+    if arg("big") {
+        soa_scaling(100, 100);
+    }
+    if !arg("all") && !arg("big") {
+        println!("Cursor arm only; pass `all` (in-cache tree) or `big` (out-of-cache tree) for the SoA arms.");
     }
 }

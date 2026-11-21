@@ -134,6 +134,7 @@ pub fn br_value_vector(
     seed: u64,
 ) -> Vec<f64> {
     assert!(!flops.is_empty(), "need at least one flop");
+    policy.assert_keys_match(game);
     FLOP_SUBTREES_DONE.store(0, Ordering::Relaxed);
     let mut ctx = Ctx::new(game, policy, br, flops, board_samples, seed);
     let state = game.play_state([[48, 49], [50, 51]], [poker_core::state::NO_CARD; 5]);

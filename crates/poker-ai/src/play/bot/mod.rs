@@ -391,6 +391,7 @@ impl std::fmt::Display for TrackingCounts {
 
 impl Bot {
     pub fn new(game: BlueprintHoldem, policy: CompactPolicy, cfg: BotConfig) -> Self {
+        policy.assert_keys_match(&game);
         let rng = cfg.seed | 1;
         Self {
             game,
@@ -558,11 +559,8 @@ impl Bot {
 
         // Our own echoed action: already applied (or deliberately skipped) at
         // decision time.
-        if ev.pos == hs.my_pos {
-            if let Some(pending) = hs.pending_self.take() {
-                let _ = pending; // applied (or skipped) when we decided
-                return;
-            }
+        if ev.pos == hs.my_pos && hs.pending_self.take().is_some() {
+            return;
         }
 
         // Desync guard: only translate events the abstract game has a node for.
@@ -601,7 +599,16 @@ impl Bot {
 
     /// Bayes update of `seat`'s range from its observed abstract action at the
     /// *current* (pre-action) abstract node: multiply each hand's probability
-    /// by the blueprint's likelihood of the action with that hand.
+    /// by the likelihood of the action with that hand.
+    ///
+    /// The two seats read different likelihoods.  The opponent's is the
+    /// blueprint's probability of the action — our model of a player we cannot
+    /// see inside.  Ours is the probability we actually **play** it with: the
+    /// blueprint's distribution after purification ([`Bot::play_distribution`]),
+    /// because that is what the action was drawn from.  Using the raw
+    /// blueprint for ourselves keeps every hand that takes this action 5% of
+    /// the time in our range, although we never take it with that hand — and
+    /// the river re-solve then defends, and bluffs, a range we do not hold.
     fn update_range(&self, hs: &mut HandState, seat: usize, action_index: u8) {
         let n = hs.hand.actions(&self.game).len();
         // Combos sharing a card with the visible board must never reach the
@@ -613,7 +620,8 @@ impl Bot {
         for &c in &gs.board[..gs.board_cards_count()] {
             board_mask |= 1 << c;
         }
-        let floor = if seat != hs.my_seat && gs.street >= 1 { self.cfg.opp_range_floor } else { 0.0 };
+        let ours = seat == hs.my_seat;
+        let floor = if !ours && gs.street >= 1 { self.cfg.opp_range_floor } else { 0.0 };
         let mut likelihood = vec![1.0; NUM_COMBOS];
         for (i, l) in likelihood.iter_mut().enumerate() {
             if hs.ranges[seat].probs[i] <= 0.0 {
@@ -625,14 +633,17 @@ impl Bot {
                 continue;
             }
             let key = hs.hand.key_with_hole(&self.game, [a, b]);
-            *l = floor + (1.0 - floor) * self.policy.probs_or_uniform(key, n)[action_index as usize];
+            let probs = self.policy.probs_or_uniform(key, n);
+            *l = if ours {
+                self.play_distribution(&probs)[action_index as usize]
+            } else {
+                floor + (1.0 - floor) * probs[action_index as usize]
+            };
         }
-        hs.ranges[seat].update(&likelihood);
+        hs.ranges[seat].update_if_supported(&likelihood);
     }
 }
 
-/// Whether `board` holds exactly the cards `street` has revealed — the guard
-/// every re-solve needs, since the root synthesis assumes they agree.
 /// Per-combo mask that zeroes every hand sharing a card with `hole` — the
 /// hands an opponent can never hold against us.
 fn hole_mask(hole: [u8; 2]) -> Vec<f64> {
@@ -648,6 +659,8 @@ fn hole_mask(hole: [u8; 2]) -> Vec<f64> {
         .collect()
 }
 
+/// Whether `board` holds exactly the cards `street` has revealed — the guard
+/// every re-solve needs, since the root synthesis assumes they agree.
 fn board_matches(street: u8, board: &[u8]) -> bool {
     match street {
         1 => board.len() == 3,

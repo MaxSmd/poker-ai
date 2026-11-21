@@ -28,8 +28,12 @@
 //!
 //! ## Footprints reported
 //!
-//! * **f32 SoA** (the current store): f32 regret + f64 strategy-sum + f32
-//!   baseline per (info set, action) slot, plus a 5-byte per-info-set index.
+//! * **f32 SoA** (the current store): f32 regret + f32 strategy-sum + f32
+//!   baseline per (info set, action) slot; **no-bl** is the same without the
+//!   baseline.  Nothing per info set — the table's index is a run-length
+//!   layout of a few megabytes.
+//! * **policy**: the trained strategy as `play` holds it — the dense format,
+//!   one `u16` per slot.
 //! * **lean** (the quantized `LeanTable` store, validated on push/fold): `i16`
 //!   regret + `u16` strategy-sum + `i16` baseline per slot, paired with Linear
 //!   CFR — the regime where integer quantization works (DCFR+bf16 was tried
@@ -66,14 +70,20 @@ const SMALL_BLIND: u32 = 1;
 /// the reason (round-to-nearest freezes it past ~1.7e7 visits; see
 /// `solver::regret_table`).
 const BYTES_PER_SLOT: usize = 4 + 4 + 4;
-/// Per-info-set index overhead: `offsets` (u32) + `num_actions` (u8).
-const INDEX_BYTES_PER_INFOSET: usize = 4 + 1;
+/// The same store trained without control variates (`train blueprint
+/// --no-baseline`): the baseline array is never allocated.
+const BYTES_PER_SLOT_NO_BASELINE: usize = 4 + 4;
+// Neither store keeps anything per info set: where each one's slots are is a
+// run-length layout with one entry per betting node (megabytes).  The 5 bytes
+// per info set the tables used to carry for it were 3 GB at 595 M info sets.
 /// Lean store (`LeanTable`, validated): `i16` regret + `u16` strategy-sum +
 /// `i16` baseline per slot (a per-info-set scalar baseline was considered and
 /// is unsound — a constant control variate cancels out of the correction)…
 const LEAN_BYTES_PER_SLOT: usize = 3 * 2;
-/// …plus the same per-info-set index as the f32 store.
-const LEAN_BYTES_PER_INFOSET: usize = INDEX_BYTES_PER_INFOSET;
+/// The dense play-time policy (`play::policy`): one `u16` probability per
+/// slot, addressed by the same layout — what `play` holds in RAM and what the
+/// trained artifact weighs on disk.
+const POLICY_BYTES_PER_SLOT: usize = 2;
 /// Card-bucket maps loaded at train time, constant across the whole matrix:
 /// flop 1.29M + turn 13.96M + river 123.16M situations × 2 bytes (u16).
 const BUCKET_MAP_BYTES: usize = (1_286_792 + 13_960_050 + 123_156_254) * 2;
@@ -270,12 +280,20 @@ fn table_size(counts: &Counts, buckets: [u64; 4]) -> (u64, u64) {
     (info_sets, slots)
 }
 
-fn f32_bytes(info_sets: u64, slots: u64) -> u64 {
-    slots * BYTES_PER_SLOT as u64 + info_sets * INDEX_BYTES_PER_INFOSET as u64
+fn f32_bytes(slots: u64) -> u64 {
+    slots * BYTES_PER_SLOT as u64
 }
 
-fn lean_bytes(info_sets: u64, slots: u64) -> u64 {
-    slots * LEAN_BYTES_PER_SLOT as u64 + info_sets * LEAN_BYTES_PER_INFOSET as u64
+fn f32_no_baseline_bytes(slots: u64) -> u64 {
+    slots * BYTES_PER_SLOT_NO_BASELINE as u64
+}
+
+fn lean_bytes(slots: u64) -> u64 {
+    slots * LEAN_BYTES_PER_SLOT as u64
+}
+
+fn policy_bytes(slots: u64) -> u64 {
+    slots * POLICY_BYTES_PER_SLOT as u64
 }
 
 // ---------------------------------------------------------------------------
@@ -390,11 +408,13 @@ fn main() {
         buckets[1], buckets[2], buckets[3], fmt_count(limit as u64)
     );
     println!(
-        "Stores: f32 SoA = {BYTES_PER_SLOT} B/slot + {INDEX_BYTES_PER_INFOSET} B/info-set; \
-         lean = {LEAN_BYTES_PER_SLOT} B/slot + {LEAN_BYTES_PER_INFOSET} B/info-set \
-         (i16 regret + u16 strat-sum + f32 baseline/info-set, Linear-MCCFR regime).\n\
+        "Stores: f32 SoA = {BYTES_PER_SLOT} B/slot \
+         ({BYTES_PER_SLOT_NO_BASELINE} B/slot with --no-baseline: the `no-bl` column); \
+         lean = {LEAN_BYTES_PER_SLOT} B/slot \
+         (i16 regret + u16 strat-sum + i16 baseline, Linear-MCCFR regime).\n\
          Train RAM ≈ table + {} bucket maps. Resident RAM is lower still: untouched\n\
-         slots (unreached sequence×bucket combos) never commit a page.\n",
+         slots (unreached sequence×bucket combos) never commit a page.\n\
+         `policy` = the trained strategy as `play` loads it ({POLICY_BYTES_PER_SLOT} B/slot), in RAM and on disk.\n",
         fmt_bytes(BUCKET_MAP_BYTES as u64)
     );
 
@@ -404,8 +424,8 @@ fn main() {
         let players = players as u8;
         println!("── {players}-player ─────────────────────────────────────────────────────────────────────────");
         println!(
-            "{:>7} {:>7}  {:>26}  {:>10}  {:>10}  {:>10}  {:>10}  {:>8}  {:>7}",
-            "stack", "cap", "betting nodes pf/f/t/r", "info sets", "slots", "f32 RAM", "lean RAM", "DAG", "walk"
+            "{:>7} {:>7}  {:>26}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>8}  {:>7}",
+            "stack", "cap", "betting nodes pf/f/t/r", "info sets", "slots", "f32 RAM", "no-bl", "lean RAM", "policy", "DAG", "walk"
         );
         for &stack_bb in &stacks {
             for &cap in &cap_list {
@@ -428,14 +448,16 @@ fn main() {
                     .collect::<Vec<_>>()
                     .join("/");
                 println!(
-                    "{:>5}bb {:>7}  {:>26}  {:>10}  {:>10}  {:>10}  {:>10}  {:>8}  {:>6.1}s",
+                    "{:>5}bb {:>7}  {:>26}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>8}  {:>6.1}s",
                     stack_bb,
                     cap.to_string(),
                     nodes,
                     fmt_count(info_sets),
                     fmt_count(slots),
-                    fmt_bytes(f32_bytes(info_sets, slots)),
-                    fmt_bytes(lean_bytes(info_sets, slots)),
+                    fmt_bytes(f32_bytes(slots)),
+                    fmt_bytes(f32_no_baseline_bytes(slots)),
+                    fmt_bytes(lean_bytes(slots)),
+                    fmt_bytes(policy_bytes(slots)),
                     fmt_count(m.states as u64),
                     m.secs,
                 );
@@ -472,9 +494,9 @@ mod tests {
         let (info_sets, slots) = table_size(&m.counts, [169, 500, 500, 800]);
         assert_eq!(info_sets, 5_893_436);
         assert!(info_sets > old_info_sets, "keeping all-in at the cap adds nodes");
-        // 2.5 slots/info-set; 12 B/slot + 5 B index ≈ 0.20 GB.
-        let bytes = f32_bytes(info_sets, slots) as f64;
-        assert!((0.18e9..0.22e9).contains(&bytes), "got {}", fmt_bytes(bytes as u64));
+        // 2.5 slots/info-set at 12 B/slot ≈ 0.18 GB.
+        let bytes = f32_bytes(slots) as f64;
+        assert!((0.16e9..0.20e9).contains(&bytes), "got {}", fmt_bytes(bytes as u64));
     }
 
     /// Per-street caps are exact per street: a cap only bounds decisions made

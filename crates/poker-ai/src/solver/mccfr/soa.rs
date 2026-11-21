@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use super::parallel::{record_baseline, record_strategy_delta, record_traverser_delta, Delta};
 use crate::util::rng::splitmix_stream;
 use super::BASELINE_RATE;
-use crate::games::{CursorGame, IndexedGame};
+use crate::games::{CursorGame, IndexedGame, Layout, Span};
 use crate::solver::variant::Variant;
 use crate::solver::lean_table::LeanTable;
 use crate::solver::regret_table::{sr_add, RegretStore, RegretTable};
@@ -61,8 +61,7 @@ impl<G: IndexedGame, S: RegretStore> SoaMccfr<G, S> {
     /// Create a solver with an explicit RNG seed; the flat table is laid out from
     /// the game's known info-set capacity.
     pub fn with_seed(game: G, variant: Variant, seed: u64) -> Self {
-        let capacity = game.info_set_capacity();
-        let table = S::build(capacity, &|i| game.actions_at(i));
+        let table = S::build(game.layout());
         Self {
             game,
             variant,
@@ -75,13 +74,19 @@ impl<G: IndexedGame, S: RegretStore> SoaMccfr<G, S> {
         }
     }
 
-    /// Enable the VR-MCCFR baseline (control variate).  Stores that keep the
-    /// baseline optional (the quantized [`LeanTable`]) allocate it here, so a
-    /// run without control variates never carries the array.
+    /// Enable the VR-MCCFR baseline (control variate).  The store allocates
+    /// its baseline array here, so a run without control variates never
+    /// carries it — a third of the table on either store.
     pub fn with_baseline(mut self) -> Self {
         self.use_baseline = true;
         self.table.enable_baseline();
         self
+    }
+
+    /// Whether the VR-MCCFR baseline is on (fixed at construction, and
+    /// restored from a checkpoint on resume).
+    pub fn uses_baseline(&self) -> bool {
+        self.use_baseline
     }
 
     pub fn iterations(&self) -> u64 {
@@ -100,8 +105,26 @@ impl<G: IndexedGame, S: RegretStore> SoaMccfr<G, S> {
     /// Average (deployable) strategy at a dense info-set index.
     pub fn average_strategy_at(&self, index: usize) -> Vec<f64> {
         let mut out = Vec::new();
-        self.table.average_into(index, &mut out);
+        self.table.average_into(self.table.span(index), &mut out);
         out
+    }
+
+    /// The flat table's slot layout — one [`Span`] per info set, in index
+    /// order.
+    pub fn layout(&self) -> &Layout {
+        self.table.layout()
+    }
+
+    /// The average strategy of the info set at `at` written into `out`, or
+    /// `false` (and `out` untouched) if training never reached it.  For
+    /// exports that walk [`layout`](Self::layout) in order: no per-info-set
+    /// lookup or allocation.
+    pub fn average_strategy_into(&self, at: Span, out: &mut Vec<f64>) -> bool {
+        if !self.table.is_visited(at) {
+            return false;
+        }
+        self.table.average_into(at, out);
+        true
     }
 
     /// Number of info sets in the flat table (the game's
@@ -112,7 +135,16 @@ impl<G: IndexedGame, S: RegretStore> SoaMccfr<G, S> {
 
     /// Whether the info set at `index` was ever reached (has strategy mass).
     pub fn is_visited(&self, index: usize) -> bool {
-        self.table.is_visited(index)
+        self.table.is_visited(self.table.span(index))
+    }
+
+    /// The slots of the info set at `cursor`: from the game when it can say
+    /// (no lookup at all), else from the table's layout.  Once per node.
+    #[inline]
+    fn span_at(&self, cursor: &G::Cursor, index: usize) -> Span {
+        let at = self.game.slot_span(cursor, index).unwrap_or_else(|| self.table.span(index));
+        debug_assert_eq!(at, self.table.span(index), "the game's slot span disagrees with the table layout");
+        at
     }
 
     /// Run `iters` external-sampling iterations (serial).
@@ -148,12 +180,13 @@ impl<G: IndexedGame, S: RegretStore> SoaMccfr<G, S> {
 
         let player = CursorGame::current_player(&self.game, cursor);
         let index = self.game.info_set_index(cursor);
+        let at = self.span_at(cursor, index);
         let actions = CursorGame::legal(&self.game, cursor);
         let acts = actions.as_ref();
         let num_actions = acts.len();
         // Stack scratch, not `Vec`s: this runs once per decision node.
         let mut strategy = [0.0f64; MAX_ACTIONS];
-        let n = self.table.strategy_into(index, &mut strategy);
+        let n = self.table.strategy_into(at, &mut strategy);
         debug_assert_eq!(n, num_actions, "table fan-out must match the engine's");
         let strategy = &strategy[..n];
 
@@ -167,16 +200,16 @@ impl<G: IndexedGame, S: RegretStore> SoaMccfr<G, S> {
                 node_value += strategy[a] * util[a];
             }
             let util = &util[..num_actions];
-            self.table.add_regret(index, util, node_value, t, self.variant);
+            self.table.add_regret(at, util, node_value, t, self.variant);
             if self.use_baseline {
                 let sgn = Self::sign(traverser);
                 for (a, &u) in util.iter().enumerate() {
-                    self.table.baseline_ema(index, a, sgn * u);
+                    self.table.baseline_ema(at, a, sgn * u);
                 }
             }
             node_value
         } else {
-            self.table.add_strategy(index, strategy, t, self.variant, &mut self.sr_rng);
+            self.table.add_strategy(at, strategy, t, self.variant, &mut self.sr_rng);
             let a = self.sample(strategy);
             CursorGame::apply(&self.game, cursor, a, acts[a]);
             let v_child = self.traverse(cursor, traverser, t);
@@ -186,9 +219,9 @@ impl<G: IndexedGame, S: RegretStore> SoaMccfr<G, S> {
             }
             let sgn = Self::sign(traverser);
             let v0 = sgn * v_child;
-            let (baseline_exp, baseline_a) = self.table.baseline_pair(index, strategy, a);
+            let (baseline_exp, baseline_a) = self.table.baseline_pair(at, strategy, a);
             let corrected0 = baseline_exp + (v0 - baseline_a);
-            self.table.baseline_ema(index, a, v0);
+            self.table.baseline_ema(at, a, v0);
             sgn * corrected0
         }
     }
@@ -292,12 +325,13 @@ impl<G: IndexedGame> SoaMccfr<G, RegretTable> {
         let player = CursorGame::current_player(&self.game, cursor);
         let index = self.game.info_set_index(cursor);
         let key = index as u64;
+        let at = self.span_at(cursor, index);
         let actions = CursorGame::legal(&self.game, cursor);
         let acts = actions.as_ref();
         let num_actions = acts.len();
         // Stack scratch, not `Vec`s: this runs once per decision node.
         let mut strategy = [0.0f64; MAX_ACTIONS];
-        let n = self.table.strategy_into(index, &mut strategy);
+        let n = self.table.strategy_into(at, &mut strategy);
         debug_assert_eq!(n, num_actions, "table fan-out must match the engine's");
         let strategy = &strategy[..n];
 
@@ -328,7 +362,7 @@ impl<G: IndexedGame> SoaMccfr<G, RegretTable> {
             }
             let sgn = Self::sign(traverser);
             let v0 = sgn * v_child;
-            let b = self.table.baseline(index);
+            let b = self.table.baseline(at);
             let baseline_exp: f64 = (0..num_actions).map(|i| strategy[i] * b[i] as f64).sum();
             let corrected0 = baseline_exp + (v0 - b[a] as f64);
             record_baseline(delta, key, num_actions, a, v0);
@@ -344,7 +378,7 @@ impl<G: IndexedGame> SoaMccfr<G, RegretTable> {
         let discount = matches!(self.variant, Variant::Dcfr(_));
         self.nodes_visited += delta.nodes_visited;
         for (key, inst) in delta.regret_inst {
-            let regret = self.table.regret_mut(key as usize);
+            let regret = self.table.regret_mut(self.table.span(key as usize));
             for (r32, &i) in regret.iter_mut().zip(&inst) {
                 let mut r = *r32 as f64;
                 if discount {
@@ -356,7 +390,7 @@ impl<G: IndexedGame> SoaMccfr<G, RegretTable> {
         }
         for (key, s) in delta.strat {
             let sr = &mut self.sr_rng;
-            let ss = self.table.strategy_sum_mut(key as usize);
+            let ss = self.table.strategy_sum_mut(self.table.span(key as usize));
             for (sum, &v) in ss.iter_mut().zip(&s) {
                 sr_add(sum, v, sr);
             }
@@ -364,7 +398,7 @@ impl<G: IndexedGame> SoaMccfr<G, RegretTable> {
         if self.use_baseline {
             for (key, sums) in delta.baseline_sum {
                 let cnt = &delta.baseline_cnt[&key];
-                let b = self.table.baseline_mut(key as usize);
+                let b = self.table.baseline_mut(self.table.span(key as usize));
                 for a in 0..b.len() {
                     if cnt[a] > 0 {
                         let mean = sums[a] / cnt[a] as f64;
@@ -389,9 +423,7 @@ impl<G: IndexedGame> SoaMccfr<G, RegretTable> {
         };
         // Stream straight to the temp file: buffering the serialized table in
         // RAM first would transiently double the footprint (a 15 GB table cost
-        // ~30 GB extra at 200 bb — observed on the first server run).  The
-        // byte format is identical to the buffered form, so checkpoints stay
-        // interchangeable across versions.
+        // ~30 GB extra at 200 bb — observed on the first server run).
         let path = path.as_ref();
         let tmp = path.with_extension("ckpt.tmp");
         let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
@@ -404,22 +436,42 @@ impl<G: IndexedGame> SoaMccfr<G, RegretTable> {
     /// Restore from a checkpoint, re-supplying the game.  Streams from disk
     /// (no whole-file byte buffer — same rationale as the save path).
     ///
-    /// Accepts **both** checkpoint layouts: the current one, and the pre-`f32`
-    /// one whose strategy sums were `f64` (see the `legacy` module below).  A
-    /// run interrupted under the old build resumes under this one, converted in
-    /// place.
+    /// Accepts **every** checkpoint layout this solver has written (see the
+    /// `legacy` module), so a run interrupted under an older build resumes
+    /// under this one, converted in place.
+    ///
+    /// Fails if the checkpoint's table is not laid out the way `game` lays
+    /// one out — a different raise cap, stack depth or bucket count.  Such a
+    /// table has the wrong info sets in its slots; training on would not
+    /// crash, it would silently mix them.
     pub fn load_checkpoint(path: impl AsRef<Path>, game: G) -> io::Result<Self> {
         let path = path.as_ref();
         let mut r = std::io::BufReader::new(std::fs::File::open(path)?);
         // `peek_magic` consumes the marker, so what follows is exactly the
-        // body — which is why the read struct omits the `magic` field the
+        // body — which is why the read structs omit the `magic` field the
         // write struct carries.
-        let cp = if peek_magic(&mut r)? == SOA_CKPT_MAGIC {
-            bincode::deserialize_from::<_, SoaCheckpointBody>(r).map_err(io::Error::other)?
-        } else {
-            let r = std::io::BufReader::new(std::fs::File::open(path)?);
-            legacy::load(r)?
+        let cp = match peek_magic(&mut r)? {
+            SOA_CKPT_MAGIC => {
+                let cp: SoaCheckpointBody = bincode::deserialize_from(r).map_err(io::Error::other)?;
+                cp.table.validate().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                cp
+            }
+            legacy::V2_MAGIC => legacy::load_v2(r)?,
+            _ => legacy::load_v1(std::io::BufReader::new(std::fs::File::open(path)?))?,
         };
+        if *cp.table.layout() != game.layout() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} holds a table of {} info sets / {} slots, laid out for a different game than this one \
+                     ({} info sets) — it was trained with another raise cap, stack depth or bucket count",
+                    path.display(),
+                    cp.table.capacity(),
+                    cp.table.total_slots(),
+                    game.info_set_capacity(),
+                ),
+            ));
+        }
         Ok(Self {
             game,
             variant: cp.variant,
@@ -433,15 +485,15 @@ impl<G: IndexedGame> SoaMccfr<G, RegretTable> {
     }
 }
 
-/// Marker at the head of a current-layout SoA checkpoint.  A pre-`f32`
-/// checkpoint starts with bincode's enum tag for `Variant` — a `u32` of 0 or 1
-/// — so the two are unambiguously distinguishable and an interrupted server run
-/// can be migrated instead of orphaned.
-const SOA_CKPT_MAGIC: u64 = 0x3241_4F53_524B_4F50; // "POKRSOA2", little-endian
+/// Marker at the head of a current-layout SoA checkpoint.  The first
+/// checkpoints had none and start with bincode's enum tag for `Variant` — a
+/// `u32` of 0 or 1 — so every generation is unambiguously distinguishable and
+/// an interrupted server run can be migrated instead of orphaned.
+const SOA_CKPT_MAGIC: u64 = 0x3341_4F53_524B_4F50; // "POKRSOA3", little-endian
 
-/// Read the leading `u64` without consuming it from the logical stream (the
-/// caller reopens the file for the branch it picks — checkpoints are large and
-/// streamed, so seeking beats buffering).
+/// Read the leading `u64` of a checkpoint.  A legacy file without a marker is
+/// reopened by the caller (checkpoints are large and streamed, so reopening
+/// beats buffering).
 fn peek_magic(r: &mut impl std::io::Read) -> io::Result<u64> {
     let mut head = [0u8; 8];
     match r.read_exact(&mut head) {
@@ -477,113 +529,156 @@ struct SoaCheckpointBody {
     nodes_visited: u64,
 }
 
-/// Reading the **pre-`f32`** checkpoint layout, whose strategy sums were `f64`.
+/// Reading the checkpoint layouts earlier builds wrote.
 ///
 /// bincode is not self-describing, so an old file cannot simply be handed to
-/// the current `Deserialize` — the field widths differ from `strategy_sum`
-/// onward and everything after it would be misread.  These mirrors reproduce
-/// the old layout exactly; loading one converts the sums to `f32` (a one-time
-/// round-to-nearest of an already-accumulated total, which preserves the
-/// within-info-set ratios that are the only thing the average depends on) and
-/// seeds the rounding stream from the run's own RNG so the resumed run stays
-/// deterministic.
+/// the current `Deserialize` — the fields differ and everything after the
+/// first difference would be misread.  These mirrors reproduce the old layouts
+/// exactly and convert on load:
+///
+/// * **v2** (`POKRSOA2`): the table carried an action count and a slot offset
+///   *per info set* (5 bytes each — 3 GB at 595 M info sets), plus two
+///   accumulator arrays for features this solver never implemented, always
+///   empty.  The action counts become the run-length [`Layout`]; the rest is
+///   dropped.
+/// * **v1** (no marker): as v2, but the strategy sums were `f64`.  They are
+///   narrowed to `f32` — a one-time round-to-nearest of an already-accumulated
+///   total, which preserves the within-info-set ratios that are the only thing
+///   the average depends on — and the rounding stream is seeded from the run's
+///   own RNG so the resumed run stays deterministic.
 mod legacy {
     use super::*;
 
+    pub(super) const V2_MAGIC: u64 = 0x3241_4F53_524B_4F50; // "POKRSOA2"
+
     #[derive(Deserialize)]
-    struct Table {
+    struct TableV2 {
+        regret: Vec<f32>,
+        strategy_sum: Vec<f32>,
+        baseline: Vec<f32>,
+        _prev_inst: Vec<f32>,
+        _consec_below: Vec<u32>,
+        num_actions: Vec<u8>,
+        _offsets: Vec<u32>,
+    }
+
+    #[derive(Deserialize)]
+    struct CheckpointV2 {
+        variant: Variant,
+        use_baseline: bool,
+        table: TableV2,
+        rng: u64,
+        sr_rng: u64,
+        iterations: u64,
+        nodes_visited: u64,
+    }
+
+    #[derive(Deserialize)]
+    struct TableV1 {
         regret: Vec<f32>,
         strategy_sum: Vec<f64>,
         baseline: Vec<f32>,
-        prev_inst: Vec<f32>,
-        consec_below: Vec<u32>,
+        _prev_inst: Vec<f32>,
+        _consec_below: Vec<u32>,
         num_actions: Vec<u8>,
-        offsets: Vec<u32>,
+        _offsets: Vec<u32>,
     }
 
     #[derive(Deserialize)]
-    struct Checkpoint {
+    struct CheckpointV1 {
         variant: Variant,
         use_baseline: bool,
-        table: Table,
+        table: TableV1,
         rng: u64,
         iterations: u64,
         nodes_visited: u64,
     }
 
-    /// Serialize a table in the **old** layout — test-only, so the migration is
-    /// gated against bytes actually shaped like a pre-`f32` checkpoint rather
-    /// than against a hand-written assumption about them.
-    #[cfg(test)]
-    pub(super) fn write_v1(
-        w: impl std::io::Write,
-        variant: Variant,
-        use_baseline: bool,
-        table: &RegretTable,
-        rng: u64,
-        iterations: u64,
-        nodes_visited: u64,
-    ) -> io::Result<()> {
-        #[derive(Serialize)]
-        struct TableV1<'a> {
-            regret: &'a [f32],
-            strategy_sum: Vec<f64>,
-            baseline: &'a [f32],
-            prev_inst: &'a [f32],
-            consec_below: &'a [u32],
-            num_actions: &'a [u8],
-            offsets: &'a [u32],
-        }
-        #[derive(Serialize)]
-        struct CheckpointV1<'a> {
-            variant: Variant,
-            use_baseline: bool,
-            table: TableV1<'a>,
-            rng: u64,
-            iterations: u64,
-            nodes_visited: u64,
-        }
-        let parts = table.parts_for_test();
-        let view = CheckpointV1 {
-            variant,
-            use_baseline,
-            table: TableV1 {
-                regret: parts.0,
-                strategy_sum: parts.1.iter().map(|&x| x as f64).collect(),
-                baseline: parts.2,
-                prev_inst: parts.3,
-                consec_below: parts.4,
-                num_actions: parts.5,
-                offsets: parts.6,
-            },
-            rng,
-            iterations,
-            nodes_visited,
-        };
-        bincode::serialize_into(w, &view).map_err(io::Error::other)
+    /// The per-info-set action counts as a run-length layout.  The offsets the
+    /// old table stored alongside were their running sum, which the layout
+    /// recomputes (in `u64`, where the old `u32` could wrap).
+    fn layout_of(num_actions: &[u8]) -> Layout {
+        Layout::from_runs(num_actions.iter().map(|&n| (1, n as usize)))
     }
 
-    pub(super) fn load(r: impl std::io::Read) -> io::Result<SoaCheckpointBody> {
-        let cp: Checkpoint = bincode::deserialize_from(r).map_err(io::Error::other)?;
+    /// The body of a v2 checkpoint, after its marker.
+    pub(super) fn load_v2(r: impl std::io::Read) -> io::Result<SoaCheckpointBody> {
+        let cp: CheckpointV2 = bincode::deserialize_from(r).map_err(io::Error::other)?;
         let t = cp.table;
-        let table = RegretTable::from_parts(
-            t.regret,
-            t.strategy_sum.into_iter().map(|x| x as f32).collect(),
-            t.baseline,
-            t.prev_inst,
-            t.consec_below,
-            t.num_actions,
-            t.offsets,
-        );
+        let layout = layout_of(&t.num_actions);
         Ok(SoaCheckpointBody {
             variant: cp.variant,
             use_baseline: cp.use_baseline,
-            table,
+            table: RegretTable::from_parts(t.regret, t.strategy_sum, t.baseline, layout)?,
+            rng: cp.rng,
+            sr_rng: cp.sr_rng,
+            iterations: cp.iterations,
+            nodes_visited: cp.nodes_visited,
+        })
+    }
+
+    /// A whole v1 checkpoint (it has no marker to skip).
+    pub(super) fn load_v1(r: impl std::io::Read) -> io::Result<SoaCheckpointBody> {
+        let cp: CheckpointV1 = bincode::deserialize_from(r).map_err(io::Error::other)?;
+        let t = cp.table;
+        let layout = layout_of(&t.num_actions);
+        let strategy_sum = t.strategy_sum.into_iter().map(|x| x as f32).collect();
+        Ok(SoaCheckpointBody {
+            variant: cp.variant,
+            use_baseline: cp.use_baseline,
+            table: RegretTable::from_parts(t.regret, strategy_sum, t.baseline, layout)?,
             rng: cp.rng,
             sr_rng: super::super::atomic::SR_STREAM ^ cp.rng,
             iterations: cp.iterations,
             nodes_visited: cp.nodes_visited,
         })
+    }
+
+    /// Serialize a solver's state in an **old** layout — test-only, so the
+    /// migrations are gated against bytes actually shaped like the old
+    /// checkpoints rather than against a hand-written assumption about them.
+    /// `v1` selects the marker-less `f64`-sum form.
+    #[cfg(test)]
+    pub(super) fn write_old<G: IndexedGame>(
+        w: &mut impl std::io::Write,
+        s: &SoaMccfr<G, RegretTable>,
+        v1: bool,
+    ) -> io::Result<()> {
+        #[derive(Serialize)]
+        struct Table<'a, S> {
+            regret: &'a [f32],
+            strategy_sum: S,
+            baseline: &'a [f32],
+            prev_inst: &'a [f32],
+            consec_below: &'a [u32],
+            num_actions: Vec<u8>,
+            offsets: Vec<u32>,
+        }
+        let (regret, strategy_sum, baseline, layout) = s.table.parts_for_test();
+        let num_actions = layout.expanded_widths();
+        let offsets = layout.spans().map(|at| at.base as u32).collect();
+        let ser = |e| io::Error::other(e);
+        if v1 {
+            let table = Table {
+                regret,
+                strategy_sum: strategy_sum.iter().map(|&x| x as f64).collect::<Vec<f64>>(),
+                baseline,
+                prev_inst: &[],
+                consec_below: &[],
+                num_actions,
+                offsets,
+            };
+            bincode::serialize_into(w, &(s.variant, s.use_baseline, table, s.rng, s.iterations, s.nodes_visited))
+                .map_err(ser)
+        } else {
+            let table =
+                Table { regret, strategy_sum, baseline, prev_inst: &[], consec_below: &[], num_actions, offsets };
+            bincode::serialize_into(
+                w,
+                &(V2_MAGIC, s.variant, s.use_baseline, table, s.rng, s.sr_rng, s.iterations, s.nodes_visited),
+            )
+            .map_err(ser)
+        }
     }
 }
 
@@ -604,10 +699,16 @@ mod checkpoint_tests {
         s
     }
 
+    fn write_old(s: &SoaMccfr<PushFoldHoldem>, path: &Path, v1: bool) {
+        let mut w = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+        legacy::write_old(&mut w, s, v1).unwrap();
+        std::io::Write::flush(&mut w).unwrap();
+    }
+
     #[test]
     fn current_checkpoint_round_trips_and_resumes() {
         let s = trained();
-        let path = temp_path("v2");
+        let path = temp_path("v3");
         s.save_checkpoint(&path).unwrap();
         let loaded =
             SoaMccfr::load_checkpoint(&path, PushFoldHoldem::new(40, 2, 1, 0)).unwrap();
@@ -618,26 +719,33 @@ mod checkpoint_tests {
     }
 
     #[test]
+    fn a_checkpoint_with_per_info_set_arrays_still_loads() {
+        // The layout the server's checkpoints are in today: an action count
+        // and an offset for every info set.  Loading one must give back the
+        // identical table — same bits in every slot — and train on from it
+        // exactly as the solver that wrote it would have.
+        let mut s = trained();
+        let path = temp_path("v2");
+        write_old(&s, &path, false);
+        let mut loaded = SoaMccfr::load_checkpoint(&path, PushFoldHoldem::new(40, 2, 1, 0)).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(loaded.iterations(), s.iterations(), "counters survive");
+        assert_eq!(loaded.nodes_visited(), s.nodes_visited());
+        assert!(loaded.uses_baseline());
+        assert_eq!(loaded.table.parts_for_test(), s.table.parts_for_test(), "the table is bit-identical");
+        s.train(2_000);
+        loaded.train(2_000);
+        assert_eq!(loaded.table.parts_for_test(), s.table.parts_for_test(), "and resumes bit-identically");
+    }
+
+    #[test]
     fn a_pre_f32_checkpoint_still_loads() {
         // The server's interrupted runs must survive the storage change: a file
-        // written in the old layout (f64 strategy sums, no magic marker) has to
+        // written in the oldest layout (f64 strategy sums, no magic marker) has to
         // load, carry its counters, and keep its average strategy.
         let s = trained();
         let path = temp_path("v1");
-        {
-            let mut w = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
-            legacy::write_v1(
-                &mut w,
-                s.variant,
-                s.use_baseline,
-                &s.table,
-                s.rng,
-                s.iterations,
-                s.nodes_visited,
-            )
-            .unwrap();
-            std::io::Write::flush(&mut w).unwrap();
-        }
+        write_old(&s, &path, true);
         let loaded =
             SoaMccfr::load_checkpoint(&path, PushFoldHoldem::new(40, 2, 1, 0)).unwrap();
         std::fs::remove_file(&path).ok();
@@ -653,5 +761,81 @@ mod checkpoint_tests {
         let mut resumed = loaded;
         resumed.train(1_000);
         assert_eq!(resumed.iterations(), s.iterations() + 1_000);
+    }
+
+    /// A game laid out differently from the one a checkpoint was trained on —
+    /// here by claiming a third action everywhere, standing in for a changed
+    /// raise cap.
+    struct Wider(PushFoldHoldem);
+
+    impl CursorGame for Wider {
+        type Cursor = <PushFoldHoldem as CursorGame>::Cursor;
+        type Action = <PushFoldHoldem as CursorGame>::Action;
+        type Actions = <PushFoldHoldem as CursorGame>::Actions;
+        fn num_players(&self) -> usize {
+            self.0.num_players()
+        }
+        fn root(&self) -> Self::Cursor {
+            self.0.root()
+        }
+        fn is_terminal(&self, c: &Self::Cursor) -> bool {
+            self.0.is_terminal(c)
+        }
+        fn is_chance(&self, c: &Self::Cursor) -> bool {
+            self.0.is_chance(c)
+        }
+        fn utility(&self, c: &Self::Cursor, player: usize) -> f64 {
+            self.0.utility(c, player)
+        }
+        fn current_player(&self, c: &Self::Cursor) -> usize {
+            self.0.current_player(c)
+        }
+        fn legal(&self, c: &Self::Cursor) -> Self::Actions {
+            self.0.legal(c)
+        }
+        fn info_key(&self, c: &Self::Cursor) -> u64 {
+            CursorGame::info_key(&self.0, c)
+        }
+        fn apply(&self, c: &mut Self::Cursor, a: usize, action: Self::Action) {
+            self.0.apply(c, a, action)
+        }
+        fn undo(&self, c: &mut Self::Cursor) {
+            self.0.undo(c)
+        }
+        fn sample_chance(&self, c: &mut Self::Cursor, next_unit: impl FnMut() -> f64) {
+            self.0.sample_chance(c, next_unit)
+        }
+        fn undo_chance(&self, c: &mut Self::Cursor) {
+            self.0.undo_chance(c)
+        }
+    }
+
+    impl IndexedGame for Wider {
+        fn info_set_capacity(&self) -> usize {
+            self.0.info_set_capacity()
+        }
+        fn info_set_index(&self, c: &Self::Cursor) -> usize {
+            self.0.info_set_index(c)
+        }
+        fn actions_at(&self, _index: usize) -> usize {
+            3
+        }
+    }
+
+    #[test]
+    fn a_checkpoint_from_a_different_game_is_refused() {
+        // Resuming a table under another betting tree used to go unnoticed:
+        // the info-set count can even match while the slots mean something
+        // else.  It has to be an error that names the cause.
+        let s = trained();
+        let path = temp_path("foreign");
+        s.save_checkpoint(&path).unwrap();
+        let err = match SoaMccfr::load_checkpoint(&path, Wider(PushFoldHoldem::new(40, 2, 1, 0))) {
+            Err(e) => e,
+            Ok(_) => panic!("a table laid out for another game must not load"),
+        };
+        std::fs::remove_file(&path).ok();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("different game"), "{err}");
     }
 }

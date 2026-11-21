@@ -8,7 +8,8 @@
 //!   opponent raises past the abstraction's cap and no blueprint node exists
 //! * [`luck`] — AIVAT-style chance-node control variate for luck-adjusted
 //!   match scoring (pot-weighted equity deltas at each board reveal)
-//! * [`policy`] — compact zero-copy view of `data/blueprint_holdem.bin`
+//! * [`policy`] — the trained strategy `data/blueprint_holdem.bin`, in its
+//!   dense (by info-set index) and hashed-key formats
 //! * [`tracker`] — dual-state (real ↔ abstract) tracking with pseudo-harmonic
 //!   action translation
 //! * [`bot`] — the decision engine: blueprint policy + Bayes range tracking +

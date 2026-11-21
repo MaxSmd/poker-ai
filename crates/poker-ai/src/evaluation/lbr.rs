@@ -77,42 +77,50 @@ use crate::play::luck::luck_adjustment;
 use crate::play::protocol::{BIG_BLIND, SMALL_BLIND, STACK_SIZE};
 use crate::resolving::belief_state::BeliefState;
 use crate::util::rng::xorshift64_plain_next_u64;
+use crate::util::stats::WinRate;
 
 /// Result of an LBR match, in big blinds.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LbrOutcome {
-    pub hands: u64,
-    /// LBR's net winnings (bb).  **Positive means the agent is exploitable.**
-    pub net_bb: f64,
-    sumsq_bb: f64,
-    /// LBR's net winnings after the luck corrections (bb) — same expectation
-    /// as `net_bb`, lower variance.  See the module header.
-    pub adj_net_bb: f64,
-    adj_sumsq_bb: f64,
+    /// LBR's winnings per hand.  **Positive means the agent is exploitable.**
+    raw: WinRate,
+    /// The same after the luck corrections — same expectation, lower
+    /// variance.  See the module header.
+    adjusted: WinRate,
     /// Hands abandoned because the agent errored (desync, unparseable action).
     pub errors: u64,
 }
 
 impl LbrOutcome {
+    /// Hands played to completion.
+    pub fn hands(&self) -> u64 {
+        self.raw.hands
+    }
+
+    /// LBR's net winnings (bb).
+    pub fn net_bb(&self) -> f64 {
+        self.raw.net_bb
+    }
+
     /// LBR's win rate in bb/100 — the exploitability lower bound.
     pub fn bb100(&self) -> f64 {
-        rate_bb100(self.net_bb, self.hands)
+        self.raw.bb100()
     }
 
     /// 95% confidence half-width on [`bb100`](Self::bb100).
     pub fn ci95(&self) -> f64 {
-        ci95_bb100(self.net_bb, self.sumsq_bb, self.hands)
+        self.raw.ci95()
     }
 
     /// Luck-adjusted win rate in bb/100: the same expectation as
     /// [`bb100`](Self::bb100), estimated with lower variance.
     pub fn adj_bb100(&self) -> f64 {
-        rate_bb100(self.adj_net_bb, self.hands)
+        self.adjusted.bb100()
     }
 
     /// 95% confidence half-width on [`adj_bb100`](Self::adj_bb100).
     pub fn adj_ci95(&self) -> f64 {
-        ci95_bb100(self.adj_net_bb, self.adj_sumsq_bb, self.hands)
+        self.adjusted.ci95()
     }
 
     /// LBR's win rate in milli-big-blinds per hand — the figure the literature
@@ -133,29 +141,9 @@ impl LbrOutcome {
     }
 
     fn record(&mut self, bb: f64, adj_bb: f64) {
-        self.hands += 1;
-        self.net_bb += bb;
-        self.sumsq_bb += bb * bb;
-        self.adj_net_bb += adj_bb;
-        self.adj_sumsq_bb += adj_bb * adj_bb;
+        self.raw.record(bb);
+        self.adjusted.record(adj_bb);
     }
-}
-
-fn rate_bb100(net: f64, hands: u64) -> f64 {
-    if hands == 0 {
-        return 0.0;
-    }
-    net / hands as f64 * 100.0
-}
-
-fn ci95_bb100(net: f64, sumsq: f64, hands: u64) -> f64 {
-    if hands < 2 {
-        return 0.0;
-    }
-    let n = hands as f64;
-    let mean = net / n;
-    let var = (sumsq / n - mean * mean).max(0.0);
-    1.96 * (var / n).sqrt() * 100.0
 }
 
 /// Nine distinct cards: two per player, five board.
@@ -444,7 +432,7 @@ mod tests {
         assert!(saw_card_luck, "some hand should reach a flop and carry card luck");
 
         let out = run_lbr(&mut bot, 10, 11, |_| {});
-        assert_eq!(out.hands + out.errors, 10);
+        assert_eq!(out.hands() + out.errors, 10);
         assert!(out.adj_bb100().is_finite() && out.adj_ci95().is_finite());
     }
 

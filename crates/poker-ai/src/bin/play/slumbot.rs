@@ -8,6 +8,7 @@ use poker_ai::play::protocol::{parse_action, BIG_BLIND};
 use poker_ai::play::slumbot::SlumbotClient;
 use poker_ai::play::Bot;
 use poker_ai::util::cli::{data_dir, flag};
+use poker_ai::util::stats::WinRate;
 
 use super::{build_bot, hands_arg, validate, BOT_FLAGS};
 
@@ -44,25 +45,18 @@ pub(super) fn run(args: &[String]) {
         })
     });
 
-    let mut played: u64 = 0;
     let mut errors: u64 = 0;
-    let mut net_bb: f64 = 0.0;
-    let mut sumsq_bb: f64 = 0.0;
-    let mut adj_net_bb: f64 = 0.0;
-    let mut adj_sumsq_bb: f64 = 0.0;
+    let mut raw = WinRate::default();
+    let mut adjusted = WinRate::default();
     println!("Playing {hands} hands against Slumbot ...");
-    while played < hands {
+    while raw.hands < hands {
         match play_one_hand(&client, &mut bot, &mut token) {
             Ok(mut rec) => {
                 rec.luck = hand_luck(&rec);
                 let winnings = rec.winnings;
-                played += 1;
-                let bb = winnings as f64 / BIG_BLIND as f64;
-                net_bb += bb;
-                sumsq_bb += bb * bb;
-                let adj = (winnings as f64 - rec.luck - rec.action_luck) / BIG_BLIND as f64;
-                adj_net_bb += adj;
-                adj_sumsq_bb += adj * adj;
+                raw.record(winnings as f64 / BIG_BLIND as f64);
+                adjusted.record((winnings as f64 - rec.luck - rec.action_luck) / BIG_BLIND as f64);
+                let played = raw.hands;
                 if let Some(f) = csv.as_mut() {
                     let _ = writeln!(f, "{played},{winnings}");
                 }
@@ -73,17 +67,13 @@ pub(super) fn run(args: &[String]) {
                     let _ = std::fs::write(&token_path, t);
                 }
                 if played.is_multiple_of(100) || played == hands {
-                    let n = played as f64;
-                    let mean = net_bb / n;
-                    let var = (sumsq_bb / n - mean * mean).max(0.0);
-                    let ci = 1.96 * (var / n).sqrt() * 100.0;
-                    let adj_mean = adj_net_bb / n;
-                    let adj_var = (adj_sumsq_bb / n - adj_mean * adj_mean).max(0.0);
-                    let adj_ci = 1.96 * (adj_var / n).sqrt() * 100.0;
                     println!(
-                        "  {played:>6} hands   net {net_bb:>9.1} bb   {:>8.1} ± {ci:.1} bb/100   luck-adj {:>8.1} ± {adj_ci:.1} bb/100",
-                        mean * 100.0,
-                        adj_mean * 100.0
+                        "  {played:>6} hands   net {:>9.1} bb   {:>8.1} ± {:.1} bb/100   luck-adj {:>8.1} ± {:.1} bb/100",
+                        raw.net_bb,
+                        raw.bb100(),
+                        raw.ci95(),
+                        adjusted.bb100(),
+                        adjusted.ci95()
                     );
                     // Blueprint hit rate on every progress line: the uniform
                     // fallback is silent, and a bot running on uniform
@@ -92,9 +82,12 @@ pub(super) fn run(args: &[String]) {
                     let lookups = bot.lookup_counts();
                     println!("         {lookups}");
                     println!(
-                        "@wandb {{\"hand\":{played},\"net_bb\":{net_bb:.2},\"bb100\":{:.2},\"bb100_ci\":{ci:.2},\"adj_bb100\":{:.2},\"adj_bb100_ci\":{adj_ci:.2},\"bp_hit_rate\":{:.4}}}",
-                        mean * 100.0,
-                        adj_mean * 100.0,
+                        "@wandb {{\"hand\":{played},\"net_bb\":{:.2},\"bb100\":{:.2},\"bb100_ci\":{:.2},\"adj_bb100\":{:.2},\"adj_bb100_ci\":{:.2},\"bp_hit_rate\":{:.4}}}",
+                        raw.net_bb,
+                        raw.bb100(),
+                        raw.ci95(),
+                        adjusted.bb100(),
+                        adjusted.ci95(),
                         lookups.hit_rate()
                     );
                 }
@@ -105,7 +98,7 @@ pub(super) fn run(args: &[String]) {
                 if e.contains("token") || errors.is_multiple_of(5) {
                     token = None; // let the server mint a fresh session
                 }
-                if errors > 50 && errors > played {
+                if errors > 50 && errors > raw.hands {
                     eprintln!("too many errors; giving up");
                     break;
                 }
@@ -114,17 +107,14 @@ pub(super) fn run(args: &[String]) {
         }
     }
 
-    let mean = if played > 0 { net_bb / played as f64 } else { 0.0 };
-    let var = if played > 0 { (sumsq_bb / played as f64 - mean * mean).max(0.0) } else { 0.0 };
-    let ci = if played > 0 { 1.96 * (var / played as f64).sqrt() * 100.0 } else { 0.0 };
-    let adj_mean = if played > 0 { adj_net_bb / played as f64 } else { 0.0 };
-    let adj_var =
-        if played > 0 { (adj_sumsq_bb / played as f64 - adj_mean * adj_mean).max(0.0) } else { 0.0 };
-    let adj_ci = if played > 0 { 1.96 * (adj_var / played as f64).sqrt() * 100.0 } else { 0.0 };
     println!(
-        "\nDone: {played} hands, net {net_bb:.1} bb, {:.1} ± {ci:.1} bb/100 (95% CI), luck-adjusted {:.1} ± {adj_ci:.1} bb/100, {errors} errors",
-        mean * 100.0,
-        adj_mean * 100.0
+        "\nDone: {} hands, net {:.1} bb, {:.1} ± {:.1} bb/100 (95% CI), luck-adjusted {:.1} ± {:.1} bb/100, {errors} errors",
+        raw.hands,
+        raw.net_bb,
+        raw.bb100(),
+        raw.ci95(),
+        adjusted.bb100(),
+        adjusted.ci95()
     );
     let lookups = bot.lookup_counts();
     println!("Blueprint lookups: {lookups}");

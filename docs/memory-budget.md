@@ -22,14 +22,37 @@ Per `(info set, action)` slot in the production SoA store
 |---|---|---|
 | Cumulative regret | `f32` | 4 |
 | Average-strategy numerator | `f32`, stochastically rounded | 4 |
-| VR-MCCFR baseline | `f32` | 4 |
+| VR-MCCFR baseline — not with `--no-baseline` | `f32` | 4 |
 | **Total, default layout** | | **12** |
-| `prev_inst` — only with `--optimistic` | `f32` | +4 |
-| `consec_below` — only with `--rbp` | `u32` | +4 |
 
 ```
-total_memory ≈ num_info_sets × avg_actions_per_set × 12 bytes
+total_memory = action_slots × 12 bytes        (× 8 with --no-baseline)
 ```
+
+Nothing is stored per info set. Finding an info set's slots needs its first
+slot and its action count; the table used to keep both for every info set
+(5 bytes each — 3 GB of the 22.4 GB the 595M-info-set blueprint was sized
+at). Info sets come in blocks, though — one per betting-tree node, all of that
+node's width — so the same information is a run-length
+[`Layout`](../crates/poker-ai/src/games/layout.rs) with one entry per node: a
+few megabytes at any scale. The trainer does not even search it; its cursor
+knows which node it is at.
+
+## What the trained strategy costs
+
+`train blueprint --soa` writes the average strategy in the same order as the
+table, one `u16` probability per slot
+([`play::policy`](../crates/poker-ai/src/play/policy.rs)):
+
+```
+policy_memory = action_slots × 2 bytes        (on disk and in `play`)
+```
+
+The format before it kept a hashed key and an offset for every info set and
+`f32` probabilities — 16 bytes per info set plus 4 per slot, 16 GB where the
+dense form is 3.2 GB. `play compact` converts an old file. `u16` resolves a
+probability to 1.5e-5; a row is quantized so that it still sums to exactly
+one and an action that was never played stays at exactly zero.
 
 The strategy sum used to be `f64`, which made this 16 B/slot — half the table
 in one array. `f32` genuinely did break it: iteration `t` carries weight `t^γ`,
@@ -45,8 +68,8 @@ argument and its gating tests. `RegretTable::bytes_per_info_set` is the
 authority — it is what the trainer prints — so check it against any hand
 arithmetic here.
 
-The optimistic and pruning arrays are allocated only when their feature is
-enabled, so a default run pays 12 B/slot and nothing more.
+The baseline array is allocated only when control variates are on, so a
+`--no-baseline` run pays 8 B/slot.
 
 The quantized `LeanTable` store (`i16` / `u16` / `i16`) cuts this to 6 B/slot —
 2× smaller, down from 2.7× now that the strategy sum is `f32` — and must be

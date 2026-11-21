@@ -29,19 +29,27 @@ All three run through the same solvers; a schedule is one constant.
 
 | Schedule | Use when | Benefits | Drawbacks |
 |---|---|---|---|
-| `Variant::Vanilla` | Baseline comparisons, theory sanity checks | Simplest; textbook guarantees | Slowest; early-iteration noise never decays |
-| `Discount::RECOMMENDED` (DCFR 1.5/0/2) — **default** | Everything, unless quantizing | Fastest average-strategy convergence of the three; β=0 lets actions crushed by early noise recover instantly | β=0 keeps regrets **bounded** ⇒ fundamentally incompatible with 16-bit storage (quantization noise swamps a non-growing signal — proven by the rejected bf16 experiment) |
-| `Discount::LINEAR` (LCFR 1/1/1) | Required companion of the lean store | Regrets **grow** with t ⇒ fixed-point error becomes relatively negligible (the Pluribus int-storage regime) | Modest theoretical convergence edge conceded to DCFR (not detectable in our push/fold benchmark, but expect it on larger games) |
+| `Variant::Vanilla` | Baseline comparisons, theory sanity checks | Simplest; textbook guarantees; under sampling the best of the three at small budgets **[measured: `bench_discount`]** | Early-iteration noise never decays; falls behind at large budgets |
+| `Discount::RECOMMENDED` (DCFR 1.5/0/2) — **default** | Everything, unless quantizing | Never the worst at any budget measured; β=0 lets actions crushed by early noise recover instantly | β=0 keeps regrets **bounded** ⇒ fundamentally incompatible with 16-bit storage (quantization noise swamps a non-growing signal — proven by the rejected bf16 experiment) |
+| `Discount::LINEAR` (LCFR 1/1/1) | Required companion of the lean store | Regrets **grow** with t ⇒ fixed-point error becomes relatively negligible (the Pluribus int-storage regime) | With this solver's lazy (per-visit) discount it converges 3–25× worse than DCFR on Leduc and curated NLHE **[measured: `bench_discount`]** — pay that only for the lean store's memory |
 
-Untested middle ground worth a future one-constant experiment: `(1.5, 1, 2)` —
-DCFR's positive discounting and γ-averaging with quantization-friendly growing
-negatives.
+These were measured under sampling by `examples/bench_discount.rs` (exact
+exploitability, equal iterations, Leduc and curated NLHE up to 20 bb; the
+tables are in its header):
+
+- `(1.5, 1, 2)` — once floated here as a quantization-friendly middle ground —
+  is the worst schedule tried, 4–25× behind the default.
+- `(1.5, 0.5, 2)`, the DCFR paper's own alternative, starts slower than the
+  default and then overtakes it by 2.6× (12 bb) to 13× (20 bb) at 1.6M
+  iterations.  The crossover moves out with game size and the 200 bb blueprint
+  sits near it, so this is a candidate for one `play expl` A/B on a longer
+  run, not a new default.
 
 ## 3. MCCFR refinements (builder flags)
 
 | Flag | Use when | Benefits | Drawbacks |
 |---|---|---|---|
-| `.with_baseline()` (VR-MCCFR control variate) | **Always on** for sampled training | Unbiased variance reduction; benefit grows with game size **[measured: Kuhn ~20% / Leduc ~10% lower sd; on by default in every trainer]** | Third accumulator (+4 B/action f32, +2 B lean); baselines must be **per-action** — a per-info-set scalar cancels out algebraically and does nothing |
+| `.with_baseline()` (VR-MCCFR control variate) | On by default; `train blueprint --no-baseline` turns it off | Unbiased variance reduction **[measured: Kuhn ~20% / Leduc ~10% lower sd]** | Third accumulator (+4 B/action f32 = **a third of the table**, +2 B lean) and ~20% fewer nodes per second on the atomic path, for an exploitability change of −6%…+11% at equal iterations **[measured: `bench_discount baseline`, Leduc + curated NLHE ≤ 12 bb]** — on those games it does not pay at equal memory and time; unmeasured at 200 bb. Baselines must be **per-action** — a per-info-set scalar cancels out algebraically and does nothing |
 | `.with_optimistic()` (predictive updates, `R += 2rₜ − r_{t−1}`) | Last-iterate experiments only | Accelerates the last iterate | We deploy the γ-averaged strategy, where it **regressed** on push/fold **[measured: 130.7 vs 111.5 mbb/g]**; extra `prev_inst` array; no multiplayer guarantee |
 | `.with_pruning()` (Regret-Based Pruning) | Deep trees under Vanilla/CFR+ where negative regret accumulates | Skips hopeless branches **[measured: Kuhn converged at ~91% of node visits]** | Partly conflicts with DCFR (β=0 keeps regrets above θ ⇒ no-op); θ must be deep relative to the game's regret scale or it breaks *mixed* equilibria (shallow θ on Kuhn: 0.1 expl) |
 | `save_checkpoint` / `load_checkpoint` | Any run longer than a coffee | Atomic write (tmp+rename); resume is **bit-identical** to an uninterrupted run; interruption costs ≤ one chunk | None — always checkpoint |
@@ -53,6 +61,13 @@ negatives.
 | `train` / `train_fast` (serial; clone / zero-alloc cursor) | Bit-reproducible per seed; clone and cursor are **bit-identical** to each other | 1 core (~6.8M nodes/s on the cap-2 blueprint) **[measured]** | Debugging, validation, anything needing exact reproducibility |
 | `train_parallel` / `train_parallel_fast` (deterministic mini-batch) | Bit-reproducible per (seed, batch) | Merge-bound: 1.09× on the blueprint locally, ~7 effective cores on a 64-core server **[measured]** | Reproducible parallel runs where the ceiling is acceptable |
 | `train_atomic` (lock-free CAS, `SoaMccfr` only) | **Not** bit-reproducible (thread interleaving races float order) | Near-linear: 4.5× on 4 P-cores, 5.05× with E-cores **[measured: 34.3M nodes/s vs 7.4M batched]** | **Production blueprint training** — the many-core default (`--atomic`) |
+
+The absolute figures above predate the per-deal cursor caches (card buckets
+and showdown ranks computed once per deal, table slots taken from the tree
+node rather than per-info-set arrays).  Same-session A/B of those, atomic ×4
+on an M1: **12.9M → 23.1M nodes/s** on the in-cache 20 bb tree and
+**9.6M → 17.7M** on a 100 bb tree with a 340 MB table (`bench_train_paths
+big`, the regime the blueprint trains in); serial results are bit-identical.
 
 Convergence of the atomic path is gated by exploitability against the serial
 reference (per-hand strategy diffs are the wrong gate — two *serial* seeds
@@ -183,6 +198,8 @@ play expl                                  abstract-game exploitability (vectori
       --flops=N|all --board-samples=N --seed=N [--data --stack-bb --cap --policy]
       # default: 16 flops, 2 turn/river samples/reveal; progress on stderr
 play chart                                 preflop strategy grids + SB size mix
+play compact                               rewrite a hashed-key blueprint strategy in the dense format
+      --out=PATH [--data --stack-bb --cap --policy]   # ~1/5 the size; verified against the original
 scripts/train_wandb.py -- <train args>     W&B tracking wrapper
 POKER_AI_METRICS=1                         emit @wandb metric lines (no-op otherwise)
 ```

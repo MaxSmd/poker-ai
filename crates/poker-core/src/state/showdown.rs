@@ -18,31 +18,85 @@ impl GameState {
         if !self.is_terminal() {
             return [0; MAX_PLAYERS];
         }
-
-        let n = self.num_players as usize;
-        let mut payoffs = [0i32; MAX_PLAYERS];
-
-        // Case 1: everyone but one player has folded — last player wins the pot.
-        if self.count_non_folded() <= 1 {
-            let winner = (0..n)
-                .find(|&i| (self.folded >> i) & 1 == 0)
-                .unwrap_or(0);
-            let pot: i32 = self.total_committed.iter().map(|&c| c as i32).sum();
-            for (i, p) in payoffs.iter_mut().enumerate().take(n) {
-                *p = -(self.total_committed[i] as i32);
-            }
-            payoffs[winner] += pot;
-            return payoffs;
+        if self.is_showdown() {
+            self.showdown_payoffs(&self.showdown_ranks())
+        } else {
+            self.fold_payoffs()
         }
+    }
 
-        // Case 2: showdown — evaluate hands with side pots.
-        // Compute each player's best hand rank (non-folded players only).
+    /// Whether this terminal node is decided by comparing hands (two or more
+    /// players never folded) rather than by everyone else folding.
+    pub fn is_showdown(&self) -> bool {
+        self.is_terminal() && self.count_non_folded() > 1
+    }
+
+    /// Each non-folded player's hand rank on the visible board (`0` for a
+    /// folded player) — the hand-evaluation half of a showdown.
+    ///
+    /// Split from [`showdown_payoffs`](Self::showdown_payoffs) because the two
+    /// have different lifetimes in a tree walk: the ranks depend only on the
+    /// cards, the payoffs on the betting line.  A sampled CFR traversal reaches
+    /// hundreds of showdowns per deal, all with the same cards, and can
+    /// evaluate the hands once.
+    pub fn showdown_ranks(&self) -> [u32; MAX_PLAYERS] {
         let mut hand_ranks = [0u32; MAX_PLAYERS];
-        for (i, hr) in hand_ranks.iter_mut().enumerate().take(n) {
+        for (i, hr) in hand_ranks.iter_mut().enumerate().take(self.num_players as usize) {
             if (self.folded >> i) & 1 == 0 {
                 *hr = self.player_hand_rank(i);
             }
         }
+        hand_ranks
+    }
+
+    /// Payoffs at a showdown terminal given the players' `hand_ranks` (from
+    /// [`showdown_ranks`](Self::showdown_ranks) at this node, or at any other
+    /// showdown of the same deal with the same players still in).
+    pub fn showdown_payoffs(&self, hand_ranks: &[u32; MAX_PLAYERS]) -> [i32; MAX_PLAYERS] {
+        debug_assert!(self.is_showdown(), "showdown_payoffs at a non-showdown node");
+        if self.num_players == 2 {
+            return self.heads_up_showdown_payoffs(hand_ranks);
+        }
+        self.side_pot_payoffs(hand_ranks)
+    }
+
+    /// Everyone but one player folded: the last player standing wins the pot.
+    fn fold_payoffs(&self) -> [i32; MAX_PLAYERS] {
+        let n = self.num_players as usize;
+        let mut payoffs = [0i32; MAX_PLAYERS];
+        let winner = (0..n).find(|&i| (self.folded >> i) & 1 == 0).unwrap_or(0);
+        let pot: i32 = self.total_committed.iter().map(|&c| c as i32).sum();
+        for (i, p) in payoffs.iter_mut().enumerate().take(n) {
+            *p = -(self.total_committed[i] as i32);
+        }
+        payoffs[winner] += pot;
+        payoffs
+    }
+
+    /// The two-player showdown, without the side-pot machinery.
+    ///
+    /// Heads-up there is one contested pot — twice the smaller commitment —
+    /// and anything a player put in above that comes straight back.  So the
+    /// winner gains the smaller commitment, the loser pays it, and a tie
+    /// returns everyone's chips (the contested pot is even, so there is no odd
+    /// chip to assign).  This is what [`side_pot_payoffs`](Self::side_pot_payoffs)
+    /// computes for two players, and the tests hold the two to each other.
+    fn heads_up_showdown_payoffs(&self, hand_ranks: &[u32; MAX_PLAYERS]) -> [i32; MAX_PLAYERS] {
+        let contested = self.total_committed[0].min(self.total_committed[1]) as i32;
+        let mut payoffs = [0i32; MAX_PLAYERS];
+        match hand_ranks[0].cmp(&hand_ranks[1]) {
+            std::cmp::Ordering::Greater => (payoffs[0], payoffs[1]) = (contested, -contested),
+            std::cmp::Ordering::Less => (payoffs[0], payoffs[1]) = (-contested, contested),
+            std::cmp::Ordering::Equal => {}
+        }
+        payoffs
+    }
+
+    /// The general showdown: split the pot into tiers by commitment and award
+    /// each tier to the best hand eligible for it.
+    pub(super) fn side_pot_payoffs(&self, hand_ranks: &[u32; MAX_PLAYERS]) -> [i32; MAX_PLAYERS] {
+        let n = self.num_players as usize;
+        let mut payoffs = [0i32; MAX_PLAYERS];
 
         // Sort all-in amounts to find pot tiers.
         let mut tiers: [u32; MAX_PLAYERS] = self.total_committed;

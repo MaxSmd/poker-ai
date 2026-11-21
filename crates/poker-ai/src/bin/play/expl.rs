@@ -3,7 +3,7 @@
 use poker_ai::evaluation::vector_br::{all_flops, best_response_value, sample_flops};
 use poker_ai::util::cli::{data_dir, flag};
 
-use super::{cap_flag, load_game, load_policy, validate};
+use super::{cap_flag, load_blueprint, validate};
 
 /// Abstract-game exploitability of the blueprint via the vectorized best
 /// response (`evaluation::vector_br`): exact betting/turn/river/ranges,
@@ -36,17 +36,14 @@ pub(super) fn run(args: &[String]) {
         std::process::exit(2);
     }
 
-    println!("Loading abstraction from {} ({stack_bb}bb, cap-{cap})", dir.display());
-    let game = load_game(&dir, stack_bb, cap);
-    let policy = load_policy(args, &dir);
+    let (game, policy) = load_blueprint(args, &dir, stack_bb, cap);
     let runout = if board_samples == 0 {
         "exact enumeration".to_string()
     } else {
         format!("{board_samples} turn/river samples per reveal")
     };
     println!(
-        "  {} info sets; {} flops × {} (seed {seed}) — per-flop progress on stderr",
-        policy.len(),
+        "  {} flops × {} (seed {seed}) — per-flop progress on stderr",
         flops.len(),
         runout
     );

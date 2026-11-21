@@ -15,7 +15,7 @@
 # played from the blueprint; the river gets one raise since it is re-solved
 # exactly.  Buckets 8000/8000/800 keep the info-set count at the current
 # blueprint's (595M vs 599M), so 5B iterations train it about as densely,
-# in 22.4 GB (memory_estimate).
+# in 19.5 GB (memory_estimate); the strategy it writes is 3.2 GB.
 #
 # Everything goes to its own directory; the current blueprint in data/ is
 # untouched, and play uses it unless given --data.  Each step is skipped if

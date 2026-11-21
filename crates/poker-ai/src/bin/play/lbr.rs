@@ -26,7 +26,7 @@ pub(super) fn run(args: &[String]) {
     let out = poker_ai::evaluation::lbr::run_lbr(&mut bot, hands, lbr_seed, |o| {
         println!(
             "  {:>6} hands   LBR {:>8.1} ± {:.1} bb/100   ({:.0} mbb/hand)   luck-adj {:>8.1} ± {:.1} bb/100",
-            o.hands,
+            o.hands(),
             o.bb100(),
             o.ci95(),
             o.mbb_per_hand(),
@@ -35,7 +35,7 @@ pub(super) fn run(args: &[String]) {
         );
         println!(
             "@wandb {{\"lbr_hand\":{},\"lbr_bb100\":{:.2},\"lbr_bb100_ci\":{:.2},\"lbr_mbb\":{:.1},\"lbr_adj_bb100\":{:.2},\"lbr_adj_bb100_ci\":{:.2}}}",
-            o.hands,
+            o.hands(),
             o.bb100(),
             o.ci95(),
             o.mbb_per_hand(),
@@ -48,7 +48,7 @@ pub(super) fn run(args: &[String]) {
             "\nLBR LOST: {:+.1} ± {:.1} bb/100 over {} hands ({} errors, {:.0}s).",
             out.bb100(),
             out.ci95(),
-            out.hands,
+            out.hands(),
             out.errors,
             t0.elapsed().as_secs_f64()
         );
@@ -65,7 +65,7 @@ pub(super) fn run(args: &[String]) {
         out.bound_mbb(),
         out.bb100(),
         out.ci95(),
-        out.hands,
+        out.hands(),
         out.errors,
         t0.elapsed().as_secs_f64()
     );

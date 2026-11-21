@@ -72,7 +72,7 @@ impl ContinuationPolicy for CompactPolicy {
         // `get`, not `probs_or_uniform`: rollouts reach rare lines by design,
         // and must not drag down the hit rate that diagnoses the live bot.
         match self.get(key) {
-            Some(p) if p.len() == actions.len() => p.iter().map(|&x| x as f64).collect(),
+            Some(p) if p.len() == actions.len() => p,
             _ => vec![1.0 / actions.len() as f64; actions.len()],
         }
     }

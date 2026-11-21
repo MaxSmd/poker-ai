@@ -359,13 +359,15 @@ mod tests {
 
     #[test]
     fn soa_table_footprint_is_tiny() {
-        // The flat store holds (f32 regret + f32 strategy-sum + f32 baseline)
-        // × 2 actions = 24 bytes/info set, versus the HashMap Node's five heap
-        // vecs (~350 B) — the ~10× the memory budget is about.  The sum is f32
-        // rather than f64 because stochastic rounding stops long-run averaging
-        // freezing below f32 precision (see `regret_table`).
+        // The flat store holds (f32 regret + f32 strategy-sum) × 2 actions =
+        // 16 bytes/info set — 24 with the f32 baseline that control variates
+        // add — versus the HashMap Node's five heap vecs (~350 B): the ~10× the
+        // memory budget is about.  The sum is f32 rather than f64 because
+        // stochastic rounding stops long-run averaging freezing below f32
+        // precision (see `regret_table`).
         let soa: SoaMccfr<PushFoldHoldem> = SoaMccfr::new(PushFoldHoldem::new(40, 2, 1, 0), Variant::Vanilla);
-        assert_eq!(soa.bytes_per_info_set(), 24);
+        assert_eq!(soa.bytes_per_info_set(), 16);
+        assert_eq!(soa.with_baseline().bytes_per_info_set(), 24);
     }
 
     /// Export a trained SoA solver back to the `HashMap` strategy artifact
@@ -470,6 +472,42 @@ mod tests {
         let aa = atomic.average_strategy_at(preflop_index(&[make_card(12, 0), make_card(12, 1)]) as usize)[1];
         let trash = atomic.average_strategy_at(preflop_index(&[make_card(5, 0), make_card(0, 1)]) as usize)[1];
         assert!(aa > 0.9 && aa > trash, "atomic chart shape: AA {aa} vs 72o {trash}");
+    }
+
+    /// `--no-baseline`: without control variates the f32 table has no
+    /// baseline array at all — a third less memory — so every training path
+    /// must run without touching one, still converge, and survive a
+    /// checkpoint round trip in that shape.
+    #[test]
+    fn every_soa_path_trains_without_the_baseline() {
+        use crate::evaluation::exploitability::push_fold_exploitability;
+        let iters = 400_000;
+        let cfg = || PushFoldHoldem::new(40, 2, 1, 0);
+        let mk = || SoaMccfr::<PushFoldHoldem>::with_seed(cfg(), Variant::Dcfr(Discount::RECOMMENDED), 1);
+
+        let mut serial = mk();
+        serial.train(iters);
+        let mut parallel = mk();
+        parallel.train_parallel(iters, 256);
+        let mut atomic = mk();
+        atomic.train_atomic(iters, 4);
+
+        let game = cfg();
+        for (name, solver) in [("serial", &serial), ("parallel", &parallel), ("atomic", &atomic)] {
+            assert!(!solver.uses_baseline());
+            assert_eq!(solver.bytes_per_info_set(), 16, "{name}: regret + strategy sum only");
+            let expl = push_fold_exploitability(&game, &export_soa(solver), 200_000, 9);
+            assert!(expl < 0.15, "{name} without the baseline: exploitability {expl} bb");
+        }
+
+        let path = std::env::temp_dir().join(format!("soa_no_baseline_{}.ckpt", std::process::id()));
+        atomic.save_checkpoint(&path).unwrap();
+        let mut resumed = SoaMccfr::load_checkpoint(&path, cfg()).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert!(!resumed.uses_baseline());
+        assert_eq!(resumed.bytes_per_info_set(), 16, "a resumed run does not grow a baseline");
+        assert_eq!(resumed.average_strategy_at(0), atomic.average_strategy_at(0));
+        resumed.train_atomic(1_000, 2);
     }
 
     #[test]

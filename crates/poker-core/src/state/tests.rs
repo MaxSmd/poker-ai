@@ -330,3 +330,57 @@ fn bb_gets_option_when_everyone_limps() {
     gs.apply_action(Action::Check); // BB exercises option by checking.
     assert_eq!(gs.street, 1, "street should advance to flop after BB checks");
 }
+
+/// The heads-up showdown shortcut must be the side-pot algorithm specialised
+/// to two players, not a second opinion on who gets paid.  Random betting
+/// lines over unequal stacks (so one player is often all-in for less), with
+/// the three possible showdown results, compared against the general path.
+#[test]
+fn heads_up_showdown_matches_the_side_pot_algorithm() {
+    use crate::action::legal_actions;
+
+    let board = default_board();
+    let aces = [make_card_u8(12, 0), make_card_u8(12, 1)];
+    let kings = [make_card_u8(11, 0), make_card_u8(11, 1)];
+    // Both play the board's straight (2-3-4-5-6 with a 7 each): a chop.
+    let seven_a = [make_card_u8(5, 0), make_card_u8(9, 1)];
+    let seven_b = [make_card_u8(5, 1), make_card_u8(9, 2)];
+
+    let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move |n: usize| {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        (rng % n as u64) as usize
+    };
+
+    let mut showdowns = 0;
+    let mut uneven = 0;
+    for (h0, h1) in [(aces, kings), (kings, aces), (seven_a, seven_b)] {
+        for trial in 0..400 {
+            let mut stacks = [0u32; MAX_PLAYERS];
+            stacks[0] = 40 + 20 * next(30) as u32;
+            stacks[1] = if trial % 3 == 0 { stacks[0] } else { 40 + 20 * next(30) as u32 };
+            let mut holes = [[NO_CARD; 2]; MAX_PLAYERS];
+            holes[0] = h0;
+            holes[1] = h1;
+            let mut gs = GameState::new(2, 10, 5, stacks, holes, board, (trial % 2) as u8);
+            while !gs.is_terminal() {
+                let acts = legal_actions(&gs);
+                // Never fold: every line ends in a showdown.
+                let live: Vec<Action> = acts.iter().copied().filter(|a| *a != Action::Fold).collect();
+                gs.apply_action(live[next(live.len())]);
+            }
+            assert!(gs.is_showdown());
+            let ranks = gs.showdown_ranks();
+            let fast = gs.showdown_payoffs(&ranks);
+            assert_eq!(fast, gs.side_pot_payoffs(&ranks), "stacks {:?}, committed {:?}", stacks, gs.total_committed);
+            assert_eq!(fast, gs.terminal_payoffs());
+            assert_eq!(fast[0] + fast[1], 0);
+            showdowns += 1;
+            uneven += (gs.total_committed[0] != gs.total_committed[1]) as u32;
+        }
+    }
+    assert_eq!(showdowns, 1200);
+    assert!(uneven > 50, "the all-in-for-less case must actually occur, got {uneven}");
+}

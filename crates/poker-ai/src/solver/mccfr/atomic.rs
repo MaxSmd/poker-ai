@@ -34,7 +34,7 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::util::rng::splitmix_stream;
-use crate::games::{CursorGame, IndexedGame};
+use crate::games::{CursorGame, IndexedGame, Layout, Span};
 use crate::solver::variant::Variant;
 use crate::solver::regret_table::{sr_add_with, RegretTable};
 use crate::solver::MAX_ACTIONS;
@@ -54,8 +54,9 @@ struct AtomicTable<'a> {
     regret: *mut f32,
     strategy_sum: *mut f32,
     baseline: *mut f32,
-    offsets: &'a [u32],
-    num_actions: &'a [u8],
+    /// Length of each array — the bound every span is checked against.
+    slots: usize,
+    layout: &'a Layout,
 }
 
 // Soundness: the raw pointers target arrays borrowed exclusively for the whole
@@ -65,8 +66,9 @@ unsafe impl Sync for AtomicTable<'_> {}
 
 #[inline]
 fn atomic_at(ptr: *mut f32, slot: usize) -> &'static AtomicU32 {
-    // Safety: `slot` is within the array (layout-derived), f32 is 4-aligned,
-    // and the exclusive table borrow outlives every thread in the scope.
+    // Safety: `slot` is within the array (it comes from a span that
+    // `AtomicTable::checked` admitted), f32 is 4-aligned, and the exclusive
+    // table borrow outlives every thread in the scope.
     unsafe { AtomicU32::from_ptr(ptr.add(slot).cast()) }
 }
 
@@ -90,16 +92,25 @@ fn rmw(ptr: *mut f32, slot: usize, f: impl Fn(f32) -> f32) {
 }
 
 impl AtomicTable<'_> {
+    /// Admit a span to the pointer-based accessors below.  The traversal takes
+    /// spans from the game ([`slot_span`](IndexedGame::slot_span)), which is
+    /// ordinary safe code that could be wrong; one comparison per node keeps a
+    /// wrong answer a panic instead of a write outside the table.
     #[inline]
-    fn span(&self, index: usize) -> (usize, usize) {
-        (self.offsets[index] as usize, self.num_actions[index] as usize)
+    fn checked(&self, at: Span) -> Span {
+        assert!(
+            at.base.checked_add(at.n).is_some_and(|end| end <= self.slots),
+            "span {at:?} lies outside the table's {} slots",
+            self.slots
+        );
+        at
     }
 
     /// Regret-matching current strategy from atomic regret reads, written into
-    /// a stack buffer.  Returns the action count.
+    /// a stack buffer.
     #[inline]
-    fn strategy(&self, index: usize, out: &mut [f64; MAX_ACTIONS]) -> usize {
-        let (base, n) = self.span(index);
+    fn strategy(&self, at: Span, out: &mut [f64; MAX_ACTIONS]) {
+        let Span { base, n } = at;
         let mut total = 0.0;
         for (a, o) in out.iter_mut().enumerate().take(n) {
             let p = (load(self.regret, base + a) as f64).max(0.0);
@@ -113,18 +124,16 @@ impl AtomicTable<'_> {
         } else {
             out[..n].fill(1.0 / n as f64);
         }
-        n
     }
 
     /// The traverser's regret update: per-action lazy DCFR discount + add of
     /// the instantaneous regret, each slot one CAS (mirrors the serial
     /// `SoaMccfr::update_regret` arithmetic: f64 math, f32 store).
     #[inline]
-    fn add_regret(&self, index: usize, util: &[f64], node_value: f64, pos: f64, neg: f64, discount: bool) {
-        let (base, n) = self.span(index);
-        for (a, &u) in util.iter().enumerate().take(n) {
+    fn add_regret(&self, at: Span, util: &[f64], node_value: f64, pos: f64, neg: f64, discount: bool) {
+        for (a, &u) in util.iter().enumerate().take(at.n) {
             let inst = u - node_value;
-            rmw(self.regret, base + a, |r32| {
+            rmw(self.regret, at.base + a, |r32| {
                 let mut r = r32 as f64;
                 if discount {
                     r *= if r > 0.0 { pos } else { neg };
@@ -143,20 +152,18 @@ impl AtomicTable<'_> {
     /// than burning a fresh draw; reusing one draw across retries is still
     /// unbiased, because each attempt rounds its own exact sum.
     #[inline]
-    fn add_strategy(&self, index: usize, weight: f64, strategy: &[f64], n: usize, sr: &mut u64) {
-        let (base, _) = self.span(index);
-        for (a, &p) in strategy.iter().enumerate().take(n) {
+    fn add_strategy(&self, at: Span, weight: f64, strategy: &[f64], sr: &mut u64) {
+        for (a, &p) in strategy.iter().enumerate().take(at.n) {
             let inc = weight * p;
             let u = xorshift_next_unit(sr);
-            rmw(self.strategy_sum, base + a, |s| sr_add_with(s, inc, u));
+            rmw(self.strategy_sum, at.base + a, |s| sr_add_with(s, inc, u));
         }
     }
 
     /// One EMA step of a baseline slot toward `target` (player-0 perspective).
     #[inline]
-    fn baseline_ema(&self, index: usize, a: usize, target: f64) {
-        let (base, _) = self.span(index);
-        rmw(self.baseline, base + a, |b| (b as f64 + BASELINE_RATE * (target - b as f64)) as f32);
+    fn baseline_ema(&self, at: Span, a: usize, target: f64) {
+        rmw(self.baseline, at.base + a, |b| (b as f64 + BASELINE_RATE * (target - b as f64)) as f32);
     }
 }
 
@@ -205,12 +212,14 @@ fn traverse<G: IndexedGame>(
 
     let player = CursorGame::current_player(game, cursor);
     let index = game.info_set_index(cursor);
+    let at = ctx.table.checked(game.slot_span(cursor, index).unwrap_or_else(|| ctx.table.layout.span(index)));
+    debug_assert_eq!(at, ctx.table.layout.span(index), "the game's slot span disagrees with the table layout");
     let actions = CursorGame::legal(game, cursor);
     let acts = actions.as_ref();
     let num_actions = acts.len();
+    debug_assert_eq!(at.n, num_actions, "table layout disagrees with legal actions");
     let mut strategy = [0.0f64; MAX_ACTIONS];
-    let n = ctx.table.strategy(index, &mut strategy);
-    debug_assert_eq!(n, num_actions, "table layout disagrees with legal actions");
+    ctx.table.strategy(at, &mut strategy);
 
     if player == traverser {
         let mut util = [0.0f64; MAX_ACTIONS];
@@ -221,16 +230,16 @@ fn traverse<G: IndexedGame>(
             CursorGame::undo(game, cursor);
             node_value += strategy[a] * util[a];
         }
-        ctx.table.add_regret(index, &util[..num_actions], node_value, ctx.pos, ctx.neg, ctx.discount);
+        ctx.table.add_regret(at, &util[..num_actions], node_value, ctx.pos, ctx.neg, ctx.discount);
         if ctx.use_baseline {
             let sgn = sign(traverser);
             for (a, &u) in util.iter().enumerate().take(num_actions) {
-                ctx.table.baseline_ema(index, a, sgn * u);
+                ctx.table.baseline_ema(at, a, sgn * u);
             }
         }
         node_value
     } else {
-        ctx.table.add_strategy(index, ctx.strategy_weight, &strategy, num_actions, sr);
+        ctx.table.add_strategy(at, ctx.strategy_weight, &strategy, sr);
         let a = sample_index(strategy[..num_actions].iter().copied(), xorshift_next_unit(rng));
         CursorGame::apply(game, cursor, a, acts[a]);
         let v_child = traverse(ctx, cursor, traverser, rng, sr, visited);
@@ -243,13 +252,12 @@ fn traverse<G: IndexedGame>(
         // serial path, per-slot atomic.
         let sgn = sign(traverser);
         let v0 = sgn * v_child;
-        let (base, _) = ctx.table.span(index);
         let mut baseline_exp = 0.0;
         for (i, &p) in strategy.iter().enumerate().take(num_actions) {
-            baseline_exp += p * load(ctx.table.baseline, base + i) as f64;
+            baseline_exp += p * load(ctx.table.baseline, at.base + i) as f64;
         }
-        let corrected0 = baseline_exp + (v0 - load(ctx.table.baseline, base + a) as f64);
-        ctx.table.baseline_ema(index, a, v0);
+        let corrected0 = baseline_exp + (v0 - load(ctx.table.baseline, at.base + a) as f64);
+        ctx.table.baseline_ema(at, a, v0);
         sgn * corrected0
     }
 }
@@ -278,12 +286,14 @@ pub(super) fn run_atomic<G: IndexedGame + Sync>(
 ) -> u64 {
     let AtomicRun { variant, use_baseline, seed, base_iter, iters, threads } = run;
     let threads = threads.max(1);
-    let (regret, strategy_sum, baseline, offsets, num_actions) = table.atomic_parts();
     assert!(
-        num_actions.iter().all(|&n| n as usize <= MAX_ACTIONS),
-        "table has an info set wider than {MAX_ACTIONS} actions"
+        !use_baseline || table.has_baseline(),
+        "control variates are on but the table has no baseline array"
     );
-    let table = AtomicTable { regret, strategy_sum, baseline, offsets, num_actions };
+    let layout = table.layout().clone();
+    assert!(layout.max_width() <= MAX_ACTIONS, "table has an info set wider than {MAX_ACTIONS} actions");
+    let (regret, strategy_sum, baseline, slots) = table.atomic_parts();
+    let table = AtomicTable { regret, strategy_sum, baseline, slots, layout: &layout };
     let counter = AtomicU64::new(0);
     let visited_total = AtomicU64::new(0);
     let players = CursorGame::num_players(game);

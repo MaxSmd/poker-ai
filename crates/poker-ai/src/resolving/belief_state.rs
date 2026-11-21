@@ -74,6 +74,20 @@ impl BeliefState {
         self.normalize();
     }
 
+    /// [`update`](Self::update), unless the observation is one no hand in the
+    /// range can produce (every hand with mass has zero likelihood).  Applying
+    /// that would leave an empty range, which every later resolve would then
+    /// treat as "the opponent holds nothing"; an observation the range rules
+    /// out entirely says the range is wrong, not what to replace it with, so
+    /// it is kept.  Returns whether the update was applied.
+    pub fn update_if_supported(&mut self, likelihood: &[f64]) -> bool {
+        let supported = self.probs.iter().zip(likelihood).any(|(&p, &l)| p * l > 0.0);
+        if supported {
+            self.update(likelihood);
+        }
+        supported
+    }
+
     /// Probability assigned to a specific hand.
     pub fn prob(&self, c0: u8, c1: u8) -> f64 {
         self.probs[combo_index(c0, c1)]
@@ -126,6 +140,21 @@ mod tests {
         assert!(b.prob(10, 11) > 0.0, "non-conflicting hand survives");
         // Remaining combos = C(49, 2).
         assert_eq!(b.support_size(), 49 * 48 / 2);
+    }
+
+    #[test]
+    fn an_unsupported_observation_leaves_the_range_alone() {
+        let mut b = BeliefState::from_hands(&[[10, 11], [20, 21]]);
+        let before = b.probs.clone();
+        // Likelihood only on a hand the range gives no mass.
+        let mut likelihood = vec![0.0; NUM_COMBOS];
+        likelihood[combo_index(30, 31)] = 1.0;
+        assert!(!b.update_if_supported(&likelihood));
+        assert_eq!(b.probs, before, "an impossible observation must not empty the range");
+
+        likelihood[combo_index(10, 11)] = 0.5;
+        assert!(b.update_if_supported(&likelihood));
+        assert!((b.prob(10, 11) - 1.0).abs() < 1e-12, "a possible one is plain Bayes");
     }
 
     #[test]

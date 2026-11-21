@@ -267,6 +267,55 @@ fn capped_clone_and_cursor_paths_agree() {
     );
 }
 
+/// The cursor caches what is fixed for a deal (card buckets, showdown hand
+/// ranks) and what follows from its path (the dense-index tree node).  A
+/// stale entry would not crash — it would silently train some other info set
+/// or pay the wrong player — so one cursor is driven through many deals with
+/// random walks *and* undos, and every read is held to its uncached form.
+#[test]
+fn cursor_caches_follow_the_cards_and_the_path() {
+    use crate::games::CursorGame;
+    let game = BlueprintHoldem::new(40, 2, 1, 0).with_raise_cap(2);
+    let mut rng = 0x5EED_CAFEu64;
+    let mut next = || crate::util::rng::xorshift_next_unit(&mut rng);
+    let mut c = CursorGame::root(&game);
+    let (mut decisions, mut showdowns, mut undos) = (0, 0, 0);
+    for _ in 0..400 {
+        CursorGame::sample_chance(&game, &mut c, &mut next);
+        loop {
+            let gs = c.gs.as_ref().unwrap();
+            if gs.is_terminal() {
+                let want = gs.terminal_payoffs();
+                for (seat, &chips) in want.iter().enumerate().take(2) {
+                    assert_eq!(CursorGame::utility(&game, &c, seat), chips as f64 / 2.0);
+                }
+                showdowns += gs.is_showdown() as u32;
+                // Back up from some terminals and keep walking, so the same
+                // deal is read again after the caches were filled.
+                if c.depth > 0 && next() < 0.5 {
+                    CursorGame::undo(&game, &mut c);
+                    undos += 1;
+                    continue;
+                }
+                break;
+            }
+            assert_eq!(
+                CursorGame::info_key(&game, &c),
+                game.info_key_for(gs, &c.history[..c.depth]),
+                "cached key at depth {}",
+                c.depth
+            );
+            decisions += 1;
+            let acts = CursorGame::legal(&game, &c);
+            let n = acts.as_ref().len();
+            let a = ((next() * n as f64) as usize).min(n - 1);
+            CursorGame::apply(&game, &mut c, a, acts.as_ref()[a]);
+        }
+        CursorGame::undo_chance(&game, &mut c);
+    }
+    assert!(decisions > 1_000 && showdowns > 100 && undos > 100, "{decisions} / {showdowns} / {undos}");
+}
+
 #[test]
 fn indexed_preflop_only_partition_and_key_round_trip() {
     use crate::games::{CursorGame, IndexedGame};
@@ -284,6 +333,10 @@ fn indexed_preflop_only_partition_and_key_round_trip() {
 
     let cap = game.info_set_capacity();
     assert!(cap >= 169 && cap.is_multiple_of(169), "preflop-only capacity is a multiple of 169, got {cap}");
+    // The game describes its table node by node; that must be the very
+    // layout the info sets' own action counts add up to.
+    let layout = game.layout();
+    assert_eq!(layout, crate::games::Layout::build(cap, |i| game.actions_at(i)), "block-wise layout");
 
     // The dense index and the HashMap info key must induce the SAME partition,
     // and info_key_at must invert the index back to that key.
@@ -296,6 +349,7 @@ fn indexed_preflop_only_partition_and_key_round_trip() {
         let idx = game.info_set_index(&c);
         assert!(idx < cap, "index in range");
         assert_eq!(game.actions_at(idx), 2, "fold/all-in menu");
+        assert_eq!(game.slot_span(&c, idx), Some(layout.span(idx)), "the cursor's span is the layout's");
         assert_eq!(game.info_key_at(idx), key, "info_key_at inverts the dense index");
         assert_eq!(*by_key.entry(key).or_insert(idx), idx, "key -> one index");
         assert_eq!(*by_idx.entry(idx).or_insert(key), key, "index -> one key");
@@ -334,26 +388,41 @@ fn indexed_postflop_and_soa(caps: RaiseCaps) {
     let game = mk();
     let cap = game.info_set_capacity();
     assert!(cap > 0, "non-empty index");
+    // One run per tree node must come to the same table as one info set at a
+    // time — here over nodes of different widths on every street.
+    let layout = game.layout();
+    assert_eq!(layout, crate::games::Layout::build(cap, |i| game.actions_at(i)), "block-wise layout");
+    assert!(layout.runs() > 1, "the tree has nodes of different widths");
 
     // Roll out full hands, checking the partition + round-trip at every
     // decision node on every street.
     let mut by_key: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
     let mut rng = 0x00C0_FFEEu64;
     let mut next = || crate::util::rng::xorshift_next_unit(&mut rng);
+    // One cursor for every deal, with undos mixed in: the dense index reads
+    // the cursor's tracked tree node and cached bucket, and both must survive
+    // backing up and being dealt new cards.
+    let mut c = CursorGame::root(&game);
     for _ in 0..3000 {
-        let mut c = CursorGame::root(&game);
         CursorGame::sample_chance(&game, &mut c, &mut next);
         while !CursorGame::is_terminal(&game, &c) {
             let key = CursorGame::info_key(&game, &c);
+            assert_eq!(key, game.info_key_for(c.gs.as_ref().unwrap(), &c.history[..c.depth]), "cached key");
             let idx = game.info_set_index(&c);
             assert!(idx < cap, "index in range");
+            assert_eq!(game.slot_span(&c, idx), Some(layout.span(idx)), "the cursor's span is the layout's");
             assert_eq!(game.info_key_at(idx), key, "info_key_at inverts the dense index");
             assert_eq!(*by_key.entry(key).or_insert(idx), idx, "key -> one index (same partition)");
+            if c.depth > 0 && next() < 0.2 {
+                CursorGame::undo(&game, &mut c);
+                continue;
+            }
             let acts = CursorGame::legal(&game, &c);
             let n = acts.as_ref().len();
             let a = ((next() * n as f64) as usize).min(n - 1);
             CursorGame::apply(&game, &mut c, a, acts.as_ref()[a]);
         }
+        CursorGame::undo_chance(&game, &mut c);
     }
     assert!(by_key.len() > 200, "should exercise many post-flop info sets, got {}", by_key.len());
 
@@ -373,4 +442,67 @@ fn indexed_postflop_and_soa(caps: RaiseCaps) {
         }
     }
     assert!(visited > 100, "SoA training should visit many info sets, got {visited}");
+
+    // The dense policy file is this table, stored by index.  Export it, load
+    // it back, pair it with the game — which switches the game's keys to the
+    // dense index — and walk hands on every street: the key must be the index
+    // the trainer used, and the policy must answer with the solver's own
+    // average strategy (to one u16 step), or with nothing where the solver
+    // has nothing.
+    use crate::play::policy::{write_dense_policy, CompactPolicy};
+    let path = std::env::temp_dir().join(format!("dense_gate_{}_{caps}.bin", std::process::id()));
+    let written = write_dense_policy(&path, soa.layout(), |at, out| soa.average_strategy_into(at, out)).unwrap();
+    assert_eq!(written, visited, "every visited info set is in the file, and nothing else");
+    let policy = CompactPolicy::load(&path).unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(policy.is_dense());
+    assert_eq!(policy.len(), visited as usize);
+    let game = policy.bind(game).expect("the file was written for this game");
+    assert!(game.uses_dense_keys());
+
+    let mut c = CursorGame::root(&game);
+    let (mut trained, mut untrained) = (0, 0);
+    for _ in 0..3000 {
+        CursorGame::sample_chance(&game, &mut c, &mut next);
+        while !CursorGame::is_terminal(&game, &c) {
+            let idx = game.info_set_index(&c);
+            let key = CursorGame::info_key(&game, &c);
+            assert_eq!(key, idx as u64, "a dense key is the info-set index");
+            assert_eq!(game.info_key_at(idx), key, "and info_key_at agrees");
+            let acts = CursorGame::legal(&game, &c);
+            let n = acts.as_ref().len();
+            match policy.get(key) {
+                Some(p) => {
+                    trained += 1;
+                    assert!(soa.is_visited(idx), "the policy has a row the solver never trained");
+                    assert_eq!(p.len(), n, "row width is the action menu");
+                    assert!((p.iter().sum::<f64>() - 1.0).abs() < 1e-12, "a stored row sums to one");
+                    for (got, want) in p.iter().zip(soa.average_strategy_at(idx)) {
+                        assert!((got - want).abs() < 1.0 / 65535.0, "info set {idx}: {got} vs {want}");
+                        assert!(want > 0.0 || *got == 0.0, "an action never played stays at zero");
+                    }
+                }
+                None => {
+                    untrained += 1;
+                    assert!(!soa.is_visited(idx), "the policy lost a trained row");
+                }
+            }
+            let a = ((next() * n as f64) as usize).min(n - 1);
+            CursorGame::apply(&game, &mut c, a, acts.as_ref()[a]);
+        }
+        CursorGame::undo_chance(&game, &mut c);
+    }
+    assert!(trained > 1000, "the walk should read many trained rows, got {trained}");
+    assert!(untrained > 0, "and reach info sets 20k iterations never visited");
+
+    // Situations the abstract game has no info set for must not land on some
+    // other info set's index: a history that leaves the tree, and the wrong
+    // player for a node.
+    let hole = [make_card(12, 0), make_card(12, 1)];
+    CursorGame::sample_chance(&game, &mut c, &mut next);
+    let opener = CursorGame::current_player(&game, &c);
+    assert_ne!(game.key_for(opener, hole, &[], &[]), NO_INFO_SET, "the root is the opener's");
+    assert_eq!(game.key_for(1 - opener, hole, &[], &[]), NO_INFO_SET, "the other seat does not act at the root");
+    assert_eq!(game.key_for(opener, hole, &[], &[7, 7, 7]), NO_INFO_SET, "off-tree history");
+    assert_eq!(policy.get(NO_INFO_SET), None);
 }

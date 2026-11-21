@@ -5,7 +5,9 @@
 //! `expl` (abstract-game exploitability of the **blueprint**), `lbr`
 //! (exploitability lower bound of the **live agent** by local best response —
 //! the only measurement here that exercises re-solving), `replay` (what the
-//! agent would do in logged spots — see `replay.rs`).
+//! agent would do in logged spots — see `replay.rs`), `compact` (rewrite an
+//! older blueprint strategy file at about a fifth of its size — see
+//! `compact.rs`).
 //!
 //! ```text
 //! play slumbot [hands] [flags]
@@ -15,7 +17,10 @@
 //!   hands              number of hands to play (default 1000)
 //!   --data=DIR         artifact directory (default `data`): needs
 //!                      blueprint_holdem.bin + {flop,turn,river}_buckets.bin
-//!                      from the SAME training run
+//!                      from the SAME training run.  A dense strategy file
+//!                      (what `train blueprint --soa` writes) is checked
+//!                      against the game these flags build and refused if
+//!                      the two do not match
 //!   --policy=PATH      blueprint strategy file, overriding
 //!                      DATA/blueprint_holdem.bin (the path training writes
 //!                      to, so a preserved run needs this)
@@ -73,6 +78,7 @@
 //! hand to DATA/slumbot_results.csv.
 
 mod chart;
+mod compact;
 mod expl;
 mod lbr;
 mod replay;
@@ -132,10 +138,44 @@ fn policy_path(args: &[String], dir: &Path) -> PathBuf {
 fn load_policy(args: &[String], dir: &Path) -> CompactPolicy {
     let path = policy_path(args, dir);
     println!("Loading blueprint strategy {} ...", path.display());
-    CompactPolicy::load(&path).unwrap_or_else(|e| {
+    let policy = CompactPolicy::load(&path).unwrap_or_else(|e| {
         eprintln!("cannot load {}: {e}", path.display());
         std::process::exit(1);
-    })
+    });
+    println!(
+        "  {} info sets, {} in memory ({})",
+        policy.len(),
+        fmt_bytes(policy.resident_bytes()),
+        if policy.is_dense() { "dense" } else { "hashed keys — `play compact` rewrites it at about a fifth the size" }
+    );
+    policy
+}
+
+/// A byte count as MB below a gigabyte, GB from there.
+fn fmt_bytes(bytes: usize) -> String {
+    if bytes < 1_000_000_000 {
+        format!("{:.0} MB", bytes as f64 / 1e6)
+    } else {
+        format!("{:.2} GB", bytes as f64 / 1e9)
+    }
+}
+
+/// The abstract game and the blueprint strategy trained on it, paired: the
+/// one way a `play` command gets either.  A dense strategy file fixes what
+/// the game's info keys must be and which table layout it must have
+/// ([`CompactPolicy::bind`]); a game that does not match exits here, with
+/// the reason, instead of playing from the wrong rows.
+fn load_blueprint(args: &[String], dir: &Path, stack_bb: u32, cap: RaiseCaps) -> (BlueprintHoldem, CompactPolicy) {
+    println!("Loading abstraction from {} ({stack_bb}bb, cap-{cap})", dir.display());
+    let game = load_game(dir, stack_bb, cap);
+    let policy = load_policy(args, dir);
+    match policy.bind(game) {
+        Ok(game) => (game, policy),
+        Err(e) => {
+            eprintln!("cannot play {} with this game: {e}", policy_path(args, dir).display());
+            std::process::exit(1);
+        }
+    }
 }
 
 fn main() {
@@ -143,12 +183,13 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("slumbot") => slumbot::run(&args),
         Some("chart") => chart::run(&args),
+        Some("compact") => compact::run(&args),
         Some("expl") => expl::run(&args),
         Some("lbr") => lbr::run(&args),
         Some("replay") => replay::run(&args),
         _ => {
             eprintln!(
-                "usage: play slumbot [hands] | chart | expl | lbr [hands] | replay --spots=PATH --out=PATH  [flags]\n\
+                "usage: play slumbot [hands] | chart | expl | lbr [hands] | replay --spots=PATH --out=PATH | compact  [flags]\n\
                  see the header of src/bin/play/main.rs"
             );
             std::process::exit(2);
@@ -222,9 +263,7 @@ fn build_bot(args: &[String], dir: &Path) -> Bot {
         seed: flag(args, "seed").unwrap_or(1),
     };
 
-    println!("Loading abstraction from {} ({stack_bb}bb, cap-{cap})", dir.display());
-    let game = load_game(dir, stack_bb, cap);
-    let policy = load_policy(args, dir);
+    let (game, policy) = load_blueprint(args, dir, stack_bb, cap);
     let resolve_state = |on: bool, iters: u64| {
         if on {
             format!("on ({iters} iters, cap {})", cfg.river_cap)
@@ -233,8 +272,7 @@ fn build_bot(args: &[String], dir: &Path) -> Bot {
         }
     };
     println!(
-        "  {} info sets; resolve — river: {}, turn: {}, flop: {}",
-        policy.len(),
+        "  resolve — river: {}, turn: {}, flop: {}",
         resolve_state(cfg.resolve_river, cfg.river_iters),
         resolve_state(cfg.resolve_turn, cfg.turn_iters),
         resolve_state(cfg.resolve_flop, cfg.turn_iters),

@@ -6,6 +6,8 @@
 //! perfect-recall history.  They are kept bit-identical — same action menus,
 //! same raise bookkeeping, same info keys — and gated as such in the tests.
 
+use std::cell::Cell;
+
 use poker_core::action::{Action, ActionList};
 
 use super::{BlueprintCursor, BlueprintHoldem, BlueprintState, MAX_DEPTH};
@@ -97,6 +99,9 @@ impl crate::games::CursorGame for BlueprintHoldem {
             depth: 0,
             street_raises: 0,
             raises_at: [0; MAX_DEPTH],
+            nodes: [0; MAX_DEPTH + 1],
+            buckets: Default::default(),
+            showdown_ranks: Cell::new(None),
         }
     }
 
@@ -110,7 +115,17 @@ impl crate::games::CursorGame for BlueprintHoldem {
 
     fn utility(&self, c: &BlueprintCursor, player: usize) -> f64 {
         let gs = c.gs.as_ref().expect("utility at a play node");
-        gs.terminal_payoffs()[player] as f64 / self.big_blind as f64
+        let payoffs = if gs.is_showdown() {
+            let ranks = c.showdown_ranks.get().unwrap_or_else(|| {
+                let ranks = gs.showdown_ranks();
+                c.showdown_ranks.set(Some(ranks));
+                ranks
+            });
+            gs.showdown_payoffs(&ranks)
+        } else {
+            gs.terminal_payoffs()
+        };
+        payoffs[player] as f64 / self.big_blind as f64
     }
 
     fn current_player(&self, c: &BlueprintCursor) -> usize {
@@ -123,7 +138,8 @@ impl crate::games::CursorGame for BlueprintHoldem {
 
     fn info_key(&self, c: &BlueprintCursor) -> u64 {
         let gs = c.gs.as_ref().expect("info_key at a play node");
-        self.info_key_for(gs, &c.history[..c.depth])
+        let bucket = self.cursor_bucket(c, gs).key;
+        self.key_from_bucket(gs.current_player(), gs.board_cards_count(), bucket, &c.history[..c.depth])
     }
 
     fn apply(&self, c: &mut BlueprintCursor, a: usize, action: Action) {
@@ -133,6 +149,9 @@ impl crate::games::CursorGame for BlueprintHoldem {
         c.raises_at[c.depth] = c.street_raises;
         c.street_raises = Self::next_raises(c.street_raises, old_street, old_bet, gs);
         c.history[c.depth] = a as u8;
+        if let Some(index) = &self.indexing {
+            c.nodes[c.depth + 1] = index.child(c.nodes[c.depth], a);
+        }
         c.depth += 1;
     }
 
@@ -146,11 +165,22 @@ impl crate::games::CursorGame for BlueprintHoldem {
         c.gs = Some(self.deal(next_unit));
         c.depth = 0;
         c.street_raises = 0;
+        c.forget_cards();
     }
 
     fn undo_chance(&self, c: &mut BlueprintCursor) {
         c.gs = None;
         c.depth = 0;
         c.street_raises = 0;
+        c.forget_cards();
+    }
+}
+
+impl BlueprintCursor {
+    /// Drop everything cached about the current deal's cards — called whenever
+    /// the cards change, so a stale bucket or hand rank can never be read.
+    fn forget_cards(&mut self) {
+        self.buckets = Default::default();
+        self.showdown_ranks.set(None);
     }
 }

@@ -10,7 +10,7 @@ use crate::validation::resolving::leaf_eval::CheckdownLeafEval;
 use crate::validation::resolving::subgame::Subgame;
 use crate::validation::solver::best_response::{best_response_value, exploitability, profile_value};
 use poker_core::action::Action;
-use poker_core::make_card;
+use poker_core::{legal_actions, make_card};
 use poker_core::state::MAX_PLAYERS;
 
 fn river_board() -> [u8; 5] {
@@ -591,7 +591,7 @@ impl TrueBr<'_> {
     }
 
     fn node(&self, gs: &mut GameState, hist: &mut Vec<u8>, raises: u32, reach: &[f64]) -> Vec<f64> {
-        let acts = test_capped(gs, raises, self.cap);
+        let acts = build::capped_legal(gs, raises, self.cap);
         let actor = gs.current_player();
         let n = acts.len();
         if actor == self.br {
@@ -762,19 +762,6 @@ fn collide(h: &[u8; 2], j: &[u8; 2], board: &[u8; 5]) -> bool {
         used |= 1 << c;
     }
     j.iter().any(|&c| used & (1 << c) != 0)
-}
-
-/// Test-local mirror of the solver's raise-cap filter (per-street reset).
-fn test_capped(gs: &GameState, raises: u32, cap: u32) -> Vec<Action> {
-    let full = legal_actions(gs);
-    if raises < cap {
-        return full.to_vec();
-    }
-    let has_passive = full.iter().any(|a| matches!(a, Action::Check | Action::Call));
-    full.iter()
-        .copied()
-        .filter(|a| !(matches!(a, Action::Raise(_)) || (matches!(a, Action::AllIn) && has_passive)))
-        .collect()
 }
 
 /// Richer-than-duel supports on the turn board (sets, pairs, draws, air)

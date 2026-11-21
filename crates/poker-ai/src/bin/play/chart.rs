@@ -6,7 +6,7 @@ use poker_core::action::Action;
 use poker_core::make_card;
 use poker_core::state::NO_CARD;
 
-use super::{cap_flag, load_game, load_policy, validate, ABSTRACT_BB};
+use super::{cap_flag, load_blueprint, validate, ABSTRACT_BB};
 
 /// Dump the blueprint's preflop strategy — the SB open chart and the BB
 /// response to the smallest SB open — so a preflop leak (over-folding the BB,
@@ -19,10 +19,7 @@ pub(super) fn run(args: &[String]) {
     let stack_bb: u32 = flag(args, "stack-bb").unwrap_or(200);
     let cap = cap_flag(args);
 
-    println!("Loading abstraction from {} ({stack_bb}bb, cap-{cap})", dir.display());
-    let game = load_game(&dir, stack_bb, cap);
-    let policy = load_policy(args, &dir);
-    println!("  {} info sets", policy.len());
+    let (game, policy) = load_blueprint(args, &dir, stack_bb, cap);
 
     let mut sb_open = [[0.0f64; 13]; 13]; // P(raise/all-in) opening the button
     let mut sb_fold = [[0.0f64; 13]; 13]; // P(fold) — the SB min-fold
@@ -48,7 +45,7 @@ pub(super) fn run(args: &[String]) {
             let sb_state = game.play_state([hero, opp], [NO_CARD; 5]);
             let menu = game.actions(&sb_state);
             let key = game.info_key(&sb_state);
-            sb_missing[row][col] = policy.get(key).is_none();
+            sb_missing[row][col] = !policy.contains(key);
             let probs = policy.probs_or_uniform(key, menu.len());
             let (fold, _passive, aggro) = classify(&menu, &probs);
             sb_open[row][col] = 100.0 * aggro;
@@ -78,7 +75,7 @@ pub(super) fn run(args: &[String]) {
                 let bb_state = game.apply(&opener, raise_idx);
                 let bmenu = game.actions(&bb_state);
                 let bkey = game.info_key(&bb_state);
-                bb_missing[row][col] = policy.get(bkey).is_none();
+                bb_missing[row][col] = !policy.contains(bkey);
                 let bprobs = policy.probs_or_uniform(bkey, bmenu.len());
                 let (bfold, _bpassive, baggro) = classify(&bmenu, &bprobs);
                 bb_fold[row][col] = 100.0 * bfold;

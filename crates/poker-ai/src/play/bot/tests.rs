@@ -565,3 +565,42 @@ fn a_desynced_spot_is_not_searched() {
     b.act(&mut hs, action, &board).expect("bot acts");
     assert_ne!(b.last_trace().unwrap().path, DecisionPath::Search);
 }
+
+/// Our own range must follow what we *play*, not what the blueprint mixes.
+/// Here 7-2 offsuit limps 4% of the time in the blueprint — below the
+/// purification threshold, so the bot never limps it.  After we limp, 7-2
+/// must be gone from our range; updating with the raw blueprint (as this once
+/// did) left it in at 4% weight, and every later re-solve then played a range
+/// holding hands we cannot have.
+#[test]
+fn a_blueprint_decision_updates_our_range_with_what_we_play() {
+    use poker_core::action::Action;
+    let hole = [parse_card("Ac").unwrap(), parse_card("Kd").unwrap()];
+    let trash = [parse_card("7h").unwrap(), parse_card("2c").unwrap()];
+    let game = || BlueprintHoldem::new(400, 2, 1, 0).with_raise_cap(3);
+    let cfg = || BotConfig { purify: 0.1, resolve_river: false, search: false, ..Default::default() };
+
+    // The small blind's opening decision: find its keys and action indices.
+    let mut probe = Bot::new(game(), CompactPolicy::from_entries(vec![]), cfg());
+    let hs = probe.start_hand(1, hole);
+    let acts = hs.hand.actions(&probe.game);
+    let limp = acts.iter().position(|a| matches!(a, Action::Call)).unwrap();
+    let fold = acts.iter().position(|a| matches!(a, Action::Fold)).unwrap();
+    let mut ours = vec![0.0f32; acts.len()];
+    ours[limp] = 1.0;
+    let mut theirs = vec![0.0f32; acts.len()];
+    theirs[fold] = 0.96;
+    theirs[limp] = 0.04;
+    let policy = CompactPolicy::from_entries(vec![
+        (hs.hand.key_with_hole(&probe.game, hole), ours),
+        (hs.hand.key_with_hole(&probe.game, trash), theirs),
+    ]);
+
+    let mut b = Bot::new(game(), policy, cfg());
+    let mut hs = b.start_hand(1, hole);
+    assert_eq!(b.act(&mut hs, "", &[]).unwrap(), "c", "ace-king always limps in this policy");
+    let range = &hs.ranges[hs.my_seat];
+    assert_eq!(range.prob(trash[0], trash[1]), 0.0, "a hand we never limp cannot be in our limping range");
+    assert!(range.prob(hole[0], hole[1]) > 0.0, "the hand we hold stays in it");
+    assert!((range.probs.iter().sum::<f64>() - 1.0).abs() < 1e-9);
+}

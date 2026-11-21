@@ -79,116 +79,64 @@ impl Parsed {
 }
 
 /// Parse a Slumbot action string. Returns an error string on any protocol
-/// violation (same conditions `sample_api.py` rejects).
+/// violation (same conditions `sample_api.py` rejects, plus an action after
+/// the hand has ended, which the reference lets through).
 pub fn parse_action(action: &str) -> Result<Parsed, String> {
     let bytes = action.as_bytes();
-    let sz = bytes.len();
-
-    let mut st: u8 = 0;
-    let mut street_last_bet_to = BIG_BLIND;
-    let mut total_last_bet_to = BIG_BLIND;
-    let mut last_bet_size = BIG_BLIND - SMALL_BLIND;
-    let mut last_bettor: i8 = 0;
-    let mut pos: i8 = 1; // SB acts first preflop
-    let mut street_committed = [BIG_BLIND, SMALL_BLIND]; // pos 0 = BB, pos 1 = SB
-    let mut total_committed = [BIG_BLIND, SMALL_BLIND];
-    let mut events = Vec::new();
-
-    let done = |st: u8,
-                pos: i8,
-                street_last_bet_to: u32,
-                total_last_bet_to: u32,
-                last_bet_size: u32,
-                last_bettor: i8,
-                street_committed: [u32; 2],
-                total_committed: [u32; 2],
-                events: Vec<Event>| Parsed {
-        street: st,
-        next_pos: pos,
-        street_last_bet_to,
-        total_last_bet_to,
-        last_bet_size,
-        last_bettor,
-        street_committed,
-        total_committed,
-        events,
+    // Blinds are posted: the small blind opens, facing half a big blind.
+    let mut p = Parsed {
+        street: 0,
+        next_pos: 1,
+        street_last_bet_to: BIG_BLIND,
+        total_last_bet_to: BIG_BLIND,
+        last_bet_size: BIG_BLIND - SMALL_BLIND,
+        last_bettor: 0,
+        street_committed: [BIG_BLIND, SMALL_BLIND], // pos 0 = BB, pos 1 = SB
+        total_committed: [BIG_BLIND, SMALL_BLIND],
+        events: Vec::new(),
     };
+    // Whether the other player has already acted on this street, so that a
+    // check or call now closes it.
+    let mut closes_street = false;
 
-    if sz == 0 {
-        return Ok(done(
-            st,
-            pos,
-            street_last_bet_to,
-            total_last_bet_to,
-            last_bet_size,
-            last_bettor,
-            street_committed,
-            total_committed,
-            events,
-        ));
-    }
-
-    let mut check_or_call_ends_street = false;
-    let mut i = 0usize;
-    while i < sz {
-        if st >= NUM_STREETS {
-            return Err("unexpected action after the river".into());
+    let mut i = 0;
+    while i < bytes.len() {
+        if p.next_pos < 0 {
+            return Err("unexpected action after the hand ended".into());
         }
         let c = bytes[i];
         i += 1;
+        let actor = p.next_pos as usize;
+        let event = |kind| Event {
+            street: p.street,
+            pos: actor as u8,
+            kind,
+            pot_before: p.pot(),
+            bet_before: p.street_last_bet_to,
+        };
         match c {
             b'k' => {
-                if last_bet_size > 0 {
+                if p.last_bet_size > 0 {
                     return Err("illegal check facing a bet".into());
                 }
-                events.push(Event {
-                    street: st,
-                    pos: pos as u8,
-                    kind: EventKind::Check,
-                    pot_before: total_committed[0] + total_committed[1],
-                    bet_before: street_last_bet_to,
-                });
-                if check_or_call_ends_street {
-                    if st < NUM_STREETS - 1 && i < sz {
-                        if bytes[i] != b'/' {
-                            return Err("missing street separator".into());
-                        }
-                        i += 1;
-                    }
-                    if st == NUM_STREETS - 1 {
-                        pos = -1; // showdown
-                    } else {
-                        pos = 0;
-                        st += 1;
-                        street_committed = [0, 0];
-                    }
-                    street_last_bet_to = 0;
-                    check_or_call_ends_street = false;
-                } else {
-                    pos = (pos + 1) % 2;
-                    check_or_call_ends_street = true;
-                }
+                let ev = event(EventKind::Check);
+                p.events.push(ev);
+                pass_or_close(&mut p, &mut closes_street, bytes, &mut i)?;
             }
             b'c' => {
-                if last_bet_size == 0 {
+                if p.last_bet_size == 0 {
                     return Err("illegal call with no outstanding bet".into());
                 }
-                let caller = pos as usize;
-                events.push(Event {
-                    street: st,
-                    pos: pos as u8,
-                    kind: EventKind::Call,
-                    pot_before: total_committed[0] + total_committed[1],
-                    bet_before: street_last_bet_to,
-                });
-                total_committed[caller] += street_last_bet_to - street_committed[caller];
-                street_committed[caller] = street_last_bet_to;
-                if total_last_bet_to == STACK_SIZE {
-                    // Call of an all-in: optionally slashes closing every
+                let ev = event(EventKind::Call);
+                p.events.push(ev);
+                p.total_committed[actor] += p.street_last_bet_to - p.street_committed[actor];
+                p.street_committed[actor] = p.street_last_bet_to;
+                if p.total_last_bet_to == STACK_SIZE {
+                    // Call of an all-in: optionally the slashes closing every
                     // pre-river street, then nothing else.
-                    if i != sz {
-                        for _ in st..NUM_STREETS - 1 {
-                            if i == sz {
+                    if i != bytes.len() {
+                        for _ in p.street..NUM_STREETS - 1 {
+                            if i == bytes.len() {
                                 return Err("missing street separator at end".into());
                             }
                             if bytes[i] != b'/' {
@@ -197,124 +145,96 @@ pub fn parse_action(action: &str) -> Result<Parsed, String> {
                             i += 1;
                         }
                     }
-                    if i != sz {
+                    if i != bytes.len() {
                         return Err("extra characters after an all-in call".into());
                     }
-                    return Ok(done(
-                        NUM_STREETS - 1,
-                        -1,
-                        street_last_bet_to,
-                        total_last_bet_to,
-                        0,
-                        last_bettor,
-                        street_committed,
-                        total_committed,
-                        events,
-                    ));
+                    p.street = NUM_STREETS - 1; // the board runs out
+                    p.next_pos = -1;
+                    p.last_bet_size = 0;
+                    return Ok(p);
                 }
-                if check_or_call_ends_street {
-                    if st < NUM_STREETS - 1 && i < sz {
-                        if bytes[i] != b'/' {
-                            return Err("missing street separator".into());
-                        }
-                        i += 1;
-                    }
-                    if st == NUM_STREETS - 1 {
-                        pos = -1; // showdown
-                    } else {
-                        pos = 0;
-                        st += 1;
-                        street_committed = [0, 0];
-                    }
-                    street_last_bet_to = 0;
-                    check_or_call_ends_street = false;
-                } else {
-                    pos = (pos + 1) % 2;
-                    check_or_call_ends_street = true;
-                }
-                last_bet_size = 0;
-                last_bettor = -1;
+                pass_or_close(&mut p, &mut closes_street, bytes, &mut i)?;
+                p.last_bet_size = 0;
+                p.last_bettor = -1;
             }
             b'f' => {
-                if last_bet_size == 0 {
+                if p.last_bet_size == 0 {
                     return Err("illegal fold with no outstanding bet".into());
                 }
-                if i != sz {
+                if i != bytes.len() {
                     return Err("extra characters after a fold".into());
                 }
-                events.push(Event {
-                    street: st,
-                    pos: pos as u8,
-                    kind: EventKind::Fold,
-                    pot_before: total_committed[0] + total_committed[1],
-                    bet_before: street_last_bet_to,
-                });
-                return Ok(done(
-                    st,
-                    -1,
-                    street_last_bet_to,
-                    total_last_bet_to,
-                    last_bet_size,
-                    last_bettor,
-                    street_committed,
-                    total_committed,
-                    events,
-                ));
+                let ev = event(EventKind::Fold);
+                p.events.push(ev);
+                p.next_pos = -1;
+                return Ok(p);
             }
             b'b' => {
-                let j = i;
-                while i < sz && bytes[i].is_ascii_digit() {
+                let digits = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
                     i += 1;
                 }
-                if i == j {
+                if i == digits {
                     return Err("missing bet size".into());
                 }
-                let new_street_last_bet_to: u32 =
-                    action[j..i].parse().map_err(|_| "bet size not an integer".to_string())?;
-                let new_last_bet_size = new_street_last_bet_to.saturating_sub(street_last_bet_to);
+                let bet_to: u32 =
+                    action[digits..i].parse().map_err(|_| "bet size not an integer".to_string())?;
+                let bet_size = bet_to.saturating_sub(p.street_last_bet_to);
                 // Legality (Slumbot's own rules): minimum is the last bet size,
                 // floored at the big blind, capped at the remaining stack; an
                 // all-in for less is always allowed.
-                let remaining = STACK_SIZE - total_last_bet_to;
-                let min_bet_size = last_bet_size.max(BIG_BLIND).min(remaining);
-                if new_last_bet_size < min_bet_size {
-                    return Err(format!("bet too small ({new_last_bet_size} < {min_bet_size})"));
+                let remaining = STACK_SIZE - p.total_last_bet_to;
+                let min_bet_size = p.last_bet_size.max(BIG_BLIND).min(remaining);
+                if bet_size < min_bet_size {
+                    return Err(format!("bet too small ({bet_size} < {min_bet_size})"));
                 }
-                if new_last_bet_size > remaining {
-                    return Err(format!("bet too big ({new_last_bet_size} > {remaining})"));
+                if bet_size > remaining {
+                    return Err(format!("bet too big ({bet_size} > {remaining})"));
                 }
-                let bettor = pos as usize;
-                events.push(Event {
-                    street: st,
-                    pos: pos as u8,
-                    kind: EventKind::BetTo(new_street_last_bet_to),
-                    pot_before: total_committed[0] + total_committed[1],
-                    bet_before: street_last_bet_to,
-                });
-                total_committed[bettor] += new_street_last_bet_to - street_committed[bettor];
-                street_committed[bettor] = new_street_last_bet_to;
-                last_bet_size = new_last_bet_size;
-                street_last_bet_to = new_street_last_bet_to;
-                total_last_bet_to += last_bet_size;
-                last_bettor = pos;
-                pos = (pos + 1) % 2;
-                check_or_call_ends_street = true;
+                let ev = event(EventKind::BetTo(bet_to));
+                p.events.push(ev);
+                p.total_committed[actor] += bet_to - p.street_committed[actor];
+                p.street_committed[actor] = bet_to;
+                p.last_bet_size = bet_size;
+                p.street_last_bet_to = bet_to;
+                p.total_last_bet_to += bet_size;
+                p.last_bettor = actor as i8;
+                p.next_pos = (p.next_pos + 1) % 2;
+                closes_street = true;
             }
             _ => return Err(format!("unexpected character {:?} in action", c as char)),
         }
     }
+    Ok(p)
+}
 
-    Ok(done(
-        st,
-        pos,
-        street_last_bet_to,
-        total_last_bet_to,
-        last_bet_size,
-        last_bettor,
-        street_committed,
-        total_committed,
-        events,
-    ))
+/// After a check or call: pass the action across, or — when the other player
+/// has already acted this street (`closes_street`) — close the street,
+/// consuming the `/` that follows a closed pre-river street when the string
+/// continues.  The river closing is the showdown.
+fn pass_or_close(p: &mut Parsed, closes_street: &mut bool, bytes: &[u8], i: &mut usize) -> Result<(), String> {
+    if !*closes_street {
+        p.next_pos = (p.next_pos + 1) % 2;
+        *closes_street = true;
+        return Ok(());
+    }
+    let river = p.street == NUM_STREETS - 1;
+    if !river && *i < bytes.len() {
+        if bytes[*i] != b'/' {
+            return Err("missing street separator".into());
+        }
+        *i += 1;
+    }
+    if river {
+        p.next_pos = -1; // showdown
+    } else {
+        p.next_pos = 0; // the big blind opens every postflop street
+        p.street += 1;
+        p.street_committed = [0, 0];
+    }
+    p.street_last_bet_to = 0;
+    *closes_street = false;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -421,5 +341,19 @@ mod tests {
         // Raise to 300 (size 200); the minimum reraise is to 500 (another 200).
         assert!(parse_action("b300b499").is_err());
         assert!(parse_action("b300b500").is_ok());
+    }
+
+    /// A move after the hand is over has no actor.  The reference parser lets
+    /// a check through with a nonsense position; a bet there indexed the chip
+    /// arrays with position −1 and panicked, taking the whole match down on
+    /// one malformed server string.  It must be an ordinary error.
+    #[test]
+    fn a_move_after_the_hand_ended_is_an_error_not_a_panic() {
+        for over in ["b200c/kk/kk/kk", "b300f", "b20000c///"] {
+            assert_eq!(parse_action(over).unwrap().next_pos, -1, "{over:?} ends the hand");
+        }
+        for late in ["b200c/kk/kk/kkk", "b200c/kk/kk/kkb300", "b200c/kk/kk/kkc", "b200c/kk/kk/kk/"] {
+            assert!(parse_action(late).is_err(), "{late:?} acts after the showdown");
+        }
     }
 }

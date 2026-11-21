@@ -10,7 +10,7 @@
 use poker_core::state::{GameState, MAX_PLAYERS, NO_CARD};
 
 use super::{BlueprintCursor, BlueprintHoldem};
-use crate::abstraction::canonical::preflop_index;
+use crate::games::{Layout, Span};
 use crate::util::hash::Fnv1a;
 
 /// A deal-independent enumeration of the abstract betting tree under the raise
@@ -44,12 +44,29 @@ pub(super) struct Indexing {
     in_action: Vec<u8>,
     /// Per node: base dense index of its `buckets_for(visible)` bucket block.
     seq_offset: Vec<u32>,
-    /// Number of legal actions per dense info-set index (drives the table layout).
-    actions_by_index: Vec<u8>,
+    /// Per node: the flat-table slot its bucket block starts at, in a table
+    /// laid out in index order — every info set of a node has the node's
+    /// action count, so bucket `b` starts `b · num_actions` slots further on.
+    slot_offset: Vec<u64>,
     /// Total info sets = `Σ buckets_for(visible[node])`.
     capacity: usize,
 }
 
+
+impl Indexing {
+    /// The node `action` leads to from `node` (`-1` = a terminal).
+    pub(super) fn child(&self, node: i32, action: usize) -> i32 {
+        self.children[node as usize][action]
+    }
+
+    /// The node whose bucket block holds dense index `index`: the last one
+    /// whose block starts at or below it.  A binary search over the nodes —
+    /// for the paths that start from an index (table layout, export); the
+    /// traversal knows its node and never needs this.
+    fn node_of(&self, index: usize) -> usize {
+        self.seq_offset.partition_point(|&o| o as usize <= index) - 1
+    }
+}
 
 impl BlueprintHoldem {
     fn indexing(&self) -> &Indexing {
@@ -87,19 +104,21 @@ impl BlueprintHoldem {
             parent: Vec::new(),
             in_action: Vec::new(),
             seq_offset: Vec::new(),
-            actions_by_index: Vec::new(),
+            slot_offset: Vec::new(),
             capacity: 0,
         };
         self.walk_tree(&gs, 0, -1, 0, &mut idx);
 
         let mut cap = 0u32;
+        let mut slots = 0u64;
         for node in 0..idx.visible.len() {
             idx.seq_offset.push(cap);
+            idx.slot_offset.push(slots);
             let nb = self.buckets_for_visible(idx.visible[node]);
-            for _ in 0..nb {
-                idx.actions_by_index.push(idx.num_actions[node]);
-            }
-            cap += nb;
+            // Checked: a release build would otherwise wrap and quietly map
+            // two info sets onto the same index.
+            cap = cap.checked_add(nb).expect("the dense index holds at most 2^32 info sets");
+            slots += nb as u64 * idx.num_actions[node] as u64;
         }
         idx.capacity = cap as usize;
         idx
@@ -131,31 +150,16 @@ impl BlueprintHoldem {
         id as i32
     }
 
-    /// The current player's card bucket, in `0..buckets_for(visible)`.  Mirrors
-    /// [`situation_bucket`](BlueprintHoldem::situation_bucket) under full
-    /// coverage (the precondition of [`with_indexing`]); an out-of-set situation
-    /// — which cannot occur with a full-coverage map — falls back to bucket `0`.
-    fn dense_bucket(&self, hole: &[u8; 2], board: &[u8]) -> usize {
-        let visible = board.len();
-        if visible == 0 {
-            return preflop_index(hole) as usize;
-        }
-        self.street_buckets[visible - 3]
-            .as_ref()
-            .expect("map present")
-            .bucket(hole, board)
-            .map(|b| b as usize)
-            .unwrap_or(0)
-    }
-
     /// Reconstruct the `HashMap` info key for a dense index, so an SoA-trained
     /// strategy exports to the **same** `HashMap<u64, _>` artifact as the
     /// `HashMap`-solver path (identical bytes — see
     /// `info_key_for`).
     pub fn info_key_at(&self, index: usize) -> u64 {
+        if self.dense_keys {
+            return index as u64;
+        }
         let idx = self.indexing();
-        // The node owning this index is the last whose block starts at/below it.
-        let node = idx.seq_offset.partition_point(|&o| o as usize <= index) - 1;
+        let node = idx.node_of(index);
         let bucket = (index - idx.seq_offset[node] as usize) as u64;
 
         // Rebuild the perfect-recall history from the parent chain.
@@ -177,35 +181,77 @@ impl BlueprintHoldem {
     }
 }
 
+impl BlueprintHoldem {
+    /// The dense info-set index of `player` holding a hand in card `bucket`
+    /// at `history` — the dense-key form of the info key, for callers that
+    /// have a history rather than a cursor (play, evaluation).  Walks the
+    /// tree from the root along `history`.
+    ///
+    /// [`NO_INFO_SET`](super::NO_INFO_SET) if the abstract game has no such
+    /// info set: the history leaves the tree, `player` does not act with
+    /// `visible` board cards there, or `bucket` is not one of the street's
+    /// (an uncovered hand's raw index).  Each would otherwise land on some
+    /// *other* info set's index, and a lookup would return its strategy.
+    pub(super) fn dense_key(&self, player: usize, visible: usize, bucket: u64, history: &[u8]) -> u64 {
+        let idx = self.indexing();
+        if idx.children.is_empty() {
+            return super::NO_INFO_SET;
+        }
+        let mut node = 0usize;
+        for &a in history {
+            match idx.children[node].get(a as usize) {
+                Some(&child) if child >= 0 => node = child as usize,
+                _ => return super::NO_INFO_SET,
+            }
+        }
+        if idx.to_act[node] as usize != player
+            || idx.visible[node] as usize != visible
+            || bucket >= self.buckets_for_visible(idx.visible[node]) as u64
+        {
+            return super::NO_INFO_SET;
+        }
+        idx.seq_offset[node] as u64 + bucket
+    }
+}
+
 impl crate::games::IndexedGame for BlueprintHoldem {
     fn info_set_capacity(&self) -> usize {
         self.indexing().capacity
     }
 
-    /// `sequence_offset + card_bucket`.  The sequence is found by walking the
-    /// enumerated betting tree along the cursor's inline history (O(depth), no
-    /// allocation); the bucket is the acting player's current-street card bucket.
+    /// `sequence_offset + card_bucket`.  Both halves are read off the cursor:
+    /// the tree node it tracks along its path, and the acting player's
+    /// current-street card bucket from its per-deal cache.
     fn info_set_index(&self, c: &BlueprintCursor) -> usize {
         let idx = self.indexing();
         let gs = c.gs.as_ref().expect("info_set_index at a play node");
-
-        let mut node = 0usize;
-        for &a in &c.history[..c.depth] {
-            node = idx.children[node][a as usize] as usize;
-        }
+        let node = c.nodes[c.depth] as usize;
         debug_assert_eq!(idx.to_act[node] as usize, gs.current_player(), "tree node player matches");
-
-        let player = gs.current_player();
-        let mut hole = gs.hole_cards[player];
-        hole.sort_unstable();
-        let visible = gs.board_cards_count();
-        debug_assert_eq!(idx.visible[node] as usize, visible, "tree node street matches");
-        let bucket = self.dense_bucket(&hole, &gs.board[..visible]);
-
-        idx.seq_offset[node] as usize + bucket
+        debug_assert_eq!(idx.visible[node] as usize, gs.board_cards_count(), "tree node street matches");
+        idx.seq_offset[node] as usize + self.cursor_bucket(c, gs).dense as usize
     }
 
     fn actions_at(&self, index: usize) -> usize {
-        self.indexing().actions_by_index[index] as usize
+        let idx = self.indexing();
+        idx.num_actions[idx.node_of(index)] as usize
+    }
+
+    /// One run per tree node — its bucket block, every info set the node's
+    /// action count wide.  The same layout the default would reach by asking
+    /// for each of the hundreds of millions of info sets in turn.
+    fn layout(&self) -> Layout {
+        let idx = self.indexing();
+        Layout::from_runs(
+            (0..idx.visible.len())
+                .map(|node| (self.buckets_for_visible(idx.visible[node]) as u64, idx.num_actions[node] as usize)),
+        )
+    }
+
+    fn slot_span(&self, c: &BlueprintCursor, index: usize) -> Option<Span> {
+        let idx = self.indexing();
+        let node = c.nodes[c.depth] as usize;
+        let n = idx.num_actions[node] as usize;
+        let bucket = index - idx.seq_offset[node] as usize;
+        Some(Span { base: idx.slot_offset[node] as usize + bucket * n, n })
     }
 }

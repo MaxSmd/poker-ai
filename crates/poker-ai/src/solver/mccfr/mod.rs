@@ -60,9 +60,8 @@ struct Node {
 
 impl Node {
     /// `optimistic` / `pruning` allocate their feature accumulators only when
-    /// the corresponding feature is on — mirroring
-    /// [`RegretTable::with_layout`](crate::solver::regret_table::RegretTable::with_layout),
-    /// so a run pays for them only if it uses them.  RBP in particular is inert
+    /// the corresponding feature is on, so a run pays for them only if it
+    /// uses them.  RBP in particular is inert
     /// under the production discount schedule (see [`Self::with_pruning`]), and
     /// an inert feature should cost nothing.
     fn new(num_actions: usize, optimistic: bool, pruning: bool) -> Self {
@@ -154,6 +153,12 @@ impl<G: Game> Mccfr<G> {
     pub fn with_baseline(mut self) -> Self {
         self.use_baseline = true;
         self
+    }
+
+    /// Whether the VR-MCCFR baseline is on (restored from a checkpoint on
+    /// resume, so a resumed run may differ from what its flags asked for).
+    pub fn uses_baseline(&self) -> bool {
+        self.use_baseline
     }
 
     /// Enable optimistic (predictive) regret updates: the strategy is matched

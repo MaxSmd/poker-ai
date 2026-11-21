@@ -122,11 +122,7 @@ impl Bot {
                 }
             };
         }
-        let mut updated = hs.ranges[hs.my_seat].clone();
-        updated.update(&likelihood);
-        if updated.probs.iter().any(|&p| p > 0.0) {
-            hs.ranges[hs.my_seat] = updated;
-        }
+        hs.ranges[hs.my_seat].update_if_supported(&likelihood);
 
         // A search carries no CFVs: the next re-solve this hand bootstraps.
         hs.carried_cfvs = None;
@@ -282,11 +278,7 @@ impl Bot {
         if self.cfg.continual {
             hs.carried_cfvs = solver.opponent_cfvs_after(idx, &likelihood).map(Box::new);
         }
-        let mut updated = hs.ranges[hs.my_seat].clone();
-        updated.update(&likelihood);
-        if updated.probs.iter().any(|&p| p > 0.0) {
-            hs.ranges[hs.my_seat] = updated;
-        }
+        hs.ranges[hs.my_seat].update_if_supported(&likelihood);
     }
 
     /// Keep the abstract tracker coherent with what we do: map our real move

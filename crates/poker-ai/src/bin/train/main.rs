@@ -128,7 +128,7 @@ fn main() {
             pushfold::run_comparison(&args)
         }
         Some("blueprint") => {
-            let allowed = ["cap", "soa", "atomic", "parallel", "optimistic", "resume"];
+            let allowed = ["cap", "soa", "atomic", "parallel", "optimistic", "resume", "no-baseline"];
             check_flags(&args, 2, &allowed, 3);
             blueprint::run_blueprint(&args)
         }

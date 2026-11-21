@@ -17,7 +17,10 @@
 //! and [`IndexedGame`] (a dense info-set index, which unlocks flat SoA storage).
 
 pub mod blueprint;
+pub mod layout;
 pub mod push_fold;
+
+pub use layout::{Layout, Span};
 
 /// A two-player, zero-sum, perfect-recall extensive-form game with explicit
 /// chance nodes.
@@ -204,4 +207,24 @@ pub trait IndexedGame: CursorGame {
     /// Number of legal actions at the info set with the given index (fixes the
     /// flat table's per-info-set width).
     fn actions_at(&self, index: usize) -> usize;
+
+    /// The flat table's slot layout: info sets in index order, each
+    /// `actions_at` slots wide.  The default asks for every info set in turn;
+    /// a game that knows its blocks should describe them directly — the result
+    /// must be the same [`Layout`] either way.
+    fn layout(&self) -> Layout {
+        Layout::build(self.info_set_capacity(), |i| self.actions_at(i))
+    }
+
+    /// Where the info set at `cursor` (dense index `index`) sits in a table
+    /// laid out by [`layout`](IndexedGame::layout) — the same answer as
+    /// `layout().span(index)`.
+    ///
+    /// The layout finds it from `index` alone, but by a binary search over
+    /// its runs on every node visit.  A game whose cursor already knows which
+    /// block it is in can derive the span from what it has in cache.  `None`
+    /// (the default) means "ask the table".
+    fn slot_span(&self, _cursor: &Self::Cursor, _index: usize) -> Option<Span> {
+        None
+    }
 }

@@ -7,6 +7,7 @@
 
 use std::sync::Mutex;
 
+use poker_core::action::Action;
 use poker_core::legal_actions;
 use poker_core::state::{GameState, NO_CARD};
 
@@ -15,23 +16,27 @@ use super::node::{NodeKind, NodeStore};
 use super::VectorCfr;
 use crate::abstraction::features::PreparedShowdown;
 
-impl VectorCfr {
-    /// The subgame's legal actions under the raise cap: past `raises` ≥ cap,
-    /// drop every `Raise` and any *voluntary* `AllIn` (one where a passive
-    /// action exists) — the same filter as `BlueprintHoldem::capped_legal`.
-    fn capped_legal(&self, gs: &GameState, raises: u32) -> Vec<poker_core::action::Action> {
-        use poker_core::action::Action;
-        let full = legal_actions(gs);
-        if raises < self.raise_cap {
-            return full.to_vec();
-        }
-        let has_passive = full.iter().any(|a| matches!(a, Action::Check | Action::Call));
-        full.iter()
-            .copied()
-            .filter(|a| !(matches!(a, Action::Raise(_)) || (matches!(a, Action::AllIn) && has_passive)))
-            .collect()
+/// The subgame's legal actions after `raises` raises under `raise_cap`: at the
+/// cap, every `Raise` goes, and so does a *voluntary* `AllIn` (one offered
+/// beside a check or call) — a forced all-in call always stays.
+///
+/// Tighter than the blueprint's cap (`BlueprintHoldem::capped_legal_at`), which
+/// keeps the all-in so that any real bet has an abstract action to land on.  A
+/// resolve is rooted at the real state and maps nothing, so it can close the
+/// raise war outright and keep the tree small.
+pub(super) fn capped_legal(gs: &GameState, raises: u32, raise_cap: u32) -> Vec<Action> {
+    let full = legal_actions(gs);
+    if raises < raise_cap {
+        return full.to_vec();
     }
+    let has_passive = full.iter().any(|a| matches!(a, Action::Check | Action::Call));
+    full.iter()
+        .copied()
+        .filter(|a| !(matches!(a, Action::Raise(_)) || (matches!(a, Action::AllIn) && has_passive)))
+        .collect()
+}
 
+impl VectorCfr {
     pub(super) fn build(&mut self, gs: GameState, history: Vec<u8>, raises: u32, prep: usize) -> usize {
         // A node is a leaf when the hand ends (fold / river showdown) or when the
         // current street wants a board card the resolve root does not have — the
@@ -80,7 +85,7 @@ impl VectorCfr {
         }
 
         let player = gs.current_player();
-        let acts = self.capped_legal(&gs, raises);
+        let acts = capped_legal(&gs, raises, self.raise_cap);
         let mut children = Vec::with_capacity(acts.len());
         for (i, &act) in acts.iter().enumerate() {
             let old_bet = gs.current_bet;

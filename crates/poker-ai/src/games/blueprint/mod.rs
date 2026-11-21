@@ -28,6 +28,8 @@ mod traits;
 #[cfg(test)]
 mod tests;
 
+use std::cell::Cell;
+
 use poker_core::action::{Action, ActionList};
 use poker_core::legal_actions;
 use poker_core::state::{GameState, MAX_PLAYERS, NO_CARD};
@@ -70,7 +72,15 @@ pub struct BlueprintHoldem {
     /// only the `HashMap`-keyed [`Game`]/[`crate::games::CursorGame`] paths work without
     /// it.  Present ⇒ the game also implements [`crate::games::IndexedGame`].
     indexing: Option<Indexing>,
+    /// Whether info keys are dense info-set indices instead of hashes — see
+    /// [`with_dense_keys`](BlueprintHoldem::with_dense_keys).
+    dense_keys: bool,
 }
+
+/// The dense-key answer for a situation the abstract game has no info set
+/// for (a history that leaves the tree, a hand no bucket covers).  No table
+/// has this index, so a lookup with it is a miss — as an unknown hash is.
+pub const NO_INFO_SET: u64 = u64::MAX;
 
 /// Raises allowed per street, indexed `preflop = 0, flop = 1, turn = 2,
 /// river = 3` (the engine's `GameState::street`).
@@ -171,6 +181,38 @@ pub struct BlueprintCursor {
     /// `street_raises` *before* the action at each depth, so `undo` can restore
     /// it in O(1) (the inline counterpart of cloning the state).
     raises_at: [u8; MAX_DEPTH],
+    /// The dense-index tree node at each depth along the current path
+    /// (`nodes[depth]` is where the cursor stands; `-1` once the path has
+    /// reached a terminal).  Maintained by `apply` when the game is indexed, so
+    /// [`info_set_index`](crate::games::IndexedGame::info_set_index) reads its
+    /// node instead of re-walking the tree from the root at every decision.
+    nodes: [i32; MAX_DEPTH + 1],
+    /// This deal's card buckets, `[seat][street]`, filled on first use and
+    /// cleared at every deal.  A hand's bucket on a street depends only on the
+    /// cards, which are fixed for the whole traversal — while a traversal
+    /// visits hundreds of decision nodes per street.  Computing it per node was
+    /// a suit canonicalization plus a read into a table of up to 123 M entries
+    /// each time; this makes it once per (seat, street) per deal.
+    buckets: [[Cell<Option<CardBucket>>; 4]; 2],
+    /// This deal's showdown hand ranks, cached like `buckets` and for the
+    /// same reason: every showdown a traversal reaches is between the same two
+    /// hands on the same board, so the hands are evaluated once per deal and
+    /// each terminal only settles the chips.
+    showdown_ranks: Cell<Option<[u32; MAX_PLAYERS]>>,
+}
+
+/// One hand's card abstraction on one street, in both forms a solver
+/// addresses it by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CardBucket {
+    /// The bucket half of the `HashMap` info key: the bucket id, or the raw
+    /// dense hand index where no abstraction covers the situation (correct,
+    /// just unabstracted).
+    key: u64,
+    /// The offset inside a dense-index node's bucket block: the bucket id, or
+    /// `0` for an uncovered situation — which a full-coverage abstraction (the
+    /// precondition of [`BlueprintHoldem::with_indexing`]) never produces.
+    dense: u32,
 }
 
 impl BlueprintHoldem {
@@ -193,6 +235,7 @@ impl BlueprintHoldem {
             ],
             raise_caps: RaiseCaps::UNCAPPED,
             indexing: None,
+            dense_keys: false,
         }
     }
 
@@ -237,20 +280,55 @@ impl BlueprintHoldem {
     /// key).  Both are exactly the cloud-burst configuration; call this last,
     /// after [`with_raise_cap`](BlueprintHoldem::with_raise_cap) and
     /// [`with_street_bucket`](BlueprintHoldem::with_street_bucket).
-    pub fn with_indexing(mut self) -> Self {
-        assert!(
-            self.raise_caps.is_finite(),
-            "SoA indexing needs a finite raise cap on every street (call \
-             with_raise_cap or with_raise_caps first); \
-             the uncapped betting tree is unbounded"
-        );
-        assert!(
-            self.street_buckets.iter().all(Option::is_some),
-            "SoA indexing needs full-coverage flop/turn/river bucket maps \
-             (call with_street_bucket for every post-flop street)"
-        );
+    pub fn with_indexing(self) -> Self {
+        self.try_with_indexing().unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// [`with_indexing`](Self::with_indexing), reporting an unmet requirement
+    /// instead of panicking — for callers acting on a file's say-so (a dense
+    /// policy needs the index; whether this game can have one is not theirs
+    /// to assume).
+    pub fn try_with_indexing(mut self) -> Result<Self, String> {
+        if !self.raise_caps.is_finite() {
+            return Err("SoA indexing needs a finite raise cap on every street (call \
+                 with_raise_cap or with_raise_caps first); \
+                 the uncapped betting tree is unbounded"
+                .into());
+        }
+        if !self.street_buckets.iter().all(Option::is_some) {
+            return Err("SoA indexing needs full-coverage flop/turn/river bucket maps \
+                 (call with_street_bucket for every post-flop street)"
+                .into());
+        }
         self.indexing = Some(self.build_indexing());
+        Ok(self)
+    }
+
+    /// Make every info key this game hands out the **dense info-set index**
+    /// (what [`IndexedGame::info_set_index`](crate::games::IndexedGame::info_set_index)
+    /// returns) instead of a hash of the situation.  Needs
+    /// [`with_indexing`](Self::with_indexing).
+    ///
+    /// A key only has to name its info set uniquely, and the index does.  What
+    /// it adds is that the key *is* the position in a table laid out by
+    /// [`layout`](crate::games::IndexedGame::layout): a strategy stored that
+    /// way needs no key per info set and no search to find one.  That is the
+    /// dense play-time policy (`play::policy`) — at 595 M info sets the keys
+    /// were 9.5 GB of a 16 GB policy.
+    ///
+    /// Whoever holds a strategy decides this, since keys of one kind mean
+    /// nothing to a strategy stored under the other: `CompactPolicy::bind`
+    /// sets it to match the file it loaded.  Training does not care which
+    /// kind it runs on.
+    pub fn with_dense_keys(mut self) -> Self {
+        assert!(self.indexing.is_some(), "dense keys need the dense index: call with_indexing() first");
+        self.dense_keys = true;
         self
+    }
+
+    /// Whether info keys are dense indices (see [`with_dense_keys`](Self::with_dense_keys)).
+    pub fn uses_dense_keys(&self) -> bool {
+        self.dense_keys
     }
 
     /// Legal actions at `gs` after applying the raise-cap betting abstraction:
