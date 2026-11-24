@@ -89,6 +89,12 @@ impl<G: IndexedGame, S: RegretStore> SoaMccfr<G, S> {
         self.use_baseline
     }
 
+    /// The regret/strategy schedule (fixed at construction, and restored from
+    /// a checkpoint on resume).
+    pub fn variant(&self) -> Variant {
+        self.variant
+    }
+
     pub fn iterations(&self) -> u64 {
         self.iterations
     }

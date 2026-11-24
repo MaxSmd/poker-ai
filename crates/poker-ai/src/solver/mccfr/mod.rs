@@ -161,6 +161,11 @@ impl<G: Game> Mccfr<G> {
         self.use_baseline
     }
 
+    /// The regret/strategy schedule (restored from a checkpoint on resume).
+    pub fn variant(&self) -> Variant {
+        self.variant
+    }
+
     /// Enable optimistic (predictive) regret updates: the strategy is matched
     /// against `R + rₜ`, realized by accumulating `R += 2·rₜ − r_{t−1}` (Farina
     /// et al., 2021).  This accelerates **last-iterate** convergence; the

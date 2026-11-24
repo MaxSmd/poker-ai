@@ -59,3 +59,43 @@ impl Discount {
         (t as f64).powf(self.gamma)
     }
 }
+
+/// Parsed from `"α,β,γ"`, e.g. `"1.5,0.5,2"` (the trainer's `--discount`).
+impl std::str::FromStr for Discount {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        let parts: Vec<f64> = s
+            .split(',')
+            .map(|p| p.trim().parse::<f64>().map_err(|_| format!("bad number {p:?} in {s:?}")))
+            .collect::<Result<_, _>>()?;
+        match parts[..] {
+            [alpha, beta, gamma] if parts.iter().all(|x| x.is_finite() && *x >= 0.0) => {
+                Ok(Discount { alpha, beta, gamma })
+            }
+            _ => Err(format!("discount {s:?}: give three non-negative numbers α,β,γ")),
+        }
+    }
+}
+
+impl std::fmt::Display for Discount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{},{},{}", self.alpha, self.beta, self.gamma)
+    }
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::Discount;
+
+    #[test]
+    fn discount_parses_three_numbers_and_prints_back() {
+        let d: Discount = "1.5,0.5,2".parse().unwrap();
+        assert_eq!((d.alpha, d.beta, d.gamma), (1.5, 0.5, 2.0));
+        assert_eq!(d.to_string(), "1.5,0.5,2");
+        assert_eq!(Discount::RECOMMENDED.to_string(), "1.5,0,2");
+        for bad in ["1.5,0.5", "1.5,x,2", "1.5,-1,2", "1,2,3,4"] {
+            assert!(bad.parse::<Discount>().is_err(), "{bad} should not parse");
+        }
+    }
+}

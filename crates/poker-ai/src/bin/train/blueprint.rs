@@ -47,6 +47,26 @@ fn warn_if_baseline_differs(requested: bool, checkpoint: bool) {
     }
 }
 
+/// `--discount=α,β,γ`, default DCFR's (1.5, 0, 2).  A value that does not
+/// parse exits rather than silently training the default.
+fn parse_discount(args: &[String]) -> Discount {
+    strict_flag(args, "discount").unwrap_or(Discount::RECOMMENDED)
+}
+
+/// The same for the schedule: a resumed run keeps the checkpoint's.
+fn warn_if_discount_differs(requested: Discount, checkpoint: Variant) {
+    let same = match checkpoint {
+        Variant::Dcfr(d) => d.to_string() == requested.to_string(),
+        Variant::Vanilla => false,
+    };
+    if !same {
+        eprintln!(
+            "note: the checkpoint was trained with {checkpoint:?} and the run continues that way; \
+             --discount={requested} only applies to a fresh run"
+        );
+    }
+}
+
 /// The `raise_cap` W&B config value: a number for a uniform cap, as every
 /// earlier run logged it, and a string for per-street caps.
 fn cap_metric(cap: RaiseCaps) -> String {
@@ -99,6 +119,8 @@ pub fn load_blueprint_game(dir: &Path, stack: u32, cap: RaiseCaps, verbose: bool
 ///                      maps + finite cap)
 ///   --optimistic       predictive regret updates (serial path only; not --soa)
 ///   --parallel[=BATCH] mini-batch parallel MCCFR (keeps the baseline)
+///   --discount=A,B,G   DCFR schedule (α,β,γ), default 1.5,0,2; a resumed
+///                      run keeps its checkpoint's
 ///   --no-baseline      train without the VR-MCCFR control variate: a third
 ///                      less table memory under --soa (8 instead of 12 bytes
 ///                      per slot) and fewer memory touches per node, for a
@@ -133,8 +155,10 @@ pub fn run_blueprint(args: &[String]) {
     let optimistic = flag("--optimistic");
     let resume = flag("--resume");
     let baseline = !flag("--no-baseline");
+    let discount = parse_discount(args);
 
-    let mut features = vec![base_label(baseline).to_string(), format!("cap={cap}")];
+    let mut features =
+        vec![format!("{}({discount})", base_label(baseline)), format!("cap={cap}")];
     if optimistic {
         features.push("optimistic".into());
     }
@@ -155,10 +179,11 @@ pub fn run_blueprint(args: &[String]) {
         let s = Mccfr::load_checkpoint(&ckpt_path, game).expect("load checkpoint");
         println!("Resuming from {} at iteration {}", ckpt_path.display(), s.iterations());
         warn_if_baseline_differs(baseline, s.uses_baseline());
+        warn_if_discount_differs(discount, s.variant());
         s
     } else {
         let game = load_blueprint_game(&dir, stack, cap, true);
-        let mut s = Mccfr::with_seed(game, Variant::Dcfr(Discount::RECOMMENDED), seed);
+        let mut s = Mccfr::with_seed(game, Variant::Dcfr(discount), seed);
         if baseline {
             s = s.with_baseline();
         }
@@ -231,9 +256,10 @@ pub fn run_blueprint_soa(args: &[String]) {
     });
     let resume = args.iter().any(|a| a == "--resume");
     let baseline = !args.iter().any(|a| a == "--no-baseline");
+    let discount = parse_discount(args);
 
     let mode = SoaMode::from_flags(atomic_threads, parallel_batch);
-    let feat = format!("{}+cap={cap}+soa+{}", base_label(baseline), mode.label());
+    let feat = format!("{}({discount})+cap={cap}+soa+{}", base_label(baseline), mode.label());
 
     let dir = data_dir(args);
     std::fs::create_dir_all(&dir).expect("create data directory");
@@ -252,10 +278,11 @@ pub fn run_blueprint_soa(args: &[String]) {
         });
         println!("Resuming from {} at iteration {}", ckpt_path.display(), s.iterations());
         warn_if_baseline_differs(baseline, s.uses_baseline());
+        warn_if_discount_differs(discount, s.variant());
         s
     } else {
         let game = load_blueprint_game(&dir, stack, cap, true).with_indexing();
-        let s = SoaMccfr::with_seed(game, Variant::Dcfr(Discount::RECOMMENDED), seed);
+        let s = SoaMccfr::with_seed(game, Variant::Dcfr(discount), seed);
         if baseline {
             s.with_baseline()
         } else {

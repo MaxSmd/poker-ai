@@ -1,39 +1,49 @@
 #!/usr/bin/env bash
 #
-# Retrain the blueprint with deeper preflop and flop betting, then play it.
+# Retrain the blueprint finer and longer, then play it.
 #
 #   tmux new-session -d -s retrain '~/poker-ai/scripts/retrain.sh; exec bash'
 #
-# Why: with the flop and turn played from the blueprint (only the river is
-# re-solved), every leak left in the spot report is the blueprint's, and the
-# biggest structural one is betting depth.  The current blueprint allows two
-# raises a street, so preflop it can 3-bet but never 4-bet except all-in (we
-# 4-bet 0% where Slumbot 4-bets 7%), and the flop has one re-raise.  Our best
-# result against Slumbot (+7.9 bb/100, July) came from a cap-3 blueprint.
+# Why: the cap-3,3,2,1 blueprint (data/bp_3321, −7.3 ± 28.1 bb/100 against
+# Slumbot) closed the 4-bet gap, but the leaks left in its hand log — the BB
+# over-folding to 2bb opens, the passive turn lead, the flop c-bet — sit in
+# the blueprint itself, and nothing in it is hand-coded to fix them.  So this
+# run spends the budget on getting the blueprint closer to equilibrium:
 #
-# Caps 3,3,2,1 (preflop, flop, turn, river) restore that depth where it is
-# played from the blueprint; the river gets one raise since it is re-solved
-# exactly.  Buckets 8000/8000/800 keep the info-set count at the current
-# blueprint's (595M vs 599M), so 5B iterations train it about as densely,
-# in 19.5 GB (memory_estimate); the strategy it writes is 3.2 GB.
+#   * finer cards  12000/12000/1200 buckets (1.5× bp_3321's), so hands that
+#                  play differently stop sharing a strategy;
+#   * longer       10B iterations (2× bp_3321's; ~11 per info set vs ~8);
+#   * no baseline  8 instead of 12 bytes per slot, which is what pays for the
+#                  finer buckets: 19.45 GB, the same as bp_3321 (memory_estimate);
+#   * β = 0.5      DCFR 1.5,0.5,2, which bench_discount found slower to start
+#                  and then far ahead — its crossover is near ~10 iterations
+#                  per info set, which is about where this run ends.
 #
-# Everything goes to its own directory; the current blueprint in data/ is
-# untouched, and play uses it unless given --data.  Each step is skipped if
-# its output exists, and training resumes from its checkpoint, so re-running
-# after an interruption continues where it stopped.
+# Same caps as bp_3321, so the betting tree is unchanged.  Everything goes to
+# its own directory; nothing else in data/ is touched.  Each step is skipped
+# if its output exists, and training resumes from its checkpoint, so
+# re-running after an interruption continues where it stopped.  The
+# checkpoint is kept (KEEP_CKPT=1), so training can be extended later with a
+# larger ITERS instead of starting over.
 #
-#   1. cluster  8000/8000/800 buckets, OCHS river         ~1-2 h
-#   2. train    5B iterations, 32 threads                 ~1 day
-#   3. match    10k hands against Slumbot, logged         ~15 h
+#   1. cluster  buckets, OCHS river                       ~5-8 h
+#   2. train    10B iterations, 32 threads                ~1.5-2 days
+#   3. chart    preflop strategy → $DIR/chart.txt         seconds
+#   4. match    10k hands against Slumbot, logged         ~15 h
+#
+# Check $DIR/chart.txt as soon as it appears: the BB's response to the 2bb
+# open should fold far less than bp_3321's 23% (Slumbot folds 6%).
 #
 # Result: $DIR/summary.txt (match result + spot report).
 set -u
 
 cd "$(dirname "$0")/.." || exit 1
-DIR=${DIR:-data/bp_3321}
+DIR=${DIR:-data/bp_fine}
 CAPS=${CAPS:-3,3,2,1}
-BUCKETS=${BUCKETS:-"8000 8000 800"}
-ITERS=${ITERS:-5000000000}
+BUCKETS=${BUCKETS:-"12000 12000 1200"}
+ITERS=${ITERS:-10000000000}
+TRAIN_FLAGS=${TRAIN_FLAGS:-"--no-baseline --discount=1.5,0.5,2"}
+KEEP_CKPT=${KEEP_CKPT:-1}
 THREADS=${THREADS:-32}
 BIN=./target/release
 
@@ -52,12 +62,19 @@ if [ ! -f "$DIR/river_buckets.bin" ]; then
 fi
 
 if [ ! -f "$DIR/blueprint_holdem.bin" ]; then
-    step "train $ITERS iterations, caps $CAPS"
+    step "train $ITERS iterations, caps $CAPS, $TRAIN_FLAGS"
+    # shellcheck disable=SC2086  # TRAIN_FLAGS is a word list
     nice -n 19 "$BIN/train" blueprint "$ITERS" 200 1 --cap="$CAPS" --soa --atomic="$THREADS" \
-        --chunk=50000000 --resume --data="$DIR" >> "$DIR/train.log" 2>&1 \
+        $TRAIN_FLAGS --chunk=50000000 --resume --data="$DIR" >> "$DIR/train.log" 2>&1 \
         || { step "train FAILED — see $DIR/train.log"; exit 1; }
-    # The checkpoint is as large as the table and only needed to resume.
-    rm -f "$DIR/blueprint_holdem_soa.ckpt"
+    # The checkpoint is as large as the table and only needed to resume or
+    # to extend the run.
+    [ "$KEEP_CKPT" = 1 ] || rm -f "$DIR/blueprint_holdem_soa.ckpt"
+fi
+
+if [ ! -f "$DIR/chart.txt" ]; then
+    step "preflop chart -> $DIR/chart.txt"
+    "$BIN/play" chart --cap="$CAPS" --data="$DIR" > "$DIR/chart.txt" 2>&1
 fi
 
 if [ ! -f "$DIR/hands_10k.jsonl" ] || [ "$(wc -l < "$DIR/hands_10k.jsonl")" -lt 10000 ]; then
@@ -67,10 +84,10 @@ if [ ! -f "$DIR/hands_10k.jsonl" ] || [ "$(wc -l < "$DIR/hands_10k.jsonl")" -lt 
 fi
 
 {
-    echo "Blueprint caps $CAPS, buckets $BUCKETS, $ITERS iterations ($DIR)"
+    echo "Blueprint caps $CAPS, buckets $BUCKETS, $ITERS iterations, $TRAIN_FLAGS ($DIR)"
     grep -E "info sets|Saved" "$DIR/train.log" | tail -2
     echo
-    echo "Slumbot, 10k hands (previous blueprint, same play config: luck-adjusted -13.3 ± 24.8 bb/100):"
+    echo "Slumbot, 10k hands (bp_3321, same play config: luck-adjusted -7.3 ± 28.1 bb/100):"
     grep -E "^Done:|^Blueprint lookups|^Abstraction tracking" "$DIR/slumbot_10k.log"
     python3 scripts/spot_report.py "$DIR/hands_10k.jsonl"
 } | tee "$DIR/summary.txt"
